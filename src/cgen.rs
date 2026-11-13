@@ -183,6 +183,12 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "return 0;",
         needs_classes: false,
     },
+    // The VM creates the main thread before any Java code runs; JABS does it on first request.
+    Intrinsic {
+        key: ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
+        body: "return jabs_main_thread();",
+        needs_classes: true,
+    },
     // The registry sets `name` when it creates a Class, so the lazy initializer just returns it.
     Intrinsic {
         key: ("java/lang/Class", "initClassName", "()Ljava/lang/String;"),
@@ -220,15 +226,113 @@ const INTRINSICS: &[Intrinsic] = &[
 ];
 
 /// The runtime's C body for a native method, if it implements one (and the unit can support it).
-fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<&'static str> {
+fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(String, bool)> {
     if key.1 == "registerNatives" && key.2 == "()V" {
-        return Some("/* natives are linked statically */");
+        return Some(("/* natives are linked statically */".to_string(), false));
+    }
+    if key.0 == UNSAFE
+        && let Some((body, needs_classes)) = unsafe_intrinsic(&key.1, &key.2)
+    {
+        return (classes_available || !needs_classes).then_some((body, needs_classes));
     }
     INTRINSICS
         .iter()
         .find(|i| i.key.0 == key.0 && i.key.1 == key.1 && i.key.2 == key.2)
         .filter(|i| classes_available || !i.needs_classes)
-        .map(|i| i.body)
+        .map(|i| (i.body.to_string(), i.needs_classes))
+}
+
+const UNSAFE: &str = "jdk/internal/misc/Unsafe";
+
+/// Bodies for jdk.internal.misc.Unsafe natives. Offsets are byte offsets from the object pointer
+/// (our struct layouts and array data start), or raw addresses when the object is null, as in
+/// HotSpot. With a single thread, volatile accesses, fences and compare-and-set are plain.
+fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
+    const TYPES: [(&str, &str, &str); 9] = [
+        ("Int", "I", "int32_t"),
+        ("Long", "J", "int64_t"),
+        ("Reference", "Ljava/lang/Object;", "jabs_object *"),
+        ("Boolean", "Z", "uint8_t"),
+        ("Byte", "B", "int8_t"),
+        ("Short", "S", "int16_t"),
+        ("Char", "C", "uint16_t"),
+        ("Float", "F", "float"),
+        ("Double", "D", "double"),
+    ];
+    let at = |ty: &str| format!("(*({ty} *)((char *)a0 + a1))");
+    for (word, code, ty) in TYPES {
+        for suffix in ["", "Volatile"] {
+            if name == format!("get{word}{suffix}")
+                && descriptor == format!("(Ljava/lang/Object;J){code}")
+            {
+                return Some((format!("return {};", at(ty)), false));
+            }
+            if name == format!("put{word}{suffix}")
+                && descriptor == format!("(Ljava/lang/Object;J{code})V")
+            {
+                let value = if code == "Z" {
+                    "(uint8_t)(a2 & 1)".to_string()
+                } else {
+                    format!("({ty})a2")
+                };
+                return Some((format!("{} = {value};", at(ty)), false));
+            }
+        }
+        if matches!(word, "Int" | "Long" | "Reference") {
+            if name == format!("compareAndSet{word}")
+                && descriptor == format!("(Ljava/lang/Object;J{code}{code})Z")
+            {
+                return Some((
+                    format!(
+                        "{ty} *p = &{}; if (*p != a2) return 0; *p = a3; return 1;",
+                        at(ty)
+                    ),
+                    false,
+                ));
+            }
+            if name == format!("compareAndExchange{word}")
+                && descriptor == format!("(Ljava/lang/Object;J{code}{code}){code}")
+            {
+                return Some((
+                    format!(
+                        "{ty} *p = &{}; {ty} old = *p; if (old == a2) *p = a3; return old;",
+                        at(ty)
+                    ),
+                    false,
+                ));
+            }
+        }
+    }
+    let body = match (name, descriptor) {
+        ("fullFence" | "loadFence" | "storeFence", "()V") => {
+            "/* single-threaded: program order is enough */"
+        }
+        ("throwException", "(Ljava/lang/Throwable;)V") => {
+            "jabs_pending = a0 ? a0 : jabs_vm_throwable(JABS_VM_NULL_POINTER);"
+        }
+        ("allocateMemory0", "(J)J") => "return (int64_t)(intptr_t)malloc((size_t)a0);",
+        ("reallocateMemory0", "(JJ)J") => {
+            "return (int64_t)(intptr_t)realloc((void *)(intptr_t)a0, (size_t)a1);"
+        }
+        ("freeMemory0", "(J)V") => "free((void *)(intptr_t)a0);",
+        ("setMemory0", "(Ljava/lang/Object;JJB)V") => {
+            "memset((char *)a0 + a1, (unsigned char)a3, (size_t)a2);"
+        }
+        ("copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V") => {
+            "memmove((char *)a2 + a3, (char *)a0 + a1, (size_t)a4);"
+        }
+        ("arrayBaseOffset0", "(Ljava/lang/Class;)I") => {
+            "return (int32_t)((sizeof(jabs_array) + 7) & ~(size_t)7);"
+        }
+        ("arrayIndexScale0", "(Ljava/lang/Class;)I") => {
+            return Some(("return jabs_array_scale(a0);".into(), true));
+        }
+        ("objectFieldOffset1", "(Ljava/lang/Class;Ljava/lang/String;)J") => {
+            return Some(("return jabs_field_offset(a0, a1);".into(), true));
+        }
+        _ => return None,
+    };
+    Some((body.to_string(), false))
 }
 
 /// Whether the unit has what Class objects need: java.lang.Class and String with the expected fields.
@@ -313,7 +417,8 @@ pub struct CompiledUnit {
 /// Definitions of the runtime's globals; exactly one file of a program contains them.
 const RUNTIME_GLOBALS: &str = "_Thread_local jabs_object *jabs_pending;\n\
 const jabs_class jabs_array_class_record = { \"[\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 };\n\
-uint32_t jabs_hash_next = 0x9e3779b9u;\n\n";
+uint32_t jabs_hash_next = 0x9e3779b9u;\n\
+const char *jabs_where = \"\";\n\n";
 
 /// Extern declarations for the external definitions in `code` (records, vtables, static fields
 /// and non-static functions), so other files can reference them.
@@ -2252,7 +2357,13 @@ fn emit_method(
         slot += if matches!(k, Kind::J | Kind::D) { 2 } else { 1 };
     }
     // Raise a VM exception and leave through `exit` (a handler dispatch block or a return).
-    let throw = |exc: &str, exit: &str| format!("{{ {} {exit} }}", raise(exc));
+    // Raises record the method that raised them (stack traces are not captured yet).
+    let site = c_escape(&format!(
+        "{}.{}{}",
+        class.name, method.name, method.descriptor
+    ));
+    let throw =
+        |exc: &str, exit: &str| format!("{{ jabs_where = \"{site}\"; {} {exit} }}", raise(exc));
     // Emit a call: arguments (and the receiver, for instance methods) come off the stack.
     let call = |kind: &CallKind, descriptor: &str, d: usize, exit: &str| -> String {
         let npe = throw("java/lang/NullPointerException", exit);
@@ -3181,12 +3292,37 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
         out,
         "int jabs_is_error(const jabs_object *o) {{ return {error_test}; }}\n"
     );
+    // Throwable.cause, so ExceptionInInitializerError.getCause() returns the original exception.
+    if recorded.contains(THROWABLE) {
+        let field = format!(
+            "(({} *)o)->{}",
+            object_struct(THROWABLE),
+            instance_field("cause")
+        );
+        let _ = writeln!(
+            out,
+            "void jabs_set_cause(jabs_object *o, jabs_object *cause) {{ {field} = cause; }}"
+        );
+        let _ = writeln!(
+            out,
+            "jabs_object *jabs_cause_of(jabs_object *o) {{ return {field} == o ? NULL : {field}; }}\n"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "void jabs_set_cause(jabs_object *o, jabs_object *cause) {{ (void)o; (void)cause; }}"
+        );
+        let _ = writeln!(
+            out,
+            "jabs_object *jabs_cause_of(jabs_object *o) {{ (void)o; return NULL; }}\n"
+        );
+    }
 }
 
 /// Emit the Class-object registry: one java.lang.Class per name, created on first use with the
 /// fields the JVM itself fills in (name, componentType, modifiers, primitive). Class loaders are
 /// not modeled: every class reports the boot loader (null).
-fn emit_class_registry(out: &mut String, recorded: &[&ClassFile]) {
+fn emit_class_registry(out: &mut String, unit: &Unit, recorded: &[&ClassFile]) {
     let class_struct = object_struct(CLASS);
     let string_struct = object_struct(STRING);
     let records: Vec<String> = recorded
@@ -3198,6 +3334,28 @@ fn emit_class_registry(out: &mut String, recorded: &[&ClassFile]) {
         "static const jabs_class *const jabs_records[] = {{ {}NULL }};",
         records.iter().map(|r| format!("{r}, ")).collect::<String>()
     );
+    // Field offsets of every recorded class's own instance fields, for Unsafe.objectFieldOffset.
+    let _ = writeln!(
+        out,
+        "typedef struct {{ const char *class_name, *field_name; size_t offset; }} jabs_field_offset_entry;"
+    );
+    let _ = writeln!(
+        out,
+        "static const jabs_field_offset_entry jabs_field_offsets[] = {{"
+    );
+    for class in recorded {
+        for f in class.fields.iter().filter(|f| f.access & ACC_STATIC == 0) {
+            let _ = writeln!(
+                out,
+                "    {{ \"{}\", \"{}\", offsetof({}, {}) }},",
+                c_escape(&class.name),
+                c_escape(&f.name),
+                object_struct(&class.name),
+                instance_field(&f.name)
+            );
+        }
+    }
+    let _ = writeln!(out, "    {{ NULL, NULL, 0 }}\n}};");
     out.push_str(&format!(r#"
 typedef struct {{ char *name; const jabs_class *record; jabs_object *object; }} jabs_class_entry;
 static jabs_class_entry *jabs_class_entries;
@@ -3349,6 +3507,30 @@ int32_t jabs_class_assignable_from(jabs_object *c, jabs_object *other) {{
     jabs_not_compiled("Class.isAssignableFrom for a class outside the unit");
 }}
 
+/* Unsafe.arrayIndexScale0: element size of an array class. */
+int32_t jabs_array_scale(jabs_object *c) {{
+    jabs_class_entry *e = c ? jabs_class_entry_of(c) : NULL;
+    if (!e || e->name[0] != '[') {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; }}
+    switch (e->name[1]) {{
+    case 'Z': case 'B': return 1;
+    case 'C': case 'S': return 2;
+    case 'I': case 'F': return 4;
+    case 'J': case 'D': return 8;
+    default: return (int32_t)sizeof(jabs_object *);
+    }}
+}}
+
+/* Unsafe.objectFieldOffset1: byte offset of a declared instance field in our object layout. */
+int64_t jabs_field_offset(jabs_object *c, jabs_object *name) {{
+    char field[256];
+    jabs_class_entry *e = c ? jabs_class_entry_of(c) : NULL;
+    if (!e || !name || !jabs_string_to_ascii(name, field, sizeof field)) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; }}
+    for (const jabs_field_offset_entry *f = jabs_field_offsets; f->class_name; f++) {{
+        if (strcmp(f->class_name, e->name) == 0 && strcmp(f->field_name, field) == 0) return (int64_t)f->offset;
+    }}
+    jabs_not_compiled("Unsafe.objectFieldOffset for a field without a compiled layout");
+}}
+
 /* Class.getSuperclass: null for Object, interfaces and primitives; Object for arrays. */
 jabs_object *jabs_class_superclass(jabs_object *c) {{
     jabs_class_entry *e = jabs_class_entry_of(c);
@@ -3370,7 +3552,111 @@ jabs_object *jabs_class_superclass(jabs_object *c) {{
         modifiers = instance_field("modifiers"),
         component = instance_field("componentType"),
     ));
+    out.push_str(&main_thread_function(unit, recorded));
     out.push('\n');
+}
+
+/// `jabs_main_thread()`: the main Thread the VM would create at startup (thread groups "system"
+/// and "main", priority 5, not a daemon, RUNNABLE), built once without running constructors.
+/// Only fields the JDK's classes declare are set.
+fn main_thread_function(unit: &Unit, recorded: &[&ClassFile]) -> String {
+    let (thread, holder, group) = (
+        "java/lang/Thread",
+        "java/lang/Thread$FieldHolder",
+        "java/lang/ThreadGroup",
+    );
+    let have = |c: &str| recorded.iter().any(|r| r.name == c);
+    if ![thread, holder, group, OBJECT].iter().all(|c| have(c)) {
+        return "jabs_object *jabs_main_thread(void) { jabs_not_compiled(\"Thread.currentThread (thread classes are not in the unit)\"); }\n".to_string();
+    }
+    // `object.field = value` if the class declares that instance field with that descriptor.
+    let set = |class: &str, object: &str, name: &str, descriptor: &str, value: &str| -> String {
+        let declared = unit.get(class).is_some_and(|c| {
+            c.fields
+                .iter()
+                .any(|f| f.name == name && f.descriptor == descriptor && f.access & ACC_STATIC == 0)
+        });
+        if declared {
+            format!(
+                "    (({} *){object})->{} = {value};\n",
+                object_struct(class),
+                instance_field(name)
+            )
+        } else {
+            format!("    /* {class} has no {name}:{descriptor} */\n")
+        }
+    };
+    let mut body = String::from(
+        "jabs_object *jabs_main_thread(void) {\n    static jabs_object *main_thread;\n    if (main_thread) return main_thread;\n",
+    );
+    let _ = writeln!(body, "    if ({}() != 0) return NULL;", init_symbol(thread));
+    let _ = writeln!(
+        body,
+        "    jabs_object *system = jabs_new(&{g}), *group = jabs_new(&{g}), *holder = jabs_new(&{h}), *t = jabs_new(&{t}), *lock = jabs_new(&{o});",
+        g = class_record(group),
+        h = class_record(holder),
+        t = class_record(thread),
+        o = class_record(OBJECT)
+    );
+    body.push_str("    jabs_object *system_name = jabs_string_from_utf8(\"system\"), *main_name = jabs_string_from_utf8(\"main\");\n");
+    body.push_str("    if (!system || !group || !holder || !t || !lock || !system_name || !main_name) return NULL;\n");
+    body.push_str(&set(
+        group,
+        "system",
+        "name",
+        "Ljava/lang/String;",
+        "system_name",
+    ));
+    body.push_str(&set(group, "system", "maxPriority", "I", "10"));
+    body.push_str(&set(
+        group,
+        "group",
+        "parent",
+        "Ljava/lang/ThreadGroup;",
+        "system",
+    ));
+    body.push_str(&set(
+        group,
+        "group",
+        "name",
+        "Ljava/lang/String;",
+        "main_name",
+    ));
+    body.push_str(&set(group, "group", "maxPriority", "I", "10"));
+    body.push_str(&set(
+        holder,
+        "holder",
+        "group",
+        "Ljava/lang/ThreadGroup;",
+        "group",
+    ));
+    body.push_str(&set(holder, "holder", "priority", "I", "5"));
+    body.push_str(&set(holder, "holder", "daemon", "Z", "0"));
+    body.push_str(&set(
+        holder,
+        "holder",
+        "threadStatus",
+        "I",
+        "5 /* JVMTI alive | runnable */",
+    ));
+    body.push_str(&set(thread, "t", "tid", "J", "1"));
+    body.push_str(&set(thread, "t", "name", "Ljava/lang/String;", "main_name"));
+    body.push_str(&set(
+        thread,
+        "t",
+        "holder",
+        "Ljava/lang/Thread$FieldHolder;",
+        "holder",
+    ));
+    body.push_str(&set(
+        thread,
+        "t",
+        "interruptLock",
+        "Ljava/lang/Object;",
+        "lock",
+    ));
+    body.push_str("    main_thread = t;\n    return t;\n}\n");
+    body
 }
 
 /// Classes whose initialization must precede this one's: the superclass, then (for classes)
@@ -3481,6 +3767,8 @@ fn emitted_init_targets(
     emission: &Emission,
 ) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = emission.inits.clone();
+    // Instance methods assume their class is initialized; runtime-created objects need the init.
+    out.extend(emission.methods.iter().map(|k| k.0.clone()));
     for key in &emission.methods {
         if let Some(Ok((_, a))) = results.get(key) {
             out.extend(a.deps.iter().filter_map(|d| match d {
@@ -3701,7 +3989,7 @@ fn reachable(
     unit: &Unit,
     classes: &[ClassFile],
     results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
-    intrinsics: &HashMap<MethodKey, &'static str>,
+    intrinsics: &HashMap<MethodKey, (String, bool)>,
     initializable: &BTreeSet<String>,
     roots: &BTreeSet<String>,
 ) -> Emission {
@@ -3773,7 +4061,17 @@ fn reachable(
     loop {
         // Class objects (and the String names they carry) now exist: make their code reachable.
         if needs_classes {
-            for name in [CLASS, STRING] {
+            // Class objects, their String names, and the main thread the registry creates.
+            let thread_classes = [
+                "java/lang/Thread",
+                "java/lang/Thread$FieldHolder",
+                "java/lang/ThreadGroup",
+                OBJECT,
+            ];
+            for name in [CLASS, STRING].into_iter().chain(thread_classes) {
+                if unit.get(name).is_none() {
+                    continue;
+                }
                 add_records(name, &mut out.records);
                 if out.instantiated.insert(name.to_string()) {
                     work.extend(
@@ -3806,7 +4104,7 @@ fn reachable(
         };
         if intrinsics
             .get(&key)
-            .is_some_and(|i| INTRINSICS.iter().any(|x| x.body == *i && x.needs_classes))
+            .is_some_and(|(_, needs_classes)| *needs_classes)
         {
             needs_classes = true;
         }
@@ -3887,7 +4185,7 @@ pub fn compile_unit_rooted(
 ) -> CompiledUnit {
     let unit = Unit::new(classes);
     let have_classes = classes_available(&unit);
-    let mut intrinsics: HashMap<MethodKey, &'static str> = HashMap::new();
+    let mut intrinsics: HashMap<MethodKey, (String, bool)> = HashMap::new();
     let mut results: BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>> =
         BTreeMap::new();
     for class in classes {
@@ -4101,7 +4399,7 @@ pub fn compile_unit_rooted(
     }
     emit_literals(&mut source, &literals);
     if have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING) {
-        emit_class_registry(&mut source, &recorded);
+        emit_class_registry(&mut source, &unit, &recorded);
     }
     for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
         emit_statics_and_init(&mut source, &unit, class);
@@ -4127,7 +4425,7 @@ pub fn compile_unit_rooted(
                 _ if method.access & ACC_ABSTRACT != 0 => MethodStatus::Abstract,
                 Ok((sig, analyzed)) => {
                     if !emission.methods.contains(&key) {
-                    } else if let Some(body) = intrinsics.get(&key) {
+                    } else if let Some((body, _)) = intrinsics.get(&key) {
                         let mut unused = String::new();
                         if method.access & ACC_STATIC == 0 {
                             unused.push_str(" (void)self;");

@@ -10,6 +10,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,8 @@ typedef union jabs_value {
 /* Internal class name of the pending exception, or NULL. */
 /* The exception being thrown (a Throwable object), or NULL. */
 extern _Thread_local jabs_object *jabs_pending;
+/* The method whose code last raised a VM exception (a breadcrumb until stack traces exist). */
+extern const char *jabs_where;
 
 /* Exceptions the runtime itself raises, by kind. The generated unit defines jabs_vm_throwable,
  * which allocates an instance of the JDK class when it is in the unit. Constructors are not run
@@ -84,6 +87,9 @@ enum {
 jabs_object *jabs_vm_throwable(int kind);
 /* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
 int jabs_is_error(const jabs_object *o);
+/* Throwable.cause of a thrown object (NULL when unset), and setting it for VM-raised wrappers. */
+void jabs_set_cause(jabs_object *o, jabs_object *cause);
+jabs_object *jabs_cause_of(jabs_object *o);
 
 /* Allocate a zeroed object: all-zero bytes are every field's Java default (0, 0.0, false, null).
  * There is no garbage collector yet, so objects live until the process exits. */
@@ -92,7 +98,10 @@ static inline jabs_object *jabs_new(const jabs_class *cls);
 /* Exception a failed static initializer reports (JVMS 5.5 step 11): Errors pass through,
  * anything else becomes ExceptionInInitializerError. */
 static inline jabs_object *jabs_initializer_failure(jabs_object *thrown) {
-    return jabs_is_error(thrown) ? thrown : jabs_vm_throwable(JABS_VM_INITIALIZER);
+    if (jabs_is_error(thrown)) return thrown;
+    jabs_object *wrapper = jabs_vm_throwable(JABS_VM_INITIALIZER);
+    jabs_set_cause(wrapper, thrown);
+    return wrapper;
 }
 
 /* Reinterpret raw IEEE bits as float/double (exact, including NaN payloads). */
