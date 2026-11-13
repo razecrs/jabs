@@ -186,6 +186,8 @@ pub enum Op {
     },
     /// `ldc` of a String constant: its exact UTF-16 code units.
     LdcString(Vec<u16>),
+    /// `ldc` of a Class constant (`Foo.class`): the class's internal name or array descriptor.
+    LdcClass(String),
     /// Load an element; the char is the element family: I J F D A, B (byte or boolean), C, S.
     ArrayLoad(char),
     /// Store an element; same element families as `ArrayLoad`.
@@ -312,6 +314,9 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
                 c.u16()?
             };
             let value = match class.pool.get(index as usize) {
+                Some(Constant::Class(name)) if opcode != 0x14 => {
+                    return Ok(LdcClass(class.utf8(*name)?.to_string()));
+                }
                 Some(Constant::String(text)) if opcode != 0x14 => {
                     let units = class
                         .string_units

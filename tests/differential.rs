@@ -178,7 +178,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 10] = [
+const FIXTURE_SOURCES: [&str; 11] = [
     "Arith",
     "Statics",
     "BadInit",
@@ -189,6 +189,7 @@ const FIXTURE_SOURCES: [&str; 10] = [
     "Ifaces",
     "Exceptions",
     "Sync",
+    "Natives",
 ];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
@@ -353,6 +354,39 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         out.push(("Sync", "castShapes", vec![I(w)]));
     }
     out.push(("Sync", "rows", vec![]));
+    // Runtime-implemented natives and the Object/Class root.
+    for (from, to, len) in [
+        (0, 2, 3),
+        (2, 0, 3),
+        (0, 0, 6),
+        (1, 1, 0),
+        (-1, 0, 1),
+        (0, 4, 3),
+        (0, 0, -1),
+    ] {
+        out.push(("Natives", "copyInts", vec![I(from), I(to), I(len)]));
+    }
+    for name in [
+        "copyMismatch",
+        "copyNull",
+        "hashStable",
+        "hashNull",
+        "classIdentity",
+        "className",
+        "classQueries",
+        "cloneArray",
+        "clocks",
+    ] {
+        out.push(("Natives", name, vec![]));
+    }
+    out.push(("Natives", "copyCovariant", vec![I(0)]));
+    out.push(("Natives", "copyCovariant", vec![I(1)]));
+    for d in [0.0f64, -0.0, 1.5, f64::NAN, f64::INFINITY] {
+        out.push(("Natives", "doubleBits", vec![D(d)]));
+    }
+    for f in [0.0f32, -2.5, f32::NAN] {
+        out.push(("Natives", "floatBits", vec![F(f)]));
+    }
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -668,6 +702,23 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         reference[at("Sync", "arrayKinds", Some(0))],
         format!("I {:08x}", 111)
+    );
+    // Natives: a Circle stops the covariant copy after one element; overlapping copies shift.
+    assert_eq!(
+        reference[at("Natives", "copyCovariant", Some(1))],
+        format!("I {:08x}", -1i32 as u32)
+    );
+    assert_eq!(
+        reference[at("Natives", "copyMismatch", None)],
+        "throw java/lang/ArrayStoreException"
+    );
+    assert_eq!(
+        reference[at("Natives", "classIdentity", None)],
+        format!("I {:08x}", 1111)
+    );
+    assert_eq!(
+        reference[at("Natives", "className", None)],
+        format!("I {:08x}", 1602)
     );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(

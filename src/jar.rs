@@ -260,7 +260,7 @@ fn blocker_category(reason: &str) -> String {
         .split_once(": ")
         .filter(|(pc, _)| pc.starts_with("pc "))
         .map_or(reason, |(_, r)| r);
-    let rules: [(&str, &str); 16] = [
+    let rules: [(&str, &str); 17] = [
         (
             "class hierarchy incomplete",
             "superclass/interface outside the unit (JDK or other jars)",
@@ -291,6 +291,10 @@ fn blocker_category(reason: &str) -> String {
         ("synchronized", "synchronized methods"),
         ("exception handlers", "exception handlers (try/catch)"),
         ("no bytecode", "abstract or native methods"),
+        (
+            "native method without",
+            "native method without a JABS implementation",
+        ),
         ("calls ", "calls a method that is not compiled"),
         (
             "not declared in the unit",

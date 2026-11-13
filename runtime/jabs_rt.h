@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if FLT_EVAL_METHOD != 0
 #error "JABS requires FLT_EVAL_METHOD == 0 for Java floating-point semantics"
@@ -38,6 +39,7 @@ typedef struct jabs_class {
     const struct jabs_class *const *interfaces;
     uint32_t interfaces_len;
     int32_t is_interface;
+    uint16_t access; /* class-file access flags (Class.getModifiers approximates from these) */
 } jabs_class;
 
 /* Every object starts with this header; the class's own struct embeds it first. */
@@ -45,6 +47,8 @@ typedef struct jabs_object {
     const jabs_class *cls;
     /* Monitor entry count. The runtime has a single thread, so the owner is always that thread. */
     uint32_t monitor;
+    /* Identity hash code, assigned on first request (0 = not yet assigned). */
+    uint32_t hash;
 } jabs_object;
 
 typedef union jabs_value {
@@ -74,7 +78,8 @@ enum {
     JABS_VM_NO_CLASS_DEF_FOUND,
     JABS_VM_INITIALIZER,
     JABS_VM_OUT_OF_MEMORY,
-    JABS_VM_ILLEGAL_MONITOR_STATE
+    JABS_VM_ILLEGAL_MONITOR_STATE,
+    JABS_VM_CLONE_NOT_SUPPORTED
 };
 static jabs_object *jabs_vm_throwable(int kind);
 /* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
@@ -188,7 +193,7 @@ static inline void *jabs_array_data(jabs_array *a) {
 /* Shared record for every array object: arrays are instances of no compiled class.
  * A function-local static avoids unused-variable warnings in programs without arrays. */
 static inline const jabs_class *jabs_array_class(void) {
-    static const jabs_class record = { "[", 0, NULL, NULL, NULL, 0, NULL, 0, 0 };
+    static const jabs_class record = { "[", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 };
     return &record;
 }
 
@@ -309,6 +314,106 @@ static inline jabs_object *jabs_new(const jabs_class *cls) {
     }
     o->cls = cls;
     return o;
+}
+
+/* ---- Native methods implemented by the runtime (JVM intrinsics) ---- */
+
+/* Identity hash: stable per object, never 0, distinct for consecutive requests. */
+static inline int32_t jabs_identity_hash(jabs_object *o) {
+    static uint32_t next = 0x9e3779b9u;
+    if (o->hash == 0) {
+        next ^= next << 13;
+        next ^= next >> 17;
+        next ^= next << 5;
+        o->hash = next ? (next & 0x7fffffffu) | 1u : 1u;
+    }
+    return (int32_t)o->hash;
+}
+
+/* Size in bytes of one element of an array, from its descriptor. */
+static inline size_t jabs_element_size(const jabs_array *a) {
+    switch (a->descriptor[1]) {
+    case 'Z': case 'B': return 1;
+    case 'C': case 'S': return 2;
+    case 'I': case 'F': return 4;
+    case 'J': case 'D': return 8;
+    default: return sizeof(jabs_object *);
+    }
+}
+
+/* System.arraycopy with HotSpot's checks in its order: null (NullPointerException), array types
+ * (ArrayStoreException), bounds (ArrayIndexOutOfBoundsException), then per-element store checks
+ * for reference arrays whose element types differ, which copy up to the first bad element. */
+static inline void jabs_arraycopy(jabs_object *src, int32_t src_pos, jabs_object *dst, int32_t dst_pos, int32_t length) {
+    if (!src || !dst) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }
+    if (src->cls != jabs_array_class() || dst->cls != jabs_array_class()) {
+        jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_STORE);
+        return;
+    }
+    jabs_array *s = (jabs_array *)src, *d = (jabs_array *)dst;
+    int s_ref = s->descriptor[1] == 'L' || s->descriptor[1] == '[';
+    int d_ref = d->descriptor[1] == 'L' || d->descriptor[1] == '[';
+    if (s_ref != d_ref || (!s_ref && s->descriptor[1] != d->descriptor[1])) {
+        jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_STORE);
+        return;
+    }
+    if (src_pos < 0 || dst_pos < 0 || length < 0 || (int64_t)src_pos + length > s->length ||
+        (int64_t)dst_pos + length > d->length) {
+        jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX);
+        return;
+    }
+    size_t size = jabs_element_size(s);
+    char *from = (char *)jabs_array_data(s) + (size_t)src_pos * size;
+    char *to = (char *)jabs_array_data(d) + (size_t)dst_pos * size;
+    if (!s_ref || strcmp(s->descriptor, d->descriptor) == 0 || d->component_kind == JABS_COMPONENT_ANY) {
+        memmove(to, from, (size_t)length * size);
+        return;
+    }
+    /* Different reference element types: check each element (source and destination differ,
+     * since their descriptors do, so copying forward is safe). */
+    jabs_object **in = (jabs_object **)from, **out = (jabs_object **)to;
+    for (int32_t i = 0; i < length; i++) {
+        if (in[i] && !jabs_array_store_ok(d, in[i])) {
+            jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_STORE);
+            return;
+        }
+        out[i] = in[i];
+    }
+}
+
+/* Object.clone: arrays and Cloneable objects get a shallow copy with a fresh monitor and hash. */
+static inline jabs_object *jabs_clone(jabs_object *o) {
+    size_t size;
+    if (o->cls == jabs_array_class()) {
+        jabs_array *a = (jabs_array *)o;
+        size = ((sizeof(jabs_array) + 7) & ~(size_t)7) + (size_t)a->length * jabs_element_size(a);
+    } else {
+        int cloneable = 0;
+        for (uint32_t i = 0; i < o->cls->interfaces_len; i++) {
+            if (strcmp(o->cls->interfaces[i]->name, "java/lang/Cloneable") == 0) cloneable = 1;
+        }
+        if (!cloneable) { jabs_pending = jabs_vm_throwable(JABS_VM_CLONE_NOT_SUPPORTED); return NULL; }
+        size = o->cls->size;
+    }
+    jabs_object *copy = (jabs_object *)malloc(size);
+    if (!copy) { jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }
+    memcpy(copy, o, size);
+    copy->monitor = 0;
+    copy->hash = 0;
+    return copy;
+}
+
+/* System.currentTimeMillis and System.nanoTime from the C11 clock (nanoTime is only meaningful
+ * as a difference, as in Java). */
+static inline int64_t jabs_current_millis(void) {
+    struct timespec t;
+    timespec_get(&t, TIME_UTC);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+static inline int64_t jabs_nano_time(void) {
+    struct timespec t;
+    timespec_get(&t, TIME_UTC);
+    return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
 #endif

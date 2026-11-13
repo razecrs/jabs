@@ -17,8 +17,8 @@ use crate::bytecode::{
     self, BinOp, Compare, Cond, Convert, DecodeError, Insn, Kind, MemberRef, Op, Value,
 };
 use crate::classfile::{
-    ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_STATIC, ACC_SYNCHRONIZED, ClassFile,
-    Constant, Member,
+    ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_STATIC, ACC_SYNCHRONIZED,
+    ClassFile, Constant, Member,
 };
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
@@ -33,9 +33,10 @@ pub const RUNTIME_PRELUDE: &str = include_str!("../runtime/jabs_rt.h");
 const OBJECT: &str = "java/lang/Object";
 const STRING: &str = "java/lang/String";
 const THROWABLE: &str = "java/lang/Throwable";
+const CLASS: &str = "java/lang/Class";
 
 /// Exceptions the runtime raises itself, in the order of the JABS_VM_* constants.
-const VM_EXCEPTIONS: [(&str, &str); 12] = [
+const VM_EXCEPTIONS: [(&str, &str); 13] = [
     ("java/lang/NullPointerException", "JABS_VM_NULL_POINTER"),
     ("java/lang/ArithmeticException", "JABS_VM_ARITHMETIC"),
     (
@@ -66,7 +67,187 @@ const VM_EXCEPTIONS: [(&str, &str); 12] = [
         "java/lang/IllegalMonitorStateException",
         "JABS_VM_ILLEGAL_MONITOR_STATE",
     ),
+    (
+        "java/lang/CloneNotSupportedException",
+        "JABS_VM_CLONE_NOT_SUPPORTED",
+    ),
 ];
+
+/// Native methods the runtime implements: (class, name, descriptor) -> C body. `self` and
+/// `a0`.. are the receiver and arguments. Bodies marked `needs_classes` use the Class registry.
+struct Intrinsic {
+    key: (&'static str, &'static str, &'static str),
+    body: &'static str,
+    needs_classes: bool,
+}
+
+const INTRINSICS: &[Intrinsic] = &[
+    Intrinsic {
+        key: ("java/lang/Object", "hashCode", "()I"),
+        body: "return jabs_identity_hash(self);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/System",
+            "identityHashCode",
+            "(Ljava/lang/Object;)I",
+        ),
+        body: "return a0 ? jabs_identity_hash(a0) : 0;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Object", "getClass", "()Ljava/lang/Class;"),
+        body: "return jabs_class_of(self);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: ("java/lang/Object", "clone", "()Ljava/lang/Object;"),
+        body: "return jabs_clone(self);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Object", "notify", "()V"),
+        body: "if (self->monitor == 0) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Object", "notifyAll", "()V"),
+        body: "if (self->monitor == 0) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/System",
+            "arraycopy",
+            "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+        ),
+        body: "jabs_arraycopy(a0, a1, a2, a3, a4);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/System", "currentTimeMillis", "()J"),
+        body: "return jabs_current_millis();",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/System", "nanoTime", "()J"),
+        body: "return jabs_nano_time();",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Double", "doubleToRawLongBits", "(D)J"),
+        body: "int64_t r; memcpy(&r, &a0, 8); return r;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Double", "longBitsToDouble", "(J)D"),
+        body: "double r; memcpy(&r, &a0, 8); return r;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Float", "floatToRawIntBits", "(F)I"),
+        body: "int32_t r; memcpy(&r, &a0, 4); return r;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Float", "intBitsToFloat", "(I)F"),
+        body: "float r; memcpy(&r, &a0, 4); return r;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Runtime", "availableProcessors", "()I"),
+        body: "return 1; /* the native runtime is single-threaded */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/Throwable",
+            "fillInStackTrace",
+            "(I)Ljava/lang/Throwable;",
+        ),
+        body: "return self; /* stack traces are not captured yet */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/Class",
+            "desiredAssertionStatus0",
+            "(Ljava/lang/Class;)Z",
+        ),
+        body: "return 0; /* assertions disabled, as without -ea */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Class", "isHidden", "()Z"),
+        body: "return 0;",
+        needs_classes: false,
+    },
+    // The registry sets `name` when it creates a Class, so the lazy initializer just returns it.
+    Intrinsic {
+        key: ("java/lang/Class", "initClassName", "()Ljava/lang/String;"),
+        body: "return ((struct jo_java_2flang_2fClass *)self)->f_name;",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: ("java/lang/Class", "isInstance", "(Ljava/lang/Object;)Z"),
+        body: "return a0 ? jabs_class_is_instance(self, a0) : 0;",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/Class",
+            "isAssignableFrom",
+            "(Ljava/lang/Class;)Z",
+        ),
+        body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } return jabs_class_assignable_from(self, a0);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: ("java/lang/Class", "getSuperclass", "()Ljava/lang/Class;"),
+        body: "return jabs_class_superclass(self);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/Class",
+            "getPrimitiveClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+        ),
+        body: "char name[32]; if (!a0 || !jabs_string_to_ascii(a0, name, sizeof name)) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } return jabs_class_object(name);",
+        needs_classes: true,
+    },
+];
+
+/// The runtime's C body for a native method, if it implements one (and the unit can support it).
+fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<&'static str> {
+    if key.1 == "registerNatives" && key.2 == "()V" {
+        return Some("/* natives are linked statically */");
+    }
+    INTRINSICS
+        .iter()
+        .find(|i| i.key.0 == key.0 && i.key.1 == key.1 && i.key.2 == key.2)
+        .filter(|i| classes_available || !i.needs_classes)
+        .map(|i| i.body)
+}
+
+/// Whether the unit has what Class objects need: java.lang.Class and String with the expected fields.
+fn classes_available(unit: &Unit) -> bool {
+    let has = |class: &str, field: &str, descriptor: &str| {
+        unit.get(class).is_some_and(|c| {
+            c.fields.iter().any(|f| {
+                f.name == field && f.descriptor == descriptor && f.access & ACC_STATIC == 0
+            })
+        })
+    };
+    unit.chain(CLASS).is_ok()
+        && unit.chain(STRING).is_ok()
+        && has(CLASS, "name", "Ljava/lang/String;")
+        && has(CLASS, "componentType", "Ljava/lang/Class;")
+        && has(CLASS, "modifiers", "C")
+        && has(CLASS, "primitive", "Z")
+        && STRING_FIELDS.iter().all(|(n, d)| has(STRING, n, d))
+}
 
 /// `jabs_pending = <new VM exception>` for one of `VM_EXCEPTIONS`.
 fn raise(class: &str) -> String {
@@ -527,6 +708,14 @@ impl<'a> Unit<'a> {
                 return Ok((class, m));
             }
         }
+        if let Some(object) = self.get(OBJECT)
+            && let Some(m) = object
+                .methods
+                .iter()
+                .find(|m| m.name == name && m.descriptor == descriptor)
+        {
+            return Ok((object, m));
+        }
         bail!(
             "{owner}.{name}{descriptor} is inherited from outside the unit (e.g. java/lang/Object)"
         )
@@ -596,7 +785,7 @@ impl<'a> Unit<'a> {
                         continue;
                     }
                     // 1. A method in the class or a superclass wins (abstract ones throw when called).
-                    let in_class = chain.iter().find_map(|c| {
+                    let in_class = chain.iter().copied().chain(self.get(OBJECT)).find_map(|c| {
                         c.methods
                             .iter()
                             .find(|x| {
@@ -691,6 +880,10 @@ impl<'a> Unit<'a> {
         let mut slots = match class.super_name.as_deref() {
             Some(parent) if parent != OBJECT && class.access & ACC_INTERFACE == 0 => {
                 (*self.vtable(parent)?).clone()
+            }
+            // Directly below Object: start from Object's own slots (hashCode, equals, ...).
+            Some(OBJECT) if class.access & ACC_INTERFACE == 0 && self.get(OBJECT).is_some() => {
+                (*self.vtable(OBJECT)?).clone()
             }
             _ => Vec::new(),
         };
@@ -1220,6 +1413,14 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             // The JVM initializes String before any literal exists; String's own code relies on it.
             out.deps.push(Dep::Init(STRING.to_string()));
         }
+        Op::LdcClass(_) => {
+            if !classes_available(unit) {
+                bail!(
+                    "pc {pc}: class constants need java/lang/Class and String in the unit (add the JDK's java.base)"
+                );
+            }
+            frame.stack.push(VType::Obj(unit.intern(CLASS)));
+        }
         Op::NewArray(element) => {
             frame.pop_prim(Kind::I, pc)?;
             frame
@@ -1334,6 +1535,24 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 }
             }
             out.resolved = Some(Resolved::Field(declaring.name.clone()));
+        }
+        // Methods on arrays are Object's (clone is the array copy); arrays have no vtable, so call directly.
+        Op::InvokeVirtual(m) if m.class.starts_with('[') => {
+            let (declaring, target) = unit.resolve_method(OBJECT, &m.name, &m.descriptor)?;
+            if target.access & ACC_STATIC != 0 || m.name.starts_with('<') {
+                bail!("pc {pc}: invokevirtual of {} on an array", m.name);
+            }
+            let s = parse_signature(&m.descriptor)?;
+            for p in s.params.iter().rev() {
+                frame.pop_ty(cx, p, pc)?;
+            }
+            frame.pop_ref(cx, &m.class, pc)?;
+            if s.ret.code != 'V' {
+                frame.stack.push(cx.of_ty(&s.ret));
+            }
+            let key = (declaring.name.clone(), m.name.clone(), m.descriptor.clone());
+            out.deps.push(Dep::Method(key.clone()));
+            out.resolved = Some(Resolved::Call(CallKind::Direct(key)));
         }
         Op::InvokeVirtual(m) => {
             if m.name.starts_with('<') {
@@ -1463,13 +1682,16 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
         Op::InvokeSpecial(m) => {
             let parent = cx.class.super_name.as_deref().unwrap_or(OBJECT);
             if m.name == "<init>" && m.class == OBJECT && m.descriptor == "()V" {
-                // Only `this` in a direct subclass of Object calls Object's constructor.
-                if parent != OBJECT || frame.pop(pc)? != VType::UninitThis {
-                    bail!(
-                        "pc {pc}: Object.<init> called on something other than uninitialized this"
-                    );
+                // Either `super()` in a direct subclass of Object, or `new Object()`.
+                match frame.pop(pc)? {
+                    VType::UninitThis if parent == OBJECT => {
+                        frame.initialize(VType::UninitThis, VType::Obj(unit.intern(this)));
+                    }
+                    v @ VType::Uninit(at) if news.get(&at).map(String::as_str) == Some(OBJECT) => {
+                        frame.initialize(v, VType::Obj(unit.intern(OBJECT)));
+                    }
+                    other => bail!("pc {pc}: Object.<init> called on {}", cx.describe(other)),
                 }
-                frame.initialize(VType::UninitThis, VType::Obj(unit.intern(this)));
                 out.resolved = Some(Resolved::Call(CallKind::ObjectInit));
                 return Ok(out);
             }
@@ -1534,6 +1756,21 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
 struct Catch {
     class: Option<String>,
     handler: u32,
+}
+
+impl Analyzed {
+    /// Placeholder analysis for methods whose body the runtime supplies (intrinsics).
+    fn empty() -> Analyzed {
+        Analyzed {
+            exits: HashMap::new(),
+            dispatch: Vec::new(),
+            insns: Vec::new(),
+            stacks: Vec::new(),
+            targets: BTreeSet::new(),
+            deps: BTreeSet::new(),
+            resolved: HashMap::new(),
+        }
+    }
 }
 
 struct Analyzed {
@@ -2175,6 +2412,10 @@ fn emit_method(
                 "s[{d}].a = {}(); if (!s[{d}].a) {exit}",
                 literal_symbol(units)
             ),
+            Op::LdcClass(name) => format!(
+                "s[{d}].a = jabs_class_object(\"{}\"); if (!s[{d}].a) {exit}",
+                c_escape(name)
+            ),
             Op::NewArray(element) => {
                 let r = d - 1;
                 format!(
@@ -2636,9 +2877,10 @@ fn emit_stubs(
 fn emit_interface_record(out: &mut String, iface: &ClassFile) {
     let _ = writeln!(
         out,
-        "const jabs_class {} = {{ \"{}\", 0, NULL, NULL, NULL, 0, NULL, 0, 1 }};",
+        "const jabs_class {} = {{ \"{}\", 0, NULL, NULL, NULL, 0, NULL, 0, 1, {} }};",
         class_record(&iface.name),
-        c_escape(&iface.name)
+        c_escape(&iface.name),
+        iface.access
     );
 }
 
@@ -2736,10 +2978,11 @@ fn emit_class_record(
     };
     let _ = writeln!(
         out,
-        "const jabs_class {} = {{ \"{}\", sizeof({}), {vtable_name}, {parent}, {itable_ref}, {itable_len}, {ifaces_ref}, {ifaces_len}, 0 }};\n",
+        "const jabs_class {} = {{ \"{}\", sizeof({}), {vtable_name}, {parent}, {itable_ref}, {itable_len}, {ifaces_ref}, {ifaces_len}, 0, {} }};\n",
         class_record(&class.name),
         c_escape(&class.name),
-        object_struct(&class.name)
+        object_struct(&class.name),
+        class.access
     );
 }
 
@@ -2754,7 +2997,7 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
             let synthetic = mangled("jabs_vmx_", &[name]);
             let _ = writeln!(
                 out,
-                "const jabs_class {synthetic} = {{ \"{name}\", 0, NULL, NULL, NULL, 0, NULL, 0, 0 }};"
+                "const jabs_class {synthetic} = {{ \"{name}\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 }};"
             );
             records.push(format!("&{synthetic}"));
         }
@@ -2784,6 +3027,196 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
         out,
         "static int jabs_is_error(const jabs_object *o) {{ return {error_test}; }}\n"
     );
+}
+
+/// Emit the Class-object registry: one java.lang.Class per name, created on first use with the
+/// fields the JVM itself fills in (name, componentType, modifiers, primitive). Class loaders are
+/// not modeled: every class reports the boot loader (null).
+fn emit_class_registry(out: &mut String, recorded: &[&ClassFile]) {
+    let class_struct = object_struct(CLASS);
+    let string_struct = object_struct(STRING);
+    let records: Vec<String> = recorded
+        .iter()
+        .map(|c| format!("&{}", class_record(&c.name)))
+        .collect();
+    let _ = writeln!(
+        out,
+        "static const jabs_class *const jabs_records[] = {{ {}NULL }};",
+        records.iter().map(|r| format!("{r}, ")).collect::<String>()
+    );
+    out.push_str(&format!(r#"
+typedef struct {{ char *name; const jabs_class *record; jabs_object *object; }} jabs_class_entry;
+static jabs_class_entry *jabs_class_entries;
+static size_t jabs_class_count, jabs_class_capacity;
+
+/* Record for an internal class name, if the unit compiled one. */
+static const jabs_class *jabs_record_named(const char *name) {{
+    for (const jabs_class *const *r = jabs_records; *r; r++) if (strcmp((*r)->name, name) == 0) return *r;
+    return NULL;
+}}
+
+/* Build a String from UTF-8 text (compact Latin-1 when every char fits, else UTF-16). */
+static jabs_object *jabs_string_from_utf8(const char *text) {{
+    size_t n = strlen(text), count = 0;
+    uint16_t *units = (uint16_t *)malloc((n + 1) * sizeof(uint16_t));
+    if (!units) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+    int latin1 = 1;
+    for (size_t i = 0; i < n;) {{
+        unsigned char b = (unsigned char)text[i];
+        uint32_t cp = b; size_t len = 1;
+        if (b >= 0xF0 && i + 3 < n + 1) {{ cp = ((b & 7u) << 18) | ((text[i+1] & 0x3Fu) << 12) | ((text[i+2] & 0x3Fu) << 6) | (text[i+3] & 0x3Fu); len = 4; }}
+        else if (b >= 0xE0) {{ cp = ((b & 15u) << 12) | ((text[i+1] & 0x3Fu) << 6) | (text[i+2] & 0x3Fu); len = 3; }}
+        else if (b >= 0xC0) {{ cp = ((b & 31u) << 6) | (text[i+1] & 0x3Fu); len = 2; }}
+        if (cp > 0xFFFF) {{ cp -= 0x10000; units[count++] = (uint16_t)(0xD800 + (cp >> 10)); units[count++] = (uint16_t)(0xDC00 + (cp & 0x3FF)); latin1 = 0; }}
+        else {{ units[count++] = (uint16_t)cp; if (cp > 0xFF) latin1 = 0; }}
+        i += len;
+    }}
+    size_t bytes = latin1 ? count : count * 2;
+    jabs_object *value = jabs_new_array((int32_t)bytes, 1, JABS_COMPONENT_PRIMITIVE, NULL, "[B", NULL);
+    if (!value) {{ free(units); return NULL; }}
+    unsigned char *data = (unsigned char *)jabs_array_data((jabs_array *)value);
+    for (size_t i = 0; i < count; i++) {{
+        if (latin1) data[i] = (unsigned char)units[i];
+        else memcpy(data + 2 * i, &units[i], 2); /* UTF-16 in the target's byte order */
+    }}
+    free(units);
+    if ({string_init}() != 0) return NULL;
+    jabs_object *s = jabs_new(&{string_record});
+    if (!s) return NULL;
+    (({string_struct} *)s)->{value} = value;
+    (({string_struct} *)s)->{coder} = latin1 ? 0 : 1;
+    return s;
+}}
+
+/* Copy an all-ASCII Latin-1 String into `out`; 0 if it is not one or does not fit. */
+static int jabs_string_to_ascii(jabs_object *s, char *out, size_t size) {{
+    jabs_array *v = (jabs_array *)(({string_struct} *)s)->{value};
+    if ((({string_struct} *)s)->{coder} != 0 || !v || (size_t)v->length >= size) return 0;
+    memcpy(out, jabs_array_data(v), (size_t)v->length);
+    out[v->length] = 0;
+    return 1;
+}}
+
+static int jabs_is_primitive_name(const char *n) {{
+    static const char *const names[] = {{ "boolean", "byte", "char", "short", "int", "long", "float", "double", "void" }};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) if (strcmp(n, names[i]) == 0) return 1;
+    return 0;
+}}
+
+/* The Class object for an internal name ("java/lang/String"), array descriptor ("[I") or
+ * primitive name ("int"). Created once; the same object is returned afterwards. */
+static jabs_object *jabs_class_object(const char *name) {{
+    for (size_t i = 0; i < jabs_class_count; i++) if (strcmp(jabs_class_entries[i].name, name) == 0) return jabs_class_entries[i].object;
+    if ({class_init}() != 0) return NULL;
+    jabs_object *c = jabs_new(&{class_record_name});
+    if (!c) return NULL;
+    char *binary = (char *)malloc(strlen(name) + 1);
+    if (!binary) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+    for (size_t i = 0; ; i++) {{ binary[i] = name[i] == '/' ? '.' : name[i]; if (!name[i]) break; }}
+    jabs_object *binary_name = jabs_string_from_utf8(binary);
+    free(binary);
+    if (!binary_name) return NULL;
+    const jabs_class *record = name[0] == '[' ? NULL : jabs_record_named(name);
+    (({class_struct} *)c)->{name_field} = binary_name;
+    if (jabs_is_primitive_name(name)) {{
+        (({class_struct} *)c)->{primitive} = 1;
+        (({class_struct} *)c)->{modifiers} = 0x411; /* public final abstract */
+    }} else if (name[0] == '[') {{
+        (({class_struct} *)c)->{modifiers} = 0x411;
+    }} else if (record) {{
+        (({class_struct} *)c)->{modifiers} = (uint16_t)(record->access & 0x7631);
+    }}
+    if (jabs_class_count == jabs_class_capacity) {{
+        size_t grown = jabs_class_capacity ? jabs_class_capacity * 2 : 64;
+        jabs_class_entry *more = (jabs_class_entry *)realloc(jabs_class_entries, grown * sizeof *more);
+        if (!more) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+        jabs_class_entries = more;
+        jabs_class_capacity = grown;
+    }}
+    char *copy = (char *)malloc(strlen(name) + 1);
+    if (!copy) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+    strcpy(copy, name);
+    jabs_class_entries[jabs_class_count++] = (jabs_class_entry){{ copy, record, c }};
+    if (name[0] == '[') {{
+        /* componentType: "[I" -> int, "[Ljava/lang/String;" -> java/lang/String, "[[I" -> [I. */
+        char element[512];
+        static const char *const prims[] = {{ "Z", "boolean", "B", "byte", "C", "char", "S", "short", "I", "int", "J", "long", "F", "float", "D", "double" }};
+        const char *e = name + 1;
+        if (*e == 'L') {{ size_t len = strlen(e) - 2; if (len >= sizeof element) return c; memcpy(element, e + 1, len); element[len] = 0; }}
+        else if (*e == '[') {{ if (strlen(e) >= sizeof element) return c; strcpy(element, e); }}
+        else {{ for (size_t i = 0; i < 16; i += 2) if (*e == prims[i][0]) strcpy(element, prims[i + 1]); }}
+        jabs_object *component = jabs_class_object(element);
+        if (!component) return NULL;
+        (({class_struct} *)c)->{component} = component;
+    }}
+    return c;
+}}
+
+/* Registry entry of a Class object (every Class object comes from jabs_class_object). */
+static jabs_class_entry *jabs_class_entry_of(jabs_object *c) {{
+    for (size_t i = 0; i < jabs_class_count; i++) if (jabs_class_entries[i].object == c) return &jabs_class_entries[i];
+    return NULL;
+}}
+
+/* Object.getClass. */
+static jabs_object *jabs_class_of(jabs_object *o) {{
+    return jabs_class_object(o->cls == jabs_array_class() ? ((jabs_array *)o)->descriptor : o->cls->name);
+}}
+
+/* Class.isInstance(o) for non-null o. */
+static int32_t jabs_class_is_instance(jabs_object *c, jabs_object *o) {{
+    jabs_class_entry *e = jabs_class_entry_of(c);
+    if (!e || jabs_is_primitive_name(e->name)) return 0;
+    if (strcmp(e->name, "java/lang/Object") == 0) return 1;
+    if (e->name[0] == '[') {{
+        const jabs_class *component = NULL;
+        if (e->name[1] == 'L') {{
+            char element[512]; size_t len = strlen(e->name) - 3;
+            if (len < sizeof element) {{ memcpy(element, e->name + 2, len); element[len] = 0; component = jabs_record_named(element); }}
+        }}
+        return jabs_is_array_instance(o, e->name, component);
+    }}
+    if (e->record) return jabs_is_instance(o, e->record);
+    jabs_not_compiled("Class.isInstance for a class outside the unit");
+}}
+
+/* Class.isAssignableFrom(other) for non-null other. */
+static int32_t jabs_class_assignable_from(jabs_object *c, jabs_object *other) {{
+    if (c == other) return 1;
+    jabs_class_entry *a = jabs_class_entry_of(c), *b = jabs_class_entry_of(other);
+    if (!a || !b || jabs_is_primitive_name(a->name) || jabs_is_primitive_name(b->name)) return 0;
+    if (strcmp(a->name, "java/lang/Object") == 0) return 1;
+    if (b->name[0] == '[') {{
+        if (a->name[0] != '[') return strcmp(a->name, "java/lang/Cloneable") == 0 || strcmp(a->name, "java/io/Serializable") == 0;
+        jabs_not_compiled("Class.isAssignableFrom between two array types");
+    }}
+    if (a->name[0] == '[') return 0;
+    if (a->record && b->record) return jabs_class_assignable(b->record, a->record);
+    jabs_not_compiled("Class.isAssignableFrom for a class outside the unit");
+}}
+
+/* Class.getSuperclass: null for Object, interfaces and primitives; Object for arrays. */
+static jabs_object *jabs_class_superclass(jabs_object *c) {{
+    jabs_class_entry *e = jabs_class_entry_of(c);
+    if (!e || jabs_is_primitive_name(e->name) || strcmp(e->name, "java/lang/Object") == 0) return NULL;
+    if (e->name[0] == '[') return jabs_class_object("java/lang/Object");
+    if (!e->record) jabs_not_compiled("Class.getSuperclass for a class outside the unit");
+    if (e->record->is_interface) return NULL;
+    return jabs_class_object(e->record->super ? e->record->super->name : "java/lang/Object");
+}}
+"#,
+        string_init = init_symbol(STRING),
+        string_record = class_record(STRING),
+        class_init = init_symbol(CLASS),
+        class_record_name = class_record(CLASS),
+        value = instance_field("value"),
+        coder = instance_field("coder"),
+        name_field = instance_field("name"),
+        primitive = instance_field("primitive"),
+        modifiers = instance_field("modifiers"),
+        component = instance_field("componentType"),
+    ));
+    out.push('\n');
 }
 
 /// Classes whose initialization must precede this one's: the superclass, then (for classes)
@@ -2907,6 +3340,7 @@ fn reachable(
     unit: &Unit,
     classes: &[ClassFile],
     results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    intrinsics: &HashMap<MethodKey, &'static str>,
     initializable: &BTreeSet<String>,
     roots: &BTreeSet<String>,
 ) -> Emission {
@@ -2930,6 +3364,10 @@ fn reachable(
     }
     // A record for `class` also needs records for its superclasses and superinterfaces.
     let add_records = |name: &str, records: &mut BTreeSet<String>| {
+        // The class itself (Object's own chain is empty), then its superclasses.
+        if unit.get(name).is_some() {
+            records.insert(name.to_string());
+        }
         if let Ok(chain) = unit.chain(name) {
             for c in chain.iter() {
                 records.insert(c.name.clone());
@@ -2963,7 +3401,18 @@ fn reachable(
             }
         }
     }
+    let mut needs_classes = false;
     loop {
+        // Class objects (and the String names they carry) now exist: make their code reachable.
+        if needs_classes {
+            for name in [CLASS, STRING] {
+                add_records(name, &mut out.records);
+                if out.instantiated.insert(name.to_string()) {
+                    work.extend(implementations(name).into_iter().filter(|k| compiled(k)));
+                    pending_inits.push(name.to_string());
+                }
+            }
+        }
         while let Some(class) = pending_inits.pop() {
             if !initializable.contains(&class) || !out.inits.insert(class.clone()) {
                 continue;
@@ -2983,6 +3432,12 @@ fn reachable(
         let Some(Ok((_, analyzed))) = results.get(&key) else {
             continue;
         };
+        if intrinsics
+            .get(&key)
+            .is_some_and(|i| INTRINSICS.iter().any(|x| x.body == *i && x.needs_classes))
+        {
+            needs_classes = true;
+        }
         for catch in analyzed.dispatch.iter().flatten() {
             if let Some(c) = &catch.class {
                 add_records(c, &mut out.records);
@@ -3004,6 +3459,7 @@ fn reachable(
                         work.extend(implementations(class).into_iter().filter(|k| compiled(k)));
                     }
                 }
+                Op::LdcClass(_) => needs_classes = true,
                 Op::LdcString(_) => {
                     add_records(STRING, &mut out.records);
                     if out.instantiated.insert(STRING.to_string()) {
@@ -3036,6 +3492,8 @@ pub fn compile_unit_rooted(
     roots: Option<&BTreeSet<String>>,
 ) -> CompiledUnit {
     let unit = Unit::new(classes);
+    let have_classes = classes_available(&unit);
+    let mut intrinsics: HashMap<MethodKey, &'static str> = HashMap::new();
     let mut results: BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>> =
         BTreeMap::new();
     for class in classes {
@@ -3052,6 +3510,13 @@ pub fn compile_unit_rooted(
                 }
 
                 let sig = parse_signature(&method.descriptor).map_err(|e| e.to_string())?;
+                if method.access & ACC_NATIVE != 0 {
+                    let Some(body) = intrinsic(&key, have_classes) else {
+                        return Err("native method without a JABS implementation".to_string());
+                    };
+                    intrinsics.insert(key.clone(), body);
+                    return Ok((sig, Analyzed::empty()));
+                }
                 let analyzed = analyze(&unit, class, method, &sig)?;
                 Ok((sig, analyzed))
             })();
@@ -3154,7 +3619,7 @@ pub fn compile_unit_rooted(
         .filter(|c| c.access & ACC_INTERFACE == 0 && unit.chain(&c.name).is_ok())
         .collect();
     let emission = match roots {
-        Some(roots) => reachable(&unit, classes, &results, &initializable, roots),
+        Some(roots) => reachable(&unit, classes, &results, &intrinsics, &initializable, roots),
         None => Emission {
             methods: compiled.clone(),
             records: laid_out_all
@@ -3258,6 +3723,9 @@ pub fn compile_unit_rooted(
         );
     }
     emit_literals(&mut source, &literals);
+    if have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING) {
+        emit_class_registry(&mut source, &recorded);
+    }
     for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
         emit_statics_and_init(&mut source, &unit, class);
     }
@@ -3272,7 +3740,26 @@ pub fn compile_unit_rooted(
             let status = match &results[&key] {
                 _ if method.access & ACC_ABSTRACT != 0 => MethodStatus::Abstract,
                 Ok((sig, analyzed)) => {
-                    if emission.methods.contains(&key) {
+                    if !emission.methods.contains(&key) {
+                    } else if let Some(body) = intrinsics.get(&key) {
+                        let mut unused = String::new();
+                        if method.access & ACC_STATIC == 0 {
+                            unused.push_str(" (void)self;");
+                        }
+                        for i in 0..sig.params.len() {
+                            let _ = write!(unused, " (void)a{i};");
+                        }
+                        let _ = writeln!(
+                            source,
+                            "/* native {}.{}{} */",
+                            class.name, method.name, method.descriptor
+                        );
+                        let _ = writeln!(
+                            source,
+                            "{} {{{unused} {body} }}\n",
+                            prototype(&class.name, method, sig)
+                        );
+                    } else {
                         emit_method(&mut source, &unit, class, method, sig, analyzed);
                     }
                     MethodStatus::Compiled {
