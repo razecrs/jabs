@@ -262,6 +262,14 @@ fn blocker_category(reason: &str) -> String {
         "calls a method that is not compiled".into()
     } else if reason.starts_with("call to ") {
         "calls into another class".into()
+    } else if reason.contains("cross-class initialization") {
+        "initialization of a superclass/superinterface (cross-class)".into()
+    } else if reason.starts_with("static initializer not compiled") {
+        "static initializer not compiled".into()
+    } else if reason.contains("in another class is not compiled")
+        || reason.contains("cross-class field")
+    {
+        "static field of another class".into()
     } else if reason.starts_with("reference types in") {
         "reference types in signature".into()
     } else if let Some(op) = reason.strip_prefix("opcode ") {

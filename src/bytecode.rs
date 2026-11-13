@@ -158,6 +158,16 @@ pub enum Op {
         name: String,
         descriptor: String,
     },
+    GetStatic {
+        class: String,
+        name: String,
+        descriptor: String,
+    },
+    PutStatic {
+        class: String,
+        name: String,
+        descriptor: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -367,6 +377,23 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
                 class: class_name.into(),
                 name: name.into(),
                 descriptor: descriptor.into(),
+            }
+        }
+        0xb2 | 0xb3 => {
+            let (class_name, name, descriptor) = class.field_ref(c.u16()?)?;
+            let (class, name, descriptor) = (class_name.into(), name.into(), descriptor.into());
+            if opcode == 0xb2 {
+                GetStatic {
+                    class,
+                    name,
+                    descriptor,
+                }
+            } else {
+                PutStatic {
+                    class,
+                    name,
+                    descriptor,
+                }
             }
         }
         0xc4 => {

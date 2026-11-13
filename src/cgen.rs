@@ -5,7 +5,7 @@
 //! other methods are reported with a specific reason; nothing is guessed.
 
 use crate::bytecode::{self, BinOp, Compare, Cond, Convert, DecodeError, Insn, Kind, Op, Value};
-use crate::classfile::{ACC_STATIC, ACC_SYNCHRONIZED, ClassFile, Member};
+use crate::classfile::{ACC_STATIC, ACC_SYNCHRONIZED, ClassFile, Constant, Member};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::{
@@ -126,6 +126,78 @@ pub fn symbol(class: &str, name: &str, descriptor: &str) -> String {
     out.push_str("__");
     mangle(descriptor, &mut out);
     out
+}
+
+/// C symbol for a static field's storage.
+pub fn field_symbol(class: &str, name: &str) -> String {
+    let mut out = String::from("jf_");
+    mangle(class, &mut out);
+    out.push_str("__");
+    mangle(name, &mut out);
+    out
+}
+
+/// C symbol of a class's initialization entry point; returns 0 when the class is ready, -1 with `jabs_pending` set.
+pub fn init_symbol(class: &str) -> String {
+    let mut out = String::from("jc_");
+    mangle(class, &mut out);
+    out.push_str("__init");
+    out
+}
+
+/// C storage type for a primitive static field, sized like the JVM's (so byte fields really hold a byte).
+fn storage_type(descriptor: &str) -> Option<&'static str> {
+    Some(match descriptor {
+        "Z" => "uint8_t",
+        "B" => "int8_t",
+        "C" => "uint16_t",
+        "S" => "int16_t",
+        "I" => "int32_t",
+        "J" => "int64_t",
+        "F" => "float",
+        "D" => "double",
+        _ => return None,
+    })
+}
+
+/// Expression converting a stack value into a field's storage type (putstatic narrowing; boolean keeps bit 0).
+fn narrow_for_store(descriptor: &str, value: &str) -> String {
+    match descriptor {
+        "Z" => format!("(uint8_t)({value} & 1)"),
+        "B" => format!("(int8_t)jabs_i2b({value})"),
+        "C" => format!("(uint16_t)jabs_i2c({value})"),
+        "S" => format!("(int16_t)jabs_i2s({value})"),
+        _ => value.to_string(),
+    }
+}
+
+/// Find this class's own primitive static field, or explain why the access cannot be compiled.
+fn own_static_field<'a>(
+    class: &'a ClassFile,
+    owner: &str,
+    name: &str,
+    descriptor: &str,
+    pc: u32,
+) -> Result<&'a Member> {
+    if owner != class.name {
+        bail!("pc {pc}: static field {owner}.{name} in another class is not compiled yet");
+    }
+    let Some(field) = class
+        .fields
+        .iter()
+        .find(|f| f.name == name && f.descriptor == descriptor)
+    else {
+        bail!(
+            "pc {pc}: static field {name} is inherited; cross-class field resolution is not compiled yet"
+        );
+    };
+    if field.access & ACC_STATIC == 0 {
+        bail!("pc {pc}: {name} is not a static field");
+    }
+    if storage_type(descriptor).is_none() {
+        bail!("pc {pc}: static field {name} of reference type {descriptor} needs the object model");
+    }
+    Ok(field)
 }
 
 struct Analyzed {
@@ -295,6 +367,26 @@ fn step(
             if let Some(k) = kind_of(callee.ret) {
                 stack.push(k);
             }
+        }
+        Op::GetStatic {
+            class: owner,
+            name,
+            descriptor,
+        } => {
+            own_static_field(class, owner, name, descriptor, pc)?;
+            stack.push(kind_of(descriptor.chars().next().unwrap()).unwrap());
+        }
+        Op::PutStatic {
+            class: owner,
+            name,
+            descriptor,
+        } => {
+            own_static_field(class, owner, name, descriptor, pc)?;
+            pop(
+                stack,
+                kind_of(descriptor.chars().next().unwrap()).unwrap(),
+                pc,
+            )?;
         }
     }
     if let Op::Goto(t) = insn.op {
@@ -645,6 +737,19 @@ fn emit_method(
                 };
                 format!("{assign} if (jabs_pending) {ret_default}")
             }
+            Op::GetStatic {
+                name, descriptor, ..
+            } => {
+                let k = kind_of(descriptor.chars().next().unwrap()).unwrap();
+                format!("s[{d}].{} = {};", field(k), field_symbol(&class.name, name))
+            }
+            Op::PutStatic {
+                name, descriptor, ..
+            } => {
+                let k = kind_of(descriptor.chars().next().unwrap()).unwrap();
+                let value = narrow_for_store(descriptor, &format!("s[{}].{}", d - 1, field(k)));
+                format!("{} = {value};", field_symbol(&class.name, name))
+            }
         };
         let _ = writeln!(out, "    {line}");
     }
@@ -660,9 +765,76 @@ fn int_case(key: i32) -> String {
     }
 }
 
+/// Emit static field storage and the class initialization function (JVMS 5.5, single-threaded).
+fn emit_statics_and_init(out: &mut String, class: &ClassFile, has_clinit: bool) {
+    let mut constants = String::new();
+    for f in class.fields.iter().filter(|f| f.access & ACC_STATIC != 0) {
+        let Some(ty) = storage_type(&f.descriptor) else {
+            continue;
+        };
+        let sym = field_symbol(&class.name, &f.name);
+        let _ = writeln!(out, "static {ty} {sym};");
+        // ConstantValue fields are set by the initialization procedure itself, before <clinit> runs.
+        let value = match f.constant_value.and_then(|i| class.pool.get(i as usize)) {
+            Some(Constant::Integer(v)) => Some(Value::I(*v)),
+            Some(Constant::Long(v)) => Some(Value::J(*v)),
+            Some(Constant::Float(v)) => Some(Value::F(*v)),
+            Some(Constant::Double(v)) => Some(Value::D(*v)),
+            _ => None,
+        };
+        if let Some(value) = value {
+            let literal = narrow_for_store(&f.descriptor, &value_literal(value));
+            let _ = writeln!(constants, "    {sym} = {literal};");
+        }
+    }
+    let init = init_symbol(&class.name);
+    let state = format!("{init}_state");
+    let _ = writeln!(
+        out,
+        "\n/* 0 = uninitialized, 1 = initializing, 2 = initialized, 3 = erroneous. */"
+    );
+    let _ = writeln!(out, "static int {state};");
+    let _ = writeln!(out, "int {init}(void);");
+    let _ = writeln!(out, "int {init}(void) {{");
+    let _ = writeln!(
+        out,
+        "    /* State 1 can only mean this thread is mid-initialization (no other threads exist yet). */"
+    );
+    let _ = writeln!(out, "    if ({state} == 1 || {state} == 2) return 0;");
+    let _ = writeln!(
+        out,
+        "    if ({state} == 3) {{ jabs_pending = \"java/lang/NoClassDefFoundError\"; return -1; }}"
+    );
+    let _ = writeln!(out, "    {state} = 1;");
+    out.push_str(&constants);
+    if has_clinit {
+        let _ = writeln!(out, "    {}();", symbol(&class.name, "<clinit>", "()V"));
+        let _ = writeln!(
+            out,
+            "    if (jabs_pending) {{ jabs_pending = jabs_initializer_failure(jabs_pending); {state} = 3; return -1; }}"
+        );
+    }
+    let _ = writeln!(out, "    {state} = 2;");
+    let _ = writeln!(out, "    return 0;\n}}\n");
+}
+
 /// Compile every eligible static method of one class to a self-contained C unit.
 pub fn compile_class(class: &ClassFile) -> CompiledClass {
+    let clinit_key = ("<clinit>".to_string(), "()V".to_string());
     let has_clinit = class.methods.iter().any(|m| m.name == "<clinit>");
+    // JVMS 5.5: initializing a class first initializes its superclass and any superinterface
+    // with default methods. Those live in other classes, which are not compiled together yet.
+    let foreign_init = match class.super_name.as_deref() {
+        Some("java/lang/Object") if class.interfaces.is_empty() => None,
+        Some("java/lang/Object") => Some(format!(
+            "initialization may first run superinterface initializers ({}); cross-class initialization is not compiled yet",
+            class.interfaces.join(", ")
+        )),
+        Some(parent) => Some(format!(
+            "initialization first runs superclass {parent}'s initializer; cross-class initialization is not compiled yet"
+        )),
+        None => Some("java/lang/Object itself is provided by the class library".to_string()),
+    };
     let mut results: BTreeMap<
         (String, String),
         std::result::Result<(Signature, Analyzed), String>,
@@ -670,11 +842,8 @@ pub fn compile_class(class: &ClassFile) -> CompiledClass {
     for method in &class.methods {
         let key = (method.name.clone(), method.descriptor.clone());
         let result = (|| {
-            if has_clinit {
-                return Err(
-                    "class has a static initializer; class initialization is not modeled yet"
-                        .to_string(),
-                );
+            if let Some(reason) = &foreign_init {
+                return Err(reason.clone());
             }
             if method.access & ACC_STATIC == 0 {
                 return Err("instance methods need the object model".into());
@@ -712,6 +881,19 @@ pub fn compile_class(class: &ClassFile) -> CompiledClass {
             results.insert(key, Err(reason));
         }
     }
+    // Every static method runs only after <clinit>, so an uncompilable initializer blocks the class.
+    if has_clinit
+        && foreign_init.is_none()
+        && let Some(Err(reason)) = results.get(&clinit_key)
+    {
+        let reason = format!("static initializer not compiled: {reason}");
+        for (key, result) in results.iter_mut() {
+            if *key != clinit_key && result.is_ok() {
+                *result = Err(reason.clone());
+            }
+        }
+    }
+    let any_compiled = results.values().any(|r| r.is_ok());
 
     let mut source = String::new();
     let _ = writeln!(
@@ -728,6 +910,9 @@ pub fn compile_class(class: &ClassFile) -> CompiledClass {
         }
     }
     source.push('\n');
+    if any_compiled {
+        emit_statics_and_init(&mut source, class, has_clinit);
+    }
     for method in &class.methods {
         let status = match &results[&(method.name.clone(), method.descriptor.clone())] {
             Ok((sig, analyzed)) => {

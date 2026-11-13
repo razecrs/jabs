@@ -66,7 +66,7 @@ fn c_literal(arg: Arg) -> String {
 }
 
 /// Edge-case inputs per fixture method: overflow, MIN/-1, shift masks, NaN, infinities, saturation.
-fn cases() -> Vec<(&'static str, Vec<Arg>)> {
+fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
     let (imin, imax) = (i32::MIN, i32::MAX);
     let (lmin, lmax) = (i64::MIN, i64::MAX);
     let floats = [
@@ -177,6 +177,42 @@ fn cases() -> Vec<(&'static str, Vec<Arg>)> {
     out
 }
 
+const FIXTURE_CLASSES: [&str; 3] = ["Arith", "Statics", "BadInit"];
+
+/// Every call in order as (class, method, args); order matters because static state persists across calls.
+fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
+    let mut out: Vec<_> = arith_cases()
+        .into_iter()
+        .map(|(name, args)| ("Arith", name, args))
+        .collect();
+    let statics: [(&str, Vec<Arg>); 16] = [
+        ("next", vec![]),
+        ("next", vec![]),
+        ("k", vec![]),
+        ("bigPlus", vec![J(5)]),
+        ("b", vec![]),
+        ("ch", vec![]),
+        ("sh", vec![]),
+        ("flag", vec![]),
+        ("setByte", vec![I(300)]),
+        ("b", vec![]),
+        ("setChar", vec![I(-1)]),
+        ("ch", vec![]),
+        ("scaled", vec![D(2.0)]),
+        ("nan", vec![]),
+        ("next", vec![]),
+        ("setByte", vec![I(-129)]),
+    ];
+    out.extend(
+        statics
+            .into_iter()
+            .map(|(name, args)| ("Statics", name, args)),
+    );
+    // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
+    out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
+    out
+}
+
 const JAVA_PRINTERS: &str = r#"
     static void pi(int v) { System.out.println(String.format("I %08x", v)); }
     static void pj(long v) { System.out.println(String.format("J %016x", v)); }
@@ -261,47 +297,55 @@ fn native_matches_reference_jvm() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Arith.java");
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     run(Command::new("javac")
         .args(["--release", "8", "-nowarn", "-Xlint:-options", "-d"])
         .arg(root)
-        .arg(&fixture));
-    let class = ClassFile::parse(&fs::read(root.join("Arith.class")).unwrap()).unwrap();
-    let compiled = cgen::compile_class(&class);
+        .args(
+            FIXTURE_CLASSES
+                .iter()
+                .map(|c| fixtures.join(format!("{c}.java"))),
+        ));
 
-    // Every fixture method except the constructor must compile: unsupported is a test failure here.
-    let unsupported: Vec<_> = compiled
-        .methods
-        .iter()
-        .filter(|m| {
-            m.name != "<init>" && matches!(m.status, cgen::MethodStatus::Unsupported { .. })
-        })
-        .collect();
-    assert!(
-        unsupported.is_empty(),
-        "unexpectedly unsupported: {unsupported:#?}"
-    );
-
-    let descriptor = |name: &str| {
-        class
-            .methods
-            .iter()
-            .find(|m| m.name == name)
-            .unwrap()
-            .descriptor
-            .clone()
-    };
     let mut java = String::from("public class Runner {\n");
     java.push_str(JAVA_PRINTERS);
     java.push_str("    public static void main(String[] args) {\n");
-    let mut c = compiled.c_source.clone();
+    let mut c = String::new();
+    let mut classes = Vec::new();
+    for name in FIXTURE_CLASSES {
+        let class =
+            ClassFile::parse(&fs::read(root.join(format!("{name}.class"))).unwrap()).unwrap();
+        let compiled = cgen::compile_class(&class);
+        // Every fixture method except constructors must compile: unsupported is a test failure here.
+        let unsupported: Vec<_> = compiled
+            .methods
+            .iter()
+            .filter(|m| {
+                m.name != "<init>" && matches!(m.status, cgen::MethodStatus::Unsupported { .. })
+            })
+            .collect();
+        assert!(
+            unsupported.is_empty(),
+            "{name}: unexpectedly unsupported: {unsupported:#?}"
+        );
+        c.push_str(&compiled.c_source);
+        classes.push(class);
+    }
     c.push_str(C_PRINTERS);
     c.push_str("int main(void) {\n");
+
     let all = cases();
-    for (name, args) in &all {
-        let desc = descriptor(name);
+    for (class_name, name, args) in &all {
+        let class = classes.iter().find(|c| c.name == *class_name).unwrap();
+        let desc = class
+            .methods
+            .iter()
+            .find(|m| m.name == *name)
+            .unwrap()
+            .descriptor
+            .clone();
         let sig = cgen::parse_signature(&desc).unwrap();
-        assert_eq!(sig.params.len(), args.len(), "{name}");
+        assert_eq!(sig.params.len(), args.len(), "{class_name}.{name}");
         let jargs: Vec<_> = args
             .iter()
             .zip(&sig.params)
@@ -311,14 +355,16 @@ fn native_matches_reference_jvm() {
         let p = printer(sig.ret);
         let _ = writeln!(
             java,
-            "        try {{ {p}(Arith.{name}({})); }} catch (Throwable t) {{ pt(t); }}",
+            "        try {{ {p}({class_name}.{name}({})); }} catch (Throwable t) {{ pt(t); }}",
             jargs.join(", ")
         );
+        // Like invokestatic, each call first ensures the class is initialized.
         let _ = writeln!(
             c,
-            "    {{ {} r = {}({}); if (!check()) {p}(r); }}",
+            "    if ({}() != 0) check(); else {{ {} r = {}({}); if (!check()) {p}(r); }}",
+            cgen::init_symbol(class_name),
             cgen::c_type(sig.ret),
-            cgen::symbol("Arith", name, &desc),
+            cgen::symbol(class_name, name, &desc),
             cargs.join(", ")
         );
     }
@@ -334,9 +380,13 @@ fn native_matches_reference_jvm() {
         .arg(root.join("Runner.java")));
     let reference = run(Command::new("java").arg("-cp").arg(root).arg("Runner"));
 
-    let c_path = root.join("arith.c");
+    let c_path = root.join("fixtures.c");
     fs::write(&c_path, c).unwrap();
-    let exe = root.join(if cfg!(windows) { "arith.exe" } else { "arith" });
+    let exe = root.join(if cfg!(windows) {
+        "fixtures.exe"
+    } else {
+        "fixtures"
+    });
     run(Command::new("clang")
         .args(clang_target_args(root))
         .args([
@@ -361,12 +411,20 @@ fn native_matches_reference_jvm() {
     let reference: Vec<_> = reference.lines().collect();
     let native: Vec<_> = native.lines().collect();
     assert_eq!(reference.len(), all.len());
+    // Guard that the fixture really exercises the failed-initialization path on the JVM.
+    assert_eq!(
+        reference[reference.len() - 2..],
+        [
+            "throw java/lang/ExceptionInInitializerError",
+            "throw java/lang/NoClassDefFoundError"
+        ]
+    );
     let mismatches: Vec<String> = all
         .iter()
         .zip(reference.iter().zip(&native))
         .filter(|(_, (r, n))| r != n)
         .take(20)
-        .map(|((name, _), (r, n))| format!("{name}: jvm `{r}` native `{n}`"))
+        .map(|((class, name, _), (r, n))| format!("{class}.{name}: jvm `{r}` native `{n}`"))
         .collect();
     assert!(
         mismatches.is_empty(),

@@ -27,6 +27,20 @@ typedef union jabs_value {
 /* Internal class name of the pending exception, or NULL. */
 static _Thread_local const char *jabs_pending;
 
+/* Exception a failed static initializer reports (JVMS 5.5 step 11): Errors pass through,
+ * anything else becomes ExceptionInInitializerError. Until the class hierarchy is modeled,
+ * the Error subclasses listed are the ones this runtime itself can raise. */
+static inline const char *jabs_initializer_failure(const char *thrown) {
+    static const char *const errors[] = {
+        "java/lang/ExceptionInInitializerError", "java/lang/NoClassDefFoundError",
+        "java/lang/StackOverflowError", "java/lang/OutOfMemoryError",
+    };
+    for (size_t i = 0; i < sizeof errors / sizeof errors[0]; i++) {
+        if (strcmp(thrown, errors[i]) == 0) return thrown;
+    }
+    return "java/lang/ExceptionInInitializerError";
+}
+
 /* Reinterpret raw IEEE bits as float/double (exact, including NaN payloads). */
 static inline float jabs_fbits(uint32_t bits) { float f; memcpy(&f, &bits, 4); return f; }
 static inline double jabs_dbits(uint64_t bits) { double d; memcpy(&d, &bits, 8); return d; }

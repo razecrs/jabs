@@ -75,6 +75,8 @@ pub struct Member {
     pub name: String,
     pub descriptor: String,
     pub code: Option<Code>,
+    /// Pool index of a field's ConstantValue attribute (`static final` constants).
+    pub constant_value: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -308,12 +310,18 @@ impl ClassFile {
                 let name = utf8(&pool, c.u16()?)?.to_owned();
                 let descriptor = utf8(&pool, c.u16()?)?.to_owned();
                 let mut code = None;
+                let mut constant_value = None;
                 parse_attributes(c, &pool, |attr, data| {
-                    if attr == "Code" {
-                        if code.is_some() {
-                            bail!("duplicate Code attribute");
+                    match attr {
+                        "Code" if code.is_some() => bail!("duplicate Code attribute"),
+                        "Code" => code = Some(parse_code(data, &pool)?),
+                        "ConstantValue" => {
+                            if data.len() != 2 {
+                                bail!("ConstantValue attribute must be 2 bytes");
+                            }
+                            constant_value = Some(u16::from_be_bytes([data[0], data[1]]));
                         }
-                        code = Some(parse_code(data, &pool)?);
+                        _ => {}
                     }
                     Ok(())
                 })?;
@@ -322,6 +330,7 @@ impl ClassFile {
                     name,
                     descriptor,
                     code,
+                    constant_value,
                 });
             }
             Ok(out)
@@ -372,13 +381,30 @@ impl ClassFile {
         else {
             bail!("constant {index} is not a method reference")
         };
+        self.member_ref(*class, *name_and_type)
+    }
+
+    /// Resolve a Fieldref to (class, name, descriptor).
+    pub fn field_ref(&self, index: u16) -> Result<(&str, &str, &str)> {
+        let Some(Constant::FieldRef {
+            class,
+            name_and_type,
+        }) = self.pool.get(index as usize)
+        else {
+            bail!("constant {index} is not a field reference")
+        };
+        self.member_ref(*class, *name_and_type)
+    }
+
+    /// Resolve a (Class, NameAndType) pair to (class, name, descriptor).
+    fn member_ref(&self, class: u16, name_and_type: u16) -> Result<(&str, &str, &str)> {
         let Some(Constant::NameAndType { name, descriptor }) =
-            self.pool.get(*name_and_type as usize)
+            self.pool.get(name_and_type as usize)
         else {
             bail!("constant {name_and_type} is not NameAndType")
         };
         Ok((
-            self.class_name(*class)?,
+            self.class_name(class)?,
             self.utf8(*name)?,
             self.utf8(*descriptor)?,
         ))
