@@ -19,13 +19,25 @@
 #error "JABS requires FLT_EVAL_METHOD == 0 for Java floating-point semantics"
 #endif
 
-/* A class's runtime record: name, instance size, vtable (one slot per overridable method)
- * and superclass record (NULL directly below java/lang/Object). */
+/* One interface-table entry: a method signature's selector and the implementation chosen for it. */
+typedef struct jabs_itable_entry {
+    uint64_t selector;
+    void (*fn)(void);
+} jabs_itable_entry;
+
+/* A class's runtime record: name, instance size, vtable (one slot per overridable method),
+ * superclass record (NULL directly below java/lang/Object), interface table sorted by
+ * selector, every superinterface, and whether the record is itself an interface. */
 typedef struct jabs_class {
     const char *name;
     size_t size;
     void (*const *vtable)(void);
     const struct jabs_class *super;
+    const jabs_itable_entry *itable;
+    uint32_t itable_len;
+    const struct jabs_class *const *interfaces;
+    uint32_t interfaces_len;
+    int32_t is_interface;
 } jabs_class;
 
 /* Every object starts with this header; the class's own struct embeds it first. */
@@ -160,7 +172,7 @@ static inline void *jabs_array_data(jabs_array *a) {
 /* Shared record for every array object: arrays are instances of no compiled class.
  * A function-local static avoids unused-variable warnings in programs without arrays. */
 static inline const jabs_class *jabs_array_class(void) {
-    static const jabs_class record = { "[", 0, NULL, NULL };
+    static const jabs_class record = { "[", 0, NULL, NULL, NULL, 0, NULL, 0, 0 };
     return &record;
 }
 
@@ -201,12 +213,35 @@ static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, i
     return &a->header;
 }
 
-/* instanceof for a class target: walk the object's superclass chain. */
+/* instanceof: walk the superclass chain for classes, the interface list for interfaces.
+ * Arrays implement exactly Cloneable and Serializable. */
 static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target) {
+    if (target->is_interface) {
+        if (o->cls == jabs_array_class()) {
+            return strcmp(target->name, "java/lang/Cloneable") == 0 || strcmp(target->name, "java/io/Serializable") == 0;
+        }
+        for (uint32_t i = 0; i < o->cls->interfaces_len; i++) {
+            if (o->cls->interfaces[i] == target) return 1;
+        }
+        return 0;
+    }
     for (const jabs_class *c = o->cls; c; c = c->super) {
         if (c == target) return 1;
     }
     return 0;
+}
+
+/* invokeinterface: binary search the receiver's interface table; NULL if the class does not
+ * implement a method with this selector (IncompatibleClassChangeError). */
+static inline void (*jabs_itable_find(const jabs_object *o, uint64_t selector))(void) {
+    const jabs_itable_entry *t = o->cls->itable;
+    uint32_t lo = 0, hi = o->cls->itable_len;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (t[mid].selector < selector) lo = mid + 1;
+        else hi = mid;
+    }
+    return (lo < o->cls->itable_len && t[lo].selector == selector) ? t[lo].fn : NULL;
 }
 
 static inline jabs_object *jabs_new(const jabs_class *cls) {

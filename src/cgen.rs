@@ -326,6 +326,31 @@ fn package(class: &str) -> &str {
 /// A method identity: (class, name, descriptor).
 pub type MethodKey = (String, String, String);
 
+/// Stable 64-bit ID of an interface method signature; independent of which classes exist.
+pub fn selector(name: &str, descriptor: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{name}\0{descriptor}").as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().unwrap())
+}
+
+/// What an interface call selects on instances of a class (JVMS 5.4.6).
+#[derive(Debug, Clone)]
+enum ItableTarget {
+    Impl(MethodKey),
+    /// No implementation: AbstractMethodError.
+    Abstract,
+    /// Several equally specific default methods: IncompatibleClassChangeError.
+    Ambiguous,
+}
+
+#[derive(Debug, Clone)]
+struct ItableEntry {
+    selector: u64,
+    name: String,
+    descriptor: String,
+    target: ItableTarget,
+}
+
 /// One vtable slot: the method's name and descriptor, and which class's implementation fills it.
 #[derive(Debug, Clone)]
 struct Slot {
@@ -344,6 +369,7 @@ struct Unit<'a> {
     names: RefCell<(Vec<String>, HashMap<String, u32>)>,
     vtables: RefCell<HashMap<String, Rc<Vec<Slot>>>>,
     chains: RefCell<HashMap<String, ChainResult<'a>>>,
+    itables: RefCell<HashMap<String, Rc<Vec<ItableEntry>>>>,
 }
 
 impl<'a> Unit<'a> {
@@ -353,6 +379,7 @@ impl<'a> Unit<'a> {
             names: RefCell::new((Vec::new(), HashMap::new())),
             vtables: RefCell::new(HashMap::new()),
             chains: RefCell::new(HashMap::new()),
+            itables: RefCell::new(HashMap::new()),
         }
     }
     fn get(&self, name: &str) -> Option<&'a ClassFile> {
@@ -486,6 +513,122 @@ impl<'a> Unit<'a> {
         }
         bail!("field {owner}.{name} is not declared in the unit")
     }
+    /// JVMS 5.4.3.4: find an interface method in the interface or its superinterfaces.
+    fn resolve_interface_method(
+        &self,
+        iface: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> Result<(&'a ClassFile, &'a Member)> {
+        let first = self
+            .get(iface)
+            .ok_or_else(|| anyhow!("{iface} is not in the compilation unit"))?;
+        for class in std::iter::once(first).chain(self.superinterfaces(iface)?) {
+            if let Some(m) = class.methods.iter().find(|m| {
+                m.name == name && m.descriptor == descriptor && m.access & ACC_STATIC == 0
+            }) {
+                return Ok((class, m));
+            }
+        }
+        bail!(
+            "{iface}.{name}{descriptor} is inherited from outside the unit (e.g. java/lang/Object)"
+        )
+    }
+    /// Interface dispatch table of a class: for every method of every superinterface, the
+    /// implementation selected per JVMS 5.4.6, sorted by selector.
+    fn itable(&self, name: &str) -> Rc<Vec<ItableEntry>> {
+        if let Some(t) = self.itables.borrow().get(name) {
+            return t.clone();
+        }
+        let mut entries: Vec<ItableEntry> = Vec::new();
+        if let (Ok(chain), Ok(ifaces)) = (self.chain(name), self.superinterfaces(name)) {
+            let mut seen = BTreeSet::new();
+            for iface in &ifaces {
+                for m in iface.methods.iter().filter(|m| {
+                    m.access & (ACC_STATIC | ACC_PRIVATE) == 0 && !m.name.starts_with('<')
+                }) {
+                    if !seen.insert((m.name.clone(), m.descriptor.clone())) {
+                        continue;
+                    }
+                    // 1. A method in the class or a superclass wins (abstract ones throw when called).
+                    let in_class = chain.iter().find_map(|c| {
+                        c.methods
+                            .iter()
+                            .find(|x| {
+                                x.name == m.name
+                                    && x.descriptor == m.descriptor
+                                    && x.access & (ACC_STATIC | ACC_PRIVATE) == 0
+                            })
+                            .map(|x| (c, x))
+                    });
+                    let target = match in_class {
+                        Some((_, x)) if x.access & ACC_ABSTRACT != 0 => ItableTarget::Abstract,
+                        Some((c, _)) => ItableTarget::Impl((
+                            c.name.clone(),
+                            m.name.clone(),
+                            m.descriptor.clone(),
+                        )),
+                        None => {
+                            // 2. Otherwise the maximally specific default method, if exactly one.
+                            let candidates: Vec<&ClassFile> = ifaces
+                                .iter()
+                                .copied()
+                                .filter(|i| {
+                                    i.methods.iter().any(|x| {
+                                        x.name == m.name
+                                            && x.descriptor == m.descriptor
+                                            && x.access & (ACC_STATIC | ACC_PRIVATE | ACC_ABSTRACT)
+                                                == 0
+                                    })
+                                })
+                                .collect();
+                            let specific: Vec<&ClassFile> = candidates
+                                .iter()
+                                .copied()
+                                .filter(|c| {
+                                    !candidates.iter().any(|other| {
+                                        other.name != c.name
+                                            && self.superinterfaces(&other.name).is_ok_and(|sup| {
+                                                sup.iter().any(|s| s.name == c.name)
+                                            })
+                                    })
+                                })
+                                .collect();
+                            match specific.as_slice() {
+                                [one] => ItableTarget::Impl((
+                                    one.name.clone(),
+                                    m.name.clone(),
+                                    m.descriptor.clone(),
+                                )),
+                                [] => ItableTarget::Abstract,
+                                _ => ItableTarget::Ambiguous,
+                            }
+                        }
+                    };
+                    entries.push(ItableEntry {
+                        selector: selector(&m.name, &m.descriptor),
+                        name: m.name.clone(),
+                        descriptor: m.descriptor.clone(),
+                        target,
+                    });
+                }
+            }
+        }
+        entries.sort_by_key(|e| e.selector);
+        for pair in entries.windows(2) {
+            assert!(
+                pair[0].selector != pair[1].selector,
+                "interface selector collision in {name}: {} and {}",
+                pair[0].name,
+                pair[1].name
+            );
+        }
+        let entries = Rc::new(entries);
+        self.itables
+            .borrow_mut()
+            .insert(name.to_string(), entries.clone());
+        entries
+    }
     /// Whether a method declared in `owner` with `access` is overridden by a method in class `by` (JVMS 5.4.5).
     fn overrides(owner: &str, access: u16, by: &str) -> bool {
         const PUBLIC_OR_PROTECTED: u16 = 0x0001 | 0x0004;
@@ -602,6 +745,8 @@ enum CallKind {
     Virtual { slot: usize, target: MethodKey },
     /// `java/lang/Object.<init>()V`: no effect.
     ObjectInit,
+    /// Select the implementation from the receiver's interface table by selector.
+    Interface { selector: u64, target: MethodKey },
 }
 
 /// What verification resolved for one instruction, for emission.
@@ -1103,7 +1248,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             if class.starts_with('[') {
                 bail!("pc {pc}: arrays in casts are not compiled yet");
             }
-            if unit.get(class).is_none() || unit.is_interface(class) || unit.chain(class).is_err() {
+            if unit.get(class).is_none() || unit.chain(class).is_err() {
                 bail!(
                     "pc {pc}: type test against {class} (outside the unit or an interface) is not compiled yet"
                 );
@@ -1140,7 +1285,41 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             if m.name.starts_with('<') {
                 bail!("pc {pc}: invokevirtual of {}", m.name);
             }
-            let (declaring, target) = unit.resolve_method(&m.class, &m.name, &m.descriptor)?;
+            let (declaring, target) = match unit.resolve_method(&m.class, &m.name, &m.descriptor) {
+                Ok(found) => found,
+                // A default method inherited from a superinterface: dispatch like invokeinterface.
+                Err(e) => {
+                    let found = unit.superinterfaces(&m.class).ok().and_then(|ifaces| {
+                        ifaces.into_iter().find_map(|i| {
+                            i.methods
+                                .iter()
+                                .find(|x| {
+                                    x.name == m.name
+                                        && x.descriptor == m.descriptor
+                                        && x.access & ACC_STATIC == 0
+                                })
+                                .map(|x| (i, x))
+                        })
+                    });
+                    let Some((iface, _)) = found else {
+                        return Err(e);
+                    };
+                    let s = parse_signature(&m.descriptor)?;
+                    for p in s.params.iter().rev() {
+                        frame.pop_ty(cx, p, pc)?;
+                    }
+                    frame.pop_ref(cx, &m.class, pc)?;
+                    if s.ret.code != 'V' {
+                        frame.stack.push(cx.of_ty(&s.ret));
+                    }
+                    let target = (iface.name.clone(), m.name.clone(), m.descriptor.clone());
+                    out.resolved = Some(Resolved::Call(CallKind::Interface {
+                        selector: selector(&m.name, &m.descriptor),
+                        target,
+                    }));
+                    return Ok(out);
+                }
+            };
             if target.access & ACC_STATIC != 0 {
                 bail!("pc {pc}: invokevirtual of static method {}", m.name);
             }
@@ -1169,6 +1348,51 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 // holds a stub (see `emit_stubs`), so subclasses never change this decision.
                 out.resolved = Some(Resolved::Call(CallKind::Virtual { slot, target: key }));
             }
+        }
+        Op::InvokeInterface(m) => {
+            if !unit.is_interface(&m.class) {
+                bail!(
+                    "pc {pc}: invokeinterface on {}, which is not an interface in the unit",
+                    m.class
+                );
+            }
+            let (declaring, _) = unit.resolve_interface_method(&m.class, &m.name, &m.descriptor)?;
+            let s = parse_signature(&m.descriptor)?;
+            for p in s.params.iter().rev() {
+                frame.pop_ty(cx, p, pc)?;
+            }
+            frame.pop_ref(cx, &m.class, pc)?;
+            if s.ret.code != 'V' {
+                frame.stack.push(cx.of_ty(&s.ret));
+            }
+            // No dependency on implementations: uncompiled ones are stubs in the receiver's table.
+            let target = (declaring.name.clone(), m.name.clone(), m.descriptor.clone());
+            out.resolved = Some(Resolved::Call(CallKind::Interface {
+                selector: selector(&m.name, &m.descriptor),
+                target,
+            }));
+        }
+        Op::InvokeSpecial(m) if unit.is_interface(&m.class) && m.name != "<init>" => {
+            // Interface.super.m() or a private interface method: a direct call to that body.
+            let (declaring, target) =
+                unit.resolve_interface_method(&m.class, &m.name, &m.descriptor)?;
+            if target.access & ACC_ABSTRACT != 0 {
+                bail!(
+                    "pc {pc}: invokespecial of abstract interface method {}",
+                    m.name
+                );
+            }
+            let s = parse_signature(&m.descriptor)?;
+            for p in s.params.iter().rev() {
+                frame.pop_ty(cx, p, pc)?;
+            }
+            frame.pop_ref(cx, this, pc)?;
+            if s.ret.code != 'V' {
+                frame.stack.push(cx.of_ty(&s.ret));
+            }
+            let key = (declaring.name.clone(), m.name.clone(), m.descriptor.clone());
+            out.deps.push(Dep::Method(key.clone()));
+            out.resolved = Some(Resolved::Call(CallKind::Direct(key)));
         }
         Op::InvokeSpecial(m) => {
             let parent = cx.class.super_name.as_deref().unwrap_or(OBJECT);
@@ -1496,7 +1720,7 @@ fn emit_method(
                     .unwrap();
                 (key, m.access & ACC_STATIC == 0)
             }
-            CallKind::Virtual { target, .. } => (target, true),
+            CallKind::Virtual { target, .. } | CallKind::Interface { target, .. } => (target, true),
             CallKind::ObjectInit => unreachable!(),
         };
         let result_at = if receiver { base - 1 } else { base };
@@ -1518,9 +1742,22 @@ fn emit_method(
                 c_params(false, &callee, false),
                 base - 1
             ),
+            CallKind::Interface { selector, .. } => format!(
+                "(({} (*)({}))jabs_itable_find(s[{}].a, UINT64_C(0x{selector:016x})))",
+                c_type(callee.ret.code),
+                c_params(false, &callee, false),
+                base - 1
+            ),
             _ => symbol(&key.0, &key.1, &key.2),
         };
-        let guard = if receiver {
+        let guard = if let CallKind::Interface { selector, .. } = kind {
+            // The receiver's class must implement the interface (JVMS invokeinterface).
+            format!(
+                "if (!s[{r}].a) {npe} if (!jabs_itable_find(s[{r}].a, UINT64_C(0x{selector:016x}))) {} ",
+                throw("java/lang/IncompatibleClassChangeError"),
+                r = base - 1
+            )
+        } else if receiver {
             format!("if (!s[{}].a) {npe} ", base - 1)
         } else {
             init_guard(unit, &class.name, &key.0, ret_default)
@@ -1704,7 +1941,8 @@ fn emit_method(
             }
             Op::InvokeStatic { descriptor, .. }
             | Op::InvokeVirtual(MemberRef { descriptor, .. })
-            | Op::InvokeSpecial(MemberRef { descriptor, .. }) => match resolved {
+            | Op::InvokeSpecial(MemberRef { descriptor, .. })
+            | Op::InvokeInterface(MemberRef { descriptor, .. }) => match resolved {
                 Some(Resolved::Call(CallKind::ObjectInit)) => {
                     "/* java/lang/Object.<init>()V has no effect */".into()
                 }
@@ -1761,7 +1999,6 @@ fn emit_method(
                 } else if primitive_rows {
                     ("JABS_COMPONENT_ARRAY", "NULL".to_string())
                 } else if !component.starts_with('[')
-                    && !unit.is_interface(component)
                     && unit.get(component).is_some()
                     && unit.chain(component).is_ok()
                 {
@@ -2021,18 +2258,67 @@ fn stub_symbol(key: &MethodKey) -> String {
     mangled("jx_", &[&key.0, &key.1, &key.2])
 }
 
-/// Emit typed stubs for vtable implementations that did not compile. Abstract methods throw
-/// AbstractMethodError, as Java does; anything else stops with a diagnostic (the JVM backend
-/// must run the profile until that method compiles). Stubs keep each class's code independent
-/// of which subclasses exist, so per-class caching stays valid when mods add subclasses.
+/// C name of the stub for an interface call with no unique implementation on `class`.
+fn error_stub_symbol(class: &str, name: &str, descriptor: &str) -> String {
+    mangled("jxe_", &[class, name, descriptor])
+}
+
+/// Write one typed stub function with the given body.
+fn write_stub(out: &mut String, name: &str, sig: &Signature, body: &str) {
+    let unused: String = (0..sig.params.len())
+        .map(|i| format!(" (void)a{i};"))
+        .collect();
+    let _ = writeln!(
+        out,
+        "static {} {name}({}) {{ (void)self;{unused} {body} }}",
+        c_type(sig.ret.code),
+        c_params(false, sig, true)
+    );
+}
+
+/// Emit typed stubs for vtable and interface-table entries without live code. Abstract methods
+/// throw AbstractMethodError and ambiguous defaults IncompatibleClassChangeError, as Java does;
+/// anything else stops with a diagnostic (the JVM backend must run the profile until that
+/// method compiles). Stubs keep each class's code independent of which subclasses exist, so
+/// per-class caching stays valid when mods add subclasses.
 fn emit_stubs(
     out: &mut String,
     unit: &Unit,
-    laid_out: &[&ClassFile],
+    recorded: &[&ClassFile],
     live: &dyn Fn(&str, &MethodKey) -> bool,
 ) {
     let mut done = BTreeSet::new();
-    for class in laid_out {
+    let mut stub_for = |out: &mut String, key: &MethodKey| {
+        if !done.insert(key.clone()) {
+            return;
+        }
+        let Ok(sig) = parse_signature(&key.2) else {
+            return;
+        };
+        let is_abstract = unit
+            .get(&key.0)
+            .and_then(|c| {
+                c.methods
+                    .iter()
+                    .find(|m| m.name == key.1 && m.descriptor == key.2)
+            })
+            .is_some_and(|m| m.access & ACC_ABSTRACT != 0);
+        let ret = if sig.ret.code == 'V' {
+            "return;"
+        } else {
+            "return 0;"
+        };
+        let body = if is_abstract {
+            format!("jabs_pending = \"java/lang/AbstractMethodError\"; {ret}")
+        } else {
+            format!(
+                "jabs_not_compiled(\"{}\");",
+                c_escape(&format!("{}.{}{}", key.0, key.1, key.2))
+            )
+        };
+        write_stub(out, &stub_symbol(key), &sig, &body);
+    };
+    for class in recorded {
         for slot in unit
             .vtable(&class.name)
             .map(|v| (*v).clone())
@@ -2043,53 +2329,72 @@ fn emit_stubs(
                 slot.name.clone(),
                 slot.descriptor.clone(),
             );
-            if live(&class.name, &key) || !done.insert(key.clone()) {
-                continue;
+            if !live(&class.name, &key) {
+                stub_for(out, &key);
             }
-            // Calls with unparsable descriptors (arrays) never compile, so their slots stay NULL.
-            let Ok(sig) = parse_signature(&key.2) else {
+        }
+        for entry in unit.itable(&class.name).iter() {
+            let Ok(sig) = parse_signature(&entry.descriptor) else {
                 continue;
             };
-            let is_abstract = unit
-                .get(&key.0)
-                .and_then(|c| {
-                    c.methods
-                        .iter()
-                        .find(|m| m.name == key.1 && m.descriptor == key.2)
-                })
-                .is_some_and(|m| m.access & ACC_ABSTRACT != 0);
-            let body = if is_abstract {
-                let ret = if sig.ret.code == 'V' {
-                    "return;"
-                } else {
-                    "return 0;"
-                };
-                format!("jabs_pending = \"java/lang/AbstractMethodError\"; {ret}")
+            let ret = if sig.ret.code == 'V' {
+                "return;"
             } else {
-                format!("jabs_not_compiled(\"{}.{}{}\");", key.0, key.1, key.2)
+                "return 0;"
             };
-            let unused: String = (0..sig.params.len())
-                .map(|i| format!(" (void)a{i};"))
-                .collect();
-            let _ = writeln!(
-                out,
-                "static {} {}({}) {{ (void)self;{unused} {body} }}",
-                c_type(sig.ret.code),
-                stub_symbol(&key),
-                c_params(false, &sig, true)
-            );
+            match &entry.target {
+                ItableTarget::Impl(key) if !live(&class.name, key) => stub_for(out, key),
+                ItableTarget::Impl(_) => {}
+                ItableTarget::Abstract | ItableTarget::Ambiguous => {
+                    let error = if matches!(entry.target, ItableTarget::Abstract) {
+                        "java/lang/AbstractMethodError"
+                    } else {
+                        "java/lang/IncompatibleClassChangeError"
+                    };
+                    let name = error_stub_symbol(&class.name, &entry.name, &entry.descriptor);
+                    write_stub(
+                        out,
+                        &name,
+                        &sig,
+                        &format!("jabs_pending = \"{error}\"; {ret}"),
+                    );
+                }
+            }
         }
     }
     out.push('\n');
 }
 
-/// Emit a class's vtable and runtime record; implementations that did not compile are stubs.
+/// Emit the runtime record of an interface (used by instanceof, checkcast and array stores).
+fn emit_interface_record(out: &mut String, iface: &ClassFile) {
+    let _ = writeln!(
+        out,
+        "const jabs_class {} = {{ \"{}\", 0, NULL, NULL, NULL, 0, NULL, 0, 1 }};",
+        class_record(&iface.name),
+        c_escape(&iface.name)
+    );
+}
+
+/// Emit a class's vtable, interface table, interface list and runtime record; entries
+/// without live code point at stubs.
 fn emit_class_record(
     out: &mut String,
     unit: &Unit,
     class: &ClassFile,
     live: &dyn Fn(&str, &MethodKey) -> bool,
 ) {
+    let function = |key: &MethodKey| -> Option<String> {
+        if live(&class.name, key) {
+            Some(format!(
+                "(void (*)(void)){}",
+                symbol(&key.0, &key.1, &key.2)
+            ))
+        } else if parse_signature(&key.2).is_ok() {
+            Some(format!("(void (*)(void)){}", stub_symbol(key)))
+        } else {
+            None
+        }
+    };
     let vtable_name = mangled("jv_", &[&class.name]);
     let slots = unit
         .vtable(&class.name)
@@ -2098,14 +2403,8 @@ fn emit_class_record(
     let entries: Vec<String> = slots
         .iter()
         .map(|s| {
-            let key = (s.owner.clone(), s.name.clone(), s.descriptor.clone());
-            if live(&class.name, &key) {
-                format!("(void (*)(void)){}", symbol(&key.0, &key.1, &key.2))
-            } else if parse_signature(&key.2).is_ok() {
-                format!("(void (*)(void)){}", stub_symbol(&key))
-            } else {
-                "0".into()
-            }
+            function(&(s.owner.clone(), s.name.clone(), s.descriptor.clone()))
+                .unwrap_or_else(|| "0".into())
         })
         .collect();
     let entries = if entries.is_empty() {
@@ -2113,20 +2412,66 @@ fn emit_class_record(
     } else {
         entries.join(", ")
     };
-    let parent = match class.super_name.as_deref() {
-        Some(p) if p != OBJECT => format!("&{}", class_record(p)),
-        _ => "NULL".to_string(),
-    };
     // External linkage: records are referenced across the unit and must not trip unused warnings.
     let _ = writeln!(
         out,
         "void (*const {vtable_name}[])(void) = {{ {entries} }};"
     );
+
+    let itable: Vec<String> = unit
+        .itable(&class.name)
+        .iter()
+        .filter_map(|e| {
+            let f = match &e.target {
+                ItableTarget::Impl(key) => function(key)?,
+                _ if parse_signature(&e.descriptor).is_ok() => {
+                    format!(
+                        "(void (*)(void)){}",
+                        error_stub_symbol(&class.name, &e.name, &e.descriptor)
+                    )
+                }
+                _ => return None,
+            };
+            Some(format!("{{ UINT64_C(0x{:016x}), {f} }}", e.selector))
+        })
+        .collect();
+    let itable_name = mangled("ji_", &[&class.name]);
+    let (itable_ref, itable_len) = if itable.is_empty() {
+        ("NULL".to_string(), 0)
+    } else {
+        let _ = writeln!(
+            out,
+            "static const jabs_itable_entry {itable_name}[] = {{ {} }};",
+            itable.join(", ")
+        );
+        (itable_name, itable.len())
+    };
+    let ifaces: Vec<String> = unit
+        .superinterfaces(&class.name)
+        .unwrap_or_default()
+        .iter()
+        .map(|i| format!("&{}", class_record(&i.name)))
+        .collect();
+    let ifaces_name = mangled("jn_", &[&class.name]);
+    let (ifaces_ref, ifaces_len) = if ifaces.is_empty() {
+        ("NULL".to_string(), 0)
+    } else {
+        let _ = writeln!(
+            out,
+            "static const jabs_class *const {ifaces_name}[] = {{ {} }};",
+            ifaces.join(", ")
+        );
+        (ifaces_name, ifaces.len())
+    };
+    let parent = match class.super_name.as_deref() {
+        Some(p) if p != OBJECT => format!("&{}", class_record(p)),
+        _ => "NULL".to_string(),
+    };
     let _ = writeln!(
         out,
-        "const jabs_class {} = {{ \"{}\", sizeof({}), {vtable_name}, {parent} }};\n",
+        "const jabs_class {} = {{ \"{}\", sizeof({}), {vtable_name}, {parent}, {itable_ref}, {itable_len}, {ifaces_ref}, {ifaces_len}, 0 }};\n",
         class_record(&class.name),
-        class.name,
+        c_escape(&class.name),
         object_struct(&class.name)
     );
 }
@@ -2273,13 +2618,31 @@ fn reachable(
             }
         }
     }
-    // A record for `class` also needs records for its superclasses (instanceof walks them).
+    // A record for `class` also needs records for its superclasses and superinterfaces.
     let add_records = |name: &str, records: &mut BTreeSet<String>| {
         if let Ok(chain) = unit.chain(name) {
             for c in chain.iter() {
                 records.insert(c.name.clone());
             }
         }
+        for i in unit.superinterfaces(name).unwrap_or_default() {
+            records.insert(i.name.clone());
+        }
+    };
+    // Objects of `class` now exist: their vtable and interface-table implementations are reachable.
+    let implementations = |class: &str| -> Vec<MethodKey> {
+        let mut keys: Vec<MethodKey> = unit
+            .vtable(class)
+            .map(|v| (*v).clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|slot| (slot.owner, slot.name, slot.descriptor))
+            .collect();
+        keys.extend(unit.itable(class).iter().filter_map(|e| match &e.target {
+            ItableTarget::Impl(k) => Some(k.clone()),
+            _ => None,
+        }));
+        keys
     };
     loop {
         while let Some(class) = pending_inits.pop() {
@@ -2314,27 +2677,13 @@ fn reachable(
                 Op::New { class } => {
                     add_records(class, &mut out.records);
                     if out.instantiated.insert(class.clone()) {
-                        for slot in unit.vtable(class).map(|v| (*v).clone()).unwrap_or_default() {
-                            let k = (slot.owner, slot.name, slot.descriptor);
-                            if compiled(&k) {
-                                work.push(k);
-                            }
-                        }
+                        work.extend(implementations(class).into_iter().filter(|k| compiled(k)));
                     }
                 }
                 Op::LdcString(_) => {
                     add_records(STRING, &mut out.records);
                     if out.instantiated.insert(STRING.to_string()) {
-                        for slot in unit
-                            .vtable(STRING)
-                            .map(|v| (*v).clone())
-                            .unwrap_or_default()
-                        {
-                            let k = (slot.owner, slot.name, slot.descriptor);
-                            if compiled(&k) {
-                                work.push(k);
-                            }
-                        }
+                        work.extend(implementations(STRING).into_iter().filter(|k| compiled(k)));
                     }
                 }
                 Op::ANewArray { class } | Op::CheckCast { class } | Op::InstanceOf { class }
@@ -2373,9 +2722,7 @@ pub fn compile_unit_rooted(
                 if method.access & ACC_SYNCHRONIZED != 0 {
                     return Err("synchronized methods need monitors".into());
                 }
-                if class.access & ACC_INTERFACE != 0 && method.access & ACC_STATIC == 0 {
-                    return Err("interface instance methods are not compiled yet".into());
-                }
+
                 let sig = parse_signature(&method.descriptor).map_err(|e| e.to_string())?;
                 let analyzed = analyze(&unit, class, method, &sig)?;
                 Ok((sig, analyzed))
@@ -2482,7 +2829,16 @@ pub fn compile_unit_rooted(
         Some(roots) => reachable(&unit, classes, &results, &initializable, roots),
         None => Emission {
             methods: compiled.clone(),
-            records: laid_out_all.iter().map(|c| c.name.clone()).collect(),
+            records: laid_out_all
+                .iter()
+                .map(|c| c.name.clone())
+                .chain(
+                    classes
+                        .iter()
+                        .filter(|c| c.access & ACC_INTERFACE != 0)
+                        .map(|c| c.name.clone()),
+                )
+                .collect(),
             instantiated: laid_out_all.iter().map(|c| c.name.clone()).collect(),
             inits: initializable.clone(),
         },
@@ -2534,6 +2890,21 @@ pub fn compile_unit_rooted(
         .filter(|c| emission.records.contains(&c.name))
         .collect();
     emit_stubs(&mut source, &unit, &recorded, &live);
+    // Interface records first: class records point at them.
+    let mut interface_records: BTreeSet<&str> = emission
+        .records
+        .iter()
+        .map(String::as_str)
+        .filter(|n| unit.is_interface(n))
+        .collect();
+    for class in &recorded {
+        for i in unit.superinterfaces(&class.name).unwrap_or_default() {
+            interface_records.insert(&i.name);
+        }
+    }
+    for name in &interface_records {
+        emit_interface_record(&mut source, unit.get(name).unwrap());
+    }
     for class in &recorded {
         emit_class_record(&mut source, &unit, class, &live);
     }

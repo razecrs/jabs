@@ -210,6 +210,8 @@ pub enum Op {
     InvokeVirtual(MemberRef),
     /// Constructors, private methods (pre-Java 11 style) and `super.` calls.
     InvokeSpecial(MemberRef),
+    /// Call through an interface: the implementation is selected from the receiver's class.
+    InvokeInterface(MemberRef),
 }
 
 /// A resolved field or method reference: owner class, name and descriptor.
@@ -479,6 +481,18 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
             } else {
                 PutField(member)
             }
+        }
+        0xb9 => {
+            let (owner, name, descriptor) = class.method_ref(c.u16()?)?;
+            let count = c.u8()?;
+            if count == 0 || c.u8()? != 0 {
+                bail!("malformed invokeinterface operands");
+            }
+            InvokeInterface(MemberRef {
+                class: owner.into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            })
         }
         0xb6 | 0xb7 => {
             let (owner, name, descriptor) = class.method_ref(c.u16()?)?;

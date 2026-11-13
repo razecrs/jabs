@@ -178,8 +178,8 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 7] = [
-    "Arith", "Statics", "BadInit", "Node", "Shapes", "Arrays", "Strings",
+const FIXTURE_SOURCES: [&str; 8] = [
+    "Arith", "Statics", "BadInit", "Node", "Shapes", "Arrays", "Strings", "Ifaces",
 ];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
@@ -293,6 +293,21 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     }
     out.push(("Strings", "isEmpty", vec![I(0)]));
     out.push(("Strings", "isEmpty", vec![I(1)]));
+    // Interfaces: dispatch, default selection, type tests.
+    for w in [0, 1, 2] {
+        for name in ["legs", "eyes", "describe", "isLoud", "castLoud"] {
+            out.push(("Ifaces", name, vec![I(w)]));
+        }
+        for other in [0, 1, 2] {
+            out.push(("Ifaces", "count", vec![I(w), I(other)]));
+        }
+    }
+    for n in [0, 1, 7] {
+        out.push(("Ifaces", "arrayOfAnimals", vec![I(n)]));
+    }
+    for name in ["dogEyes", "arraysAreCloneable", "nullReceiver"] {
+        out.push(("Ifaces", name, vec![]));
+    }
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -561,6 +576,19 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         reference[at("Arrays", "nullLength", None)],
         "throw java/lang/NullPointerException"
+    );
+    // Interfaces: Spider is not Loud (ClassCastException); Puppy's Pet.super.eyes() + 1 = 4.
+    assert_eq!(
+        reference[at("Ifaces", "castLoud", Some(1))],
+        "throw java/lang/ClassCastException"
+    );
+    assert_eq!(
+        reference[at("Ifaces", "eyes", Some(2))],
+        format!("I {:08x}", 4)
+    );
+    assert_eq!(
+        reference[at("Ifaces", "dogEyes", None)],
+        format!("I {:08x}", 3)
     );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(
