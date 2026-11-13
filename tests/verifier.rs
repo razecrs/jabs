@@ -111,6 +111,9 @@ impl Builder {
 
 const STATIC: u16 = 0x0008;
 
+/// One bad method: (name, descriptor, max_stack, max_locals, code, expected reason fragment).
+type Case = (&'static str, &'static str, u16, u16, Vec<u8>, &'static str);
+
 /// Bytes of a big-endian u16, for instruction operands.
 fn be(v: u16) -> [u8; 2] {
     v.to_be_bytes()
@@ -138,7 +141,7 @@ fn verifier_rejects_unsafe_bytecode() {
     let [n1, n2] = be(fnext);
     let [i1, i2] = be(inst);
     let [c1, c2] = be(bad);
-    let cases: Vec<(&str, &str, u16, u16, Vec<u8>, &str)> = vec![
+    let cases: Vec<Case> = vec![
         // lconst_0; iconst_1; iadd: a long where an int is required.
         (
             "mixLong",
