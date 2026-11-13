@@ -129,9 +129,76 @@ static inline int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == 
 
 /* Reached a method that has no native code yet: stop with a diagnostic rather than guess.
  * The profile must run on the JVM backend until this method compiles. */
-static void jabs_not_compiled(const char *method) {
+static inline void jabs_not_compiled(const char *method) {
     fprintf(stderr, "jabs: %s is not compiled to native code; run this profile on the JVM backend\n", method);
     abort();
+}
+
+/* Arrays: header, length, then elements at their JVM width. The element class of a reference
+ * array is recorded so covariant stores can be checked at runtime (ArrayStoreException). */
+enum {
+    JABS_COMPONENT_PRIMITIVE,
+    JABS_COMPONENT_ANY,       /* Object[]: anything fits */
+    JABS_COMPONENT_CLASS,     /* elements must be instances of `component` */
+    JABS_COMPONENT_ARRAY,     /* elements must be arrays whose descriptor equals `component_descriptor` */
+    JABS_COMPONENT_UNCHECKED  /* element type outside the unit or an interface: stores cannot be checked yet */
+};
+typedef struct jabs_array {
+    jabs_object header;
+    int32_t length;
+    int32_t component_kind;
+    const jabs_class *component;
+    const char *descriptor;           /* this array's type, e.g. "[I" */
+    const char *component_descriptor; /* element array type for JABS_COMPONENT_ARRAY */
+} jabs_array;
+
+/* Elements start right after the header, aligned for any element type. */
+static inline void *jabs_array_data(jabs_array *a) {
+    return (char *)a + ((sizeof(jabs_array) + 7) & ~(size_t)7);
+}
+
+/* Shared record for every array object: arrays are instances of no compiled class.
+ * A function-local static avoids unused-variable warnings in programs without arrays. */
+static inline const jabs_class *jabs_array_class(void) {
+    static const jabs_class record = { "[", 0, NULL, NULL };
+    return &record;
+}
+
+static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target);
+
+/* aastore check: may `value` (non-null) be stored in this array? */
+static inline int jabs_array_store_ok(jabs_array *a, jabs_object *value) {
+    switch (a->component_kind) {
+    case JABS_COMPONENT_ANY: return 1;
+    case JABS_COMPONENT_CLASS: return jabs_is_instance(value, a->component);
+    case JABS_COMPONENT_ARRAY:
+        return value->cls == jabs_array_class() &&
+               strcmp(((jabs_array *)value)->descriptor, a->component_descriptor) == 0;
+    default: jabs_not_compiled("aastore into an array whose element type is outside the unit or an interface");
+    }
+    return 0;
+}
+
+/* Allocate a zeroed array (zero bytes are every element's default); length is already >= 0. */
+static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, int32_t kind, const jabs_class *component,
+                                          const char *descriptor, const char *component_descriptor) {
+    size_t header = (sizeof(jabs_array) + 7) & ~(size_t)7;
+    if ((size_t)length > (SIZE_MAX - header) / element_size) {
+        jabs_pending = "java/lang/OutOfMemoryError";
+        return NULL;
+    }
+    jabs_array *a = (jabs_array *)calloc(1, header + (size_t)length * element_size);
+    if (!a) {
+        jabs_pending = "java/lang/OutOfMemoryError";
+        return NULL;
+    }
+    a->header.cls = jabs_array_class();
+    a->length = length;
+    a->component_kind = kind;
+    a->component = component;
+    a->descriptor = descriptor;
+    a->component_descriptor = component_descriptor;
+    return &a->header;
 }
 
 /* instanceof for a class target: walk the object's superclass chain. */

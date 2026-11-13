@@ -103,8 +103,58 @@ fn parse_type(descriptor: &str, context: &str) -> Result<Ty> {
             code: 'L',
             class: Some(descriptor[1..descriptor.len() - 1].to_string()),
         }),
-        [b'[', ..] => bail!("arrays in {context} are not compiled yet"),
+        [b'[', ..] => {
+            parse_type(&descriptor[1..], context)?;
+            Ok(Ty {
+                code: 'L',
+                class: Some(descriptor.to_string()),
+            })
+        }
         _ => bail!("invalid descriptor {descriptor} in {context}"),
+    }
+}
+
+/// Escape a class or descriptor name for a C string literal (names may hold any Unicode).
+fn c_escape(text: &str) -> String {
+    let mut out = String::new();
+    for b in text.bytes() {
+        match b {
+            b'"' | b'\\' => {
+                out.push('\\');
+                out.push(b as char);
+            }
+            0x20..=0x7e => out.push(b as char),
+            _ => {
+                let _ = write!(out, "\\{b:03o}");
+            }
+        }
+    }
+    out
+}
+
+/// C element type of an array, from its descriptor char (`L` or `[` for references).
+fn element_type(element: char) -> &'static str {
+    match element {
+        'Z' => "uint8_t",
+        'B' => "int8_t",
+        'C' => "uint16_t",
+        'S' => "int16_t",
+        'I' => "int32_t",
+        'J' => "int64_t",
+        'F' => "float",
+        'D' => "double",
+        _ => "jabs_object *",
+    }
+}
+
+/// Type name of an array element as the verifier interns it: a class name, an array
+/// descriptor, or None for primitives.
+fn element_class(array: &str) -> Option<String> {
+    let element = &array[1..];
+    match element.as_bytes().first() {
+        Some(b'L') => Some(element[1..element.len() - 1].to_string()),
+        Some(b'[') => Some(element.to_string()),
+        _ => None,
     }
 }
 
@@ -243,7 +293,7 @@ fn storage_type(descriptor: &str) -> Option<&'static str> {
         b"J" => "int64_t",
         b"F" => "float",
         b"D" => "double",
-        [b'L', .., b';'] => "jabs_object *",
+        [b'L', .., b';'] | [b'[', ..] => "jabs_object *",
         _ => return None,
     })
 }
@@ -551,6 +601,9 @@ enum Resolved {
     Call(CallKind),
     /// Field access resolved to its declaring class.
     Field(String),
+    /// Array access: the element descriptor char of the array's static type (`Z` vs `B` matters
+    /// for stores), or None when the array is statically null (the access always throws).
+    Element(Option<char>),
 }
 
 /// Something a compiled method needs to be compiled too.
@@ -587,14 +640,26 @@ impl Cx<'_, '_> {
     fn assignable(&self, v: VType, target: &str) -> bool {
         match v {
             VType::Null => true,
-            VType::Obj(id) => {
-                let name = self.unit.name(id);
-                target == OBJECT
-                    || name == target
-                    || self.unit.is_interface(target)
-                    || self.unit.is_subclass(&name, target) == Some(true)
-            }
+            VType::Obj(id) => self.name_assignable(&self.unit.name(id), target),
             _ => false,
+        }
+    }
+    /// Whether a value of static type `name` (class name or array descriptor) fits `target`.
+    fn name_assignable(&self, name: &str, target: &str) -> bool {
+        if target == OBJECT || name == target {
+            return true;
+        }
+        match (name.starts_with('['), target.starts_with('[')) {
+            // Arrays are covariant in their reference element type; primitive arrays must match exactly.
+            (true, true) => match (element_class(name), element_class(target)) {
+                (Some(a), Some(b)) => self.name_assignable(&a, &b),
+                _ => false,
+            },
+            (true, false) => matches!(target, "java/lang/Cloneable" | "java/io/Serializable"),
+            (false, true) => false,
+            (false, false) => {
+                self.unit.is_interface(target) || self.unit.is_subclass(name, target) == Some(true)
+            }
         }
     }
     /// Least common supertype at a control-flow join (java/lang/Object when nothing closer is known).
@@ -935,6 +1000,75 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             unit.chain(class)?;
             frame.stack.push(VType::Uninit(pc));
             out.deps.push(Dep::Init(class.clone()));
+        }
+        Op::NewArray(element) => {
+            frame.pop_prim(Kind::I, pc)?;
+            frame
+                .stack
+                .push(VType::Obj(unit.intern(&format!("[{element}"))));
+        }
+        Op::ANewArray { class } => {
+            frame.pop_prim(Kind::I, pc)?;
+            let element = if class.starts_with('[') {
+                class.clone()
+            } else {
+                format!("L{class};")
+            };
+            frame
+                .stack
+                .push(VType::Obj(unit.intern(&format!("[{element}"))));
+        }
+        Op::ArrayLength => {
+            let array = frame.pop(pc)?;
+            if !matches!(array, VType::Null)
+                && !matches!(array, VType::Obj(id) if unit.name(id).starts_with('['))
+            {
+                bail!("pc {pc}: arraylength of {}", cx.describe(array));
+            }
+            frame.stack.push(VType::I);
+        }
+        Op::ArrayLoad(family) | Op::ArrayStore(family) => {
+            let storing = matches!(insn.op, Op::ArrayStore(_));
+            if storing {
+                match *family {
+                    'A' => {
+                        frame.pop_ref(cx, OBJECT, pc)?;
+                    }
+                    'B' | 'C' | 'S' => frame.pop_prim(Kind::I, pc)?,
+                    f => frame.pop_prim(kind_of(f).unwrap(), pc)?,
+                }
+            }
+            frame.pop_prim(Kind::I, pc)?;
+            let array = frame.pop(pc)?;
+            let element = match array {
+                VType::Null => None,
+                VType::Obj(id) if unit.name(id).starts_with('[') => {
+                    let name = unit.name(id);
+                    let e = name.as_bytes()[1] as char;
+                    let fits = match *family {
+                        'A' => matches!(e, 'L' | '['),
+                        'B' => matches!(e, 'B' | 'Z'),
+                        f => f == e,
+                    };
+                    if !fits {
+                        bail!("pc {pc}: element access of kind {family} on {name}");
+                    }
+                    Some(e)
+                }
+                other => bail!("pc {pc}: array access on {}", cx.describe(other)),
+            };
+            if !storing {
+                let pushed = match (*family, &array) {
+                    ('A', VType::Null) => VType::Null,
+                    ('A', VType::Obj(id)) => {
+                        VType::Obj(unit.intern(&element_class(&unit.name(*id)).unwrap()))
+                    }
+                    ('B' | 'C' | 'S', _) => VType::I,
+                    (f, _) => VType::prim(kind_of(f).unwrap()),
+                };
+                frame.stack.push(pushed);
+            }
+            out.resolved = Some(Resolved::Element(element));
         }
         Op::CheckCast { class } | Op::InstanceOf { class } => {
             if class.starts_with('[') {
@@ -1572,6 +1706,101 @@ fn emit_method(
                 init_guard(unit, &class.name, target, ret_default),
                 class_record(target)
             ),
+            Op::NewArray(element) => {
+                let r = d - 1;
+                format!(
+                    "if (s[{r}].i < 0) {} s[{r}].a = jabs_new_array(s[{r}].i, sizeof({}), JABS_COMPONENT_PRIMITIVE, NULL, \"[{element}\", NULL); if (!s[{r}].a) {ret_default}",
+                    throw("java/lang/NegativeArraySizeException"),
+                    element_type(*element)
+                )
+            }
+            Op::ANewArray { class: component } => {
+                let r = d - 1;
+                // Record the runtime element class so covariant stores can be checked (ArrayStoreException).
+                let element = if component.starts_with('[') {
+                    component.clone()
+                } else {
+                    format!("L{component};")
+                };
+                let primitive_rows = component.len() == 2 && component.starts_with('[');
+                let (kind, record) = if component == OBJECT {
+                    ("JABS_COMPONENT_ANY", "NULL".to_string())
+                } else if primitive_rows {
+                    ("JABS_COMPONENT_ARRAY", "NULL".to_string())
+                } else if !component.starts_with('[')
+                    && !unit.is_interface(component)
+                    && unit.get(component).is_some()
+                    && unit.chain(component).is_ok()
+                {
+                    (
+                        "JABS_COMPONENT_CLASS",
+                        format!("&{}", class_record(component)),
+                    )
+                } else {
+                    ("JABS_COMPONENT_UNCHECKED", "NULL".to_string())
+                };
+                let component_descriptor = if primitive_rows {
+                    format!("\"{component}\"")
+                } else {
+                    "NULL".to_string()
+                };
+                format!(
+                    "if (s[{r}].i < 0) {} s[{r}].a = jabs_new_array(s[{r}].i, sizeof(jabs_object *), {kind}, {record}, \"[{}\", {component_descriptor}); if (!s[{r}].a) {ret_default}",
+                    throw("java/lang/NegativeArraySizeException"),
+                    c_escape(&element)
+                )
+            }
+            Op::ArrayLength => {
+                let r = d - 1;
+                format!("if (!s[{r}].a) {npe} s[{r}].i = ((jabs_array *)s[{r}].a)->length;")
+            }
+            Op::ArrayLoad(family) | Op::ArrayStore(family) => {
+                let storing = matches!(insn.op, Op::ArrayStore(_));
+                let Some(Resolved::Element(element)) = resolved else {
+                    unreachable!()
+                };
+                let (array, index) = if storing {
+                    (d - 3, d - 2)
+                } else {
+                    (d - 2, d - 1)
+                };
+                let checks = format!(
+                    "if (!s[{array}].a) {npe} if ((uint32_t)s[{index}].i >= (uint32_t)((jabs_array *)s[{array}].a)->length) {}",
+                    throw("java/lang/ArrayIndexOutOfBoundsException")
+                );
+                match element {
+                    // Statically null: the null check always throws.
+                    None => checks,
+                    Some(e) => {
+                        let slot = format!(
+                            "(({} *)jabs_array_data((jabs_array *)s[{array}].a))[s[{index}].i]",
+                            element_type(*e)
+                        );
+                        let k = if *family == 'A' {
+                            Kind::A
+                        } else if matches!(family, 'B' | 'C' | 'S') {
+                            Kind::I
+                        } else {
+                            kind_of(*family).unwrap()
+                        };
+                        if storing {
+                            let value = format!("s[{}].{}", d - 1, field(k));
+                            let narrowed = narrow_for_store(&e.to_string(), &value);
+                            let store_check = if *family == 'A' {
+                                format!(
+                                    "if ({value} && !jabs_array_store_ok((jabs_array *)s[{array}].a, {value})) {} ",
+                                    throw("java/lang/ArrayStoreException")
+                                )
+                            } else {
+                                String::new()
+                            };
+                            format!("{checks} {store_check}{slot} = {narrowed};")
+                        } else {
+                            format!("{checks} s[{array}].{} = {slot};", field(k))
+                        }
+                    }
+                }
+            }
             Op::CheckCast { class: target } => format!(
                 "if (s[{r}].a && !jabs_is_instance(s[{r}].a, &{})) {}",
                 class_record(target),

@@ -184,6 +184,17 @@ pub enum Op {
     New {
         class: String,
     },
+    /// Load an element; the char is the element family: I J F D A, B (byte or boolean), C, S.
+    ArrayLoad(char),
+    /// Store an element; same element families as `ArrayLoad`.
+    ArrayStore(char),
+    /// `newarray`: a primitive array whose element descriptor char is given (Z C F D B S I J).
+    NewArray(char),
+    /// `anewarray`: an array of references to `class` (which may itself be an array type).
+    ANewArray {
+        class: String,
+    },
+    ArrayLength,
     /// Throw ClassCastException unless the reference is null or an instance of `class`.
     CheckCast {
         class: String,
@@ -420,6 +431,27 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
         0xbb => New {
             class: class.class_name(c.u16()?)?.into(),
         },
+        0x2e..=0x35 => ArrayLoad(b"IJFDABCS"[(opcode - 0x2e) as usize] as char),
+        0x4f..=0x56 => ArrayStore(b"IJFDABCS"[(opcode - 0x4f) as usize] as char),
+        0xbc => {
+            let atype = c.u8()?;
+            let element = match atype {
+                4 => 'Z',
+                5 => 'C',
+                6 => 'F',
+                7 => 'D',
+                8 => 'B',
+                9 => 'S',
+                10 => 'I',
+                11 => 'J',
+                _ => bail!("invalid newarray type {atype}"),
+            };
+            NewArray(element)
+        }
+        0xbd => ANewArray {
+            class: class.class_name(c.u16()?)?.into(),
+        },
+        0xbe => ArrayLength,
         0xc0 => CheckCast {
             class: class.class_name(c.u16()?)?.into(),
         },

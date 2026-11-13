@@ -178,7 +178,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 5] = ["Arith", "Statics", "BadInit", "Node", "Shapes"];
+const FIXTURE_SOURCES: [&str; 6] = ["Arith", "Statics", "BadInit", "Node", "Shapes", "Arrays"];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
@@ -247,6 +247,36 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     // A superclass whose initializer throws: EIIE first, then NoClassDefFoundError.
     out.push(("Shapes", "childGet", vec![]));
     out.push(("Shapes", "childGet", vec![]));
+    // Arrays: every element type, 2-D, covariance and each exception.
+    for n in [0, 1, 7, 1000] {
+        out.push(("Arrays", "sumSquares", vec![I(n)]));
+        out.push(("Arrays", "doubles", vec![I(n)]));
+        out.push(("Arrays", "grid", vec![I(n.min(50))]));
+        out.push(("Arrays", "shapes", vec![I(n.min(50))]));
+        out.push(("Arrays", "objects", vec![I(n)]));
+    }
+    for v in [0, 1, -1, 255, 70000, i32::MIN, i32::MAX] {
+        for name in ["bytes", "booleans", "chars", "shorts"] {
+            out.push(("Arrays", name, vec![I(v)]));
+        }
+    }
+    for x in [0.5f32, -3.0, f32::NAN] {
+        out.push(("Arrays", "floats", vec![F(x)]));
+    }
+    for x in [0i64, i64::MAX, -7] {
+        out.push(("Arrays", "longs", vec![J(x)]));
+    }
+    for which in [0, 1, 2] {
+        out.push(("Arrays", "covariantStore", vec![I(which)]));
+    }
+    for n in [-1, 0, 5, i32::MIN] {
+        out.push(("Arrays", "negative", vec![I(n)]));
+    }
+    for i in [-1, 0, 2, 3, i32::MIN, i32::MAX] {
+        out.push(("Arrays", "outOfBounds", vec![I(i)]));
+    }
+    out.push(("Arrays", "nullArray", vec![I(0)]));
+    out.push(("Arrays", "nullLength", vec![]));
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -451,9 +481,12 @@ fn native_matches_reference_jvm() {
     assert_eq!(reference.len(), all.len());
     // Guard that the object fixture really reaches NullPointerException on the JVM (build(0),
     // nullField, nullCall(0), lengthOf(0)), so those paths are compared rather than skipped.
-    let npes = reference
+    let npes = all
         .iter()
-        .filter(|l| **l == "throw java/lang/NullPointerException")
+        .zip(&reference)
+        .filter(|((class, _, _), line)| {
+            *class == "Node" && **line == "throw java/lang/NullPointerException"
+        })
         .count();
     assert_eq!(
         npes, 4,
@@ -485,6 +518,23 @@ fn native_matches_reference_jvm() {
             "throw java/lang/ExceptionInInitializerError",
             "throw java/lang/NoClassDefFoundError"
         ]
+    );
+    // Array exceptions: a Circle into a Rect[] seen as Shape[], negative sizes, bad indexes.
+    assert_eq!(
+        reference[at("Arrays", "covariantStore", Some(0))],
+        "throw java/lang/ArrayStoreException"
+    );
+    assert_eq!(
+        reference[at("Arrays", "negative", Some(-1))],
+        "throw java/lang/NegativeArraySizeException"
+    );
+    assert_eq!(
+        reference[at("Arrays", "outOfBounds", Some(3))],
+        "throw java/lang/ArrayIndexOutOfBoundsException"
+    );
+    assert_eq!(
+        reference[at("Arrays", "nullLength", None)],
+        "throw java/lang/NullPointerException"
     );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(
