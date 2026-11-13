@@ -54,24 +54,37 @@ typedef union jabs_value {
 } jabs_value;
 
 /* Internal class name of the pending exception, or NULL. */
-static _Thread_local const char *jabs_pending;
+/* The exception being thrown (a Throwable object), or NULL. */
+static _Thread_local jabs_object *jabs_pending;
+
+/* Exceptions the runtime itself raises, by kind. The generated unit defines jabs_vm_throwable,
+ * which allocates an instance of the JDK class when it is in the unit. Constructors are not run
+ * (Throwable's captures a stack trace natively), so these carry no message or stack trace yet. */
+enum {
+    JABS_VM_NULL_POINTER,
+    JABS_VM_ARITHMETIC,
+    JABS_VM_ARRAY_INDEX,
+    JABS_VM_NEGATIVE_ARRAY_SIZE,
+    JABS_VM_ARRAY_STORE,
+    JABS_VM_CLASS_CAST,
+    JABS_VM_INCOMPATIBLE_CLASS_CHANGE,
+    JABS_VM_ABSTRACT_METHOD,
+    JABS_VM_NO_CLASS_DEF_FOUND,
+    JABS_VM_INITIALIZER,
+    JABS_VM_OUT_OF_MEMORY
+};
+static jabs_object *jabs_vm_throwable(int kind);
+/* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
+static int jabs_is_error(const jabs_object *o);
 
 /* Allocate a zeroed object: all-zero bytes are every field's Java default (0, 0.0, false, null).
  * There is no garbage collector yet, so objects live until the process exits. */
 static inline jabs_object *jabs_new(const jabs_class *cls);
 
 /* Exception a failed static initializer reports (JVMS 5.5 step 11): Errors pass through,
- * anything else becomes ExceptionInInitializerError. Until the class hierarchy is modeled,
- * the Error subclasses listed are the ones this runtime itself can raise. */
-static inline const char *jabs_initializer_failure(const char *thrown) {
-    static const char *const errors[] = {
-        "java/lang/ExceptionInInitializerError", "java/lang/NoClassDefFoundError",
-        "java/lang/StackOverflowError", "java/lang/OutOfMemoryError",
-    };
-    for (size_t i = 0; i < sizeof errors / sizeof errors[0]; i++) {
-        if (strcmp(thrown, errors[i]) == 0) return thrown;
-    }
-    return "java/lang/ExceptionInInitializerError";
+ * anything else becomes ExceptionInInitializerError. */
+static inline jabs_object *jabs_initializer_failure(jabs_object *thrown) {
+    return jabs_is_error(thrown) ? thrown : jabs_vm_throwable(JABS_VM_INITIALIZER);
 }
 
 /* Reinterpret raw IEEE bits as float/double (exact, including NaN payloads). */
@@ -196,12 +209,12 @@ static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, i
                                           const char *descriptor, const char *component_descriptor) {
     size_t header = (sizeof(jabs_array) + 7) & ~(size_t)7;
     if ((size_t)length > (SIZE_MAX - header) / element_size) {
-        jabs_pending = "java/lang/OutOfMemoryError";
+        jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
     }
     jabs_array *a = (jabs_array *)calloc(1, header + (size_t)length * element_size);
     if (!a) {
-        jabs_pending = "java/lang/OutOfMemoryError";
+        jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
     }
     a->header.cls = jabs_array_class();
@@ -247,7 +260,7 @@ static inline void (*jabs_itable_find(const jabs_object *o, uint64_t selector))(
 static inline jabs_object *jabs_new(const jabs_class *cls) {
     jabs_object *o = (jabs_object *)calloc(1, cls->size);
     if (!o) {
-        jabs_pending = "java/lang/OutOfMemoryError";
+        jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
     }
     o->cls = cls;

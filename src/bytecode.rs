@@ -212,6 +212,8 @@ pub enum Op {
     InvokeSpecial(MemberRef),
     /// Call through an interface: the implementation is selected from the receiver's class.
     InvokeInterface(MemberRef),
+    /// Throw the Throwable on top of the stack.
+    AThrow,
 }
 
 /// A resolved field or method reference: owner class, name and descriptor.
@@ -463,6 +465,7 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
             class: class.class_name(c.u16()?)?.into(),
         },
         0xbe => ArrayLength,
+        0xbf => AThrow,
         0xc0 => CheckCast {
             class: class.class_name(c.u16()?)?.into(),
         },

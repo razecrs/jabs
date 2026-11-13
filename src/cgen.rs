@@ -32,6 +32,47 @@ use std::{
 pub const RUNTIME_PRELUDE: &str = include_str!("../runtime/jabs_rt.h");
 const OBJECT: &str = "java/lang/Object";
 const STRING: &str = "java/lang/String";
+const THROWABLE: &str = "java/lang/Throwable";
+
+/// Exceptions the runtime raises itself, in the order of the JABS_VM_* constants.
+const VM_EXCEPTIONS: [(&str, &str); 11] = [
+    ("java/lang/NullPointerException", "JABS_VM_NULL_POINTER"),
+    ("java/lang/ArithmeticException", "JABS_VM_ARITHMETIC"),
+    (
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "JABS_VM_ARRAY_INDEX",
+    ),
+    (
+        "java/lang/NegativeArraySizeException",
+        "JABS_VM_NEGATIVE_ARRAY_SIZE",
+    ),
+    ("java/lang/ArrayStoreException", "JABS_VM_ARRAY_STORE"),
+    ("java/lang/ClassCastException", "JABS_VM_CLASS_CAST"),
+    (
+        "java/lang/IncompatibleClassChangeError",
+        "JABS_VM_INCOMPATIBLE_CLASS_CHANGE",
+    ),
+    ("java/lang/AbstractMethodError", "JABS_VM_ABSTRACT_METHOD"),
+    (
+        "java/lang/NoClassDefFoundError",
+        "JABS_VM_NO_CLASS_DEF_FOUND",
+    ),
+    (
+        "java/lang/ExceptionInInitializerError",
+        "JABS_VM_INITIALIZER",
+    ),
+    ("java/lang/OutOfMemoryError", "JABS_VM_OUT_OF_MEMORY"),
+];
+
+/// `jabs_pending = <new VM exception>` for one of `VM_EXCEPTIONS`.
+fn raise(class: &str) -> String {
+    let kind = VM_EXCEPTIONS
+        .iter()
+        .find(|(c, _)| *c == class)
+        .unwrap_or_else(|| panic!("{class} is not a VM exception"))
+        .1;
+    format!("jabs_pending = jabs_vm_throwable({kind});")
+}
 
 /// Fields the JDK 9+ String layout must have for compiled literals: value, coder, hash, hashIsZero.
 const STRING_FIELDS: [(&str, &str); 4] = [
@@ -1349,6 +1390,15 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 out.resolved = Some(Resolved::Call(CallKind::Virtual { slot, target: key }));
             }
         }
+        Op::AThrow => {
+            if unit.get(THROWABLE).is_none() {
+                bail!(
+                    "pc {pc}: throw needs java/lang/Throwable in the unit (add the JDK's java.base)"
+                );
+            }
+            frame.pop_ref(cx, THROWABLE, pc)?;
+            out.falls = false;
+        }
         Op::InvokeInterface(m) => {
             if !unit.is_interface(&m.class) {
                 bail!(
@@ -1463,7 +1513,18 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
     Ok(out)
 }
 
+/// One exception handler, verified: catch class (None catches everything) and handler pc.
+#[derive(Debug, Clone, PartialEq)]
+struct Catch {
+    class: Option<String>,
+    handler: u32,
+}
+
 struct Analyzed {
+    /// pc -> index into `dispatch` for instructions inside try ranges.
+    exits: HashMap<u32, usize>,
+    /// Handler chains in table order; each becomes a dispatch block in the C function.
+    dispatch: Vec<Vec<Catch>>,
     insns: Vec<Insn>,
     /// Operand stack types before each instruction.
     stacks: Vec<Vec<VType>>,
@@ -1483,9 +1544,7 @@ fn analyze<'a>(
         .code
         .as_ref()
         .ok_or("no bytecode (abstract or native)")?;
-    if !code.handlers.is_empty() {
-        return Err("exception handlers are not compiled yet".into());
-    }
+
     let insns = match bytecode::decode(class, &code.bytecode) {
         Ok(insns) => insns,
         Err(DecodeError::Unsupported(u)) => return Err(u.to_string()),
@@ -1535,6 +1594,35 @@ fn analyze<'a>(
         .enumerate()
         .map(|(i, insn)| (insn.pc, i))
         .collect();
+    // Exception handlers: (start, end, catch). Catch classes must be Throwables in the unit.
+    let mut handlers: Vec<(u32, u32, Catch)> = Vec::new();
+    for h in &code.handlers {
+        let class = if h.catch_type == 0 {
+            None
+        } else {
+            let name = class
+                .class_name(h.catch_type)
+                .map_err(|e| format!("{e:#}"))?
+                .to_string();
+            if unit.get(&name).is_none() || unit.is_subclass(&name, THROWABLE) != Some(true) {
+                return Err(format!(
+                    "catch type {name} is outside the unit or not a Throwable"
+                ));
+            }
+            Some(name)
+        };
+        if !index.contains_key(&(h.handler_pc as u32)) {
+            return Err(format!("handler pc {} is not an instruction", h.handler_pc));
+        }
+        handlers.push((
+            h.start_pc as u32,
+            h.end_pc as u32,
+            Catch {
+                class,
+                handler: h.handler_pc as u32,
+            },
+        ));
+    }
     let mut frames: Vec<Option<Frame>> = vec![None; insns.len()];
     let mut targets = BTreeSet::new();
     let mut deps = BTreeSet::new();
@@ -1559,6 +1647,28 @@ fn analyze<'a>(
             return Err(format!("pc {pc}: stack exceeds max_stack"));
         }
         frames[i] = Some(frame.clone());
+        // Every instruction in a try range may transfer to its handlers with its incoming locals
+        // and only the exception on the stack.
+        for (start, end, catch) in &handlers {
+            if *start <= pc && pc < *end {
+                if frame
+                    .locals
+                    .iter()
+                    .any(|v| matches!(v, VType::UninitThis | VType::Uninit(_)))
+                {
+                    return Err(format!(
+                        "pc {pc}: try range covers an object before its constructor ran"
+                    ));
+                }
+                let thrown = catch.class.as_deref().unwrap_or(THROWABLE);
+                let entry = Frame {
+                    stack: vec![VType::Obj(unit.intern(thrown))],
+                    locals: frame.locals.clone(),
+                };
+                targets.insert(catch.handler);
+                work.push((index[&catch.handler], entry));
+            }
+        }
         let mut next = frame;
         let step = step(&insns[i], &mut next, &cx, &news).map_err(|e| format!("{e:#}"))?;
         deps.extend(step.deps);
@@ -1587,7 +1697,30 @@ fn analyze<'a>(
         .zip(frames)
         .filter_map(|(insn, f)| f.map(|f| (insn, f.stack)))
         .unzip();
+    // Exceptional exits: instructions in try ranges jump to a dispatch block for their handler chain.
+    let mut exits = HashMap::new();
+    let mut dispatch: Vec<Vec<Catch>> = Vec::new();
+    for insn in &insns {
+        let chain: Vec<Catch> = handlers
+            .iter()
+            .filter(|(start, end, _)| *start <= insn.pc && insn.pc < *end)
+            .map(|(_, _, c)| c.clone())
+            .collect();
+        if chain.is_empty() {
+            continue;
+        }
+        let id = dispatch
+            .iter()
+            .position(|c| *c == chain)
+            .unwrap_or_else(|| {
+                dispatch.push(chain);
+                dispatch.len() - 1
+            });
+        exits.insert(insn.pc, id);
+    }
     Ok(Analyzed {
+        exits,
+        dispatch,
         insns,
         stacks,
         targets,
@@ -1704,10 +1837,11 @@ fn emit_method(
         let _ = writeln!(out, "    l[{slot}].{} = a{i};", field(k));
         slot += if matches!(k, Kind::J | Kind::D) { 2 } else { 1 };
     }
-    let throw = |exc: &str| format!("{{ jabs_pending = \"{exc}\"; {ret_default} }}");
-    let npe = throw("java/lang/NullPointerException");
+    // Raise a VM exception and leave through `exit` (a handler dispatch block or a return).
+    let throw = |exc: &str, exit: &str| format!("{{ {} {exit} }}", raise(exc));
     // Emit a call: arguments (and the receiver, for instance methods) come off the stack.
-    let call = |kind: &CallKind, descriptor: &str, d: usize| -> String {
+    let call = |kind: &CallKind, descriptor: &str, d: usize, exit: &str| -> String {
+        let npe = throw("java/lang/NullPointerException", exit);
         let callee = parse_signature(descriptor).unwrap();
         let base = d - callee.params.len();
         let (key, receiver) = match kind {
@@ -1754,20 +1888,20 @@ fn emit_method(
             // The receiver's class must implement the interface (JVMS invokeinterface).
             format!(
                 "if (!s[{r}].a) {npe} if (!jabs_itable_find(s[{r}].a, UINT64_C(0x{selector:016x}))) {} ",
-                throw("java/lang/IncompatibleClassChangeError"),
+                throw("java/lang/IncompatibleClassChangeError", exit),
                 r = base - 1
             )
         } else if receiver {
             format!("if (!s[{}].a) {npe} ", base - 1)
         } else {
-            init_guard(unit, &class.name, &key.0, ret_default)
+            init_guard(unit, &class.name, &key.0, exit)
         };
         let invoke = format!("{function}({})", args.join(", "));
         let assign = match kind_of(callee.ret.code) {
             Some(k) => format!("s[{result_at}].{} = {invoke};", field(k)),
             None => format!("{invoke};"),
         };
-        format!("{guard}{assign} if (jabs_pending) {ret_default}")
+        format!("{guard}{assign} if (jabs_pending) {exit}")
     };
     for (insn, stack) in a.insns.iter().zip(&a.stacks) {
         if a.targets.contains(&insn.pc) {
@@ -1775,6 +1909,12 @@ fn emit_method(
         }
         let d = stack.len();
         let resolved = a.resolved.get(&insn.pc);
+        let exit = match a.exits.get(&insn.pc) {
+            Some(n) => format!("goto E{n};"),
+            None => ret_default.to_string(),
+        };
+        let exit = exit.as_str();
+        let npe = throw("java/lang/NullPointerException", exit);
         let line = match &insn.op {
             Op::Nop | Op::Pop | Op::Pop2 => continue,
             Op::Const(v) => format!("s[{d}].{} = {};", field(v.kind()), value_literal(*v)),
@@ -1845,7 +1985,7 @@ fn emit_method(
                     (Kind::I | Kind::J, BinOp::Div | BinOp::Rem) => {
                         format!(
                             "if (s[{b}].{f} == 0) {} ",
-                            throw("java/lang/ArithmeticException")
+                            throw("java/lang/ArithmeticException", exit)
                         )
                     }
                     _ => String::new(),
@@ -1939,6 +2079,10 @@ fn emit_method(
                     _ => format!("return {v};"),
                 }
             }
+            Op::AThrow => format!(
+                "if (!s[{r}].a) {npe} jabs_pending = s[{r}].a; {exit}",
+                r = d - 1
+            ),
             Op::InvokeStatic { descriptor, .. }
             | Op::InvokeVirtual(MemberRef { descriptor, .. })
             | Op::InvokeSpecial(MemberRef { descriptor, .. })
@@ -1946,7 +2090,7 @@ fn emit_method(
                 Some(Resolved::Call(CallKind::ObjectInit)) => {
                     "/* java/lang/Object.<init>()V has no effect */".into()
                 }
-                Some(Resolved::Call(kind)) => call(kind, descriptor, d),
+                Some(Resolved::Call(kind)) => call(kind, descriptor, d, exit),
                 _ => unreachable!("calls are resolved during verification"),
             },
             Op::GetStatic {
@@ -1959,7 +2103,7 @@ fn emit_method(
                     unreachable!()
                 };
                 let k = kind_of(parse_type(descriptor, name).unwrap().code).unwrap();
-                let guard = init_guard(unit, &class.name, declaring, ret_default);
+                let guard = init_guard(unit, &class.name, declaring, exit);
                 let sym = field_symbol(declaring, name);
                 if matches!(insn.op, Op::GetStatic { .. }) {
                     format!("{guard}s[{d}].{} = {sym};", field(k))
@@ -1969,19 +2113,19 @@ fn emit_method(
                 }
             }
             Op::New { class: target } => format!(
-                "{}s[{d}].a = jabs_new(&{}); if (!s[{d}].a) {ret_default}",
-                init_guard(unit, &class.name, target, ret_default),
+                "{}s[{d}].a = jabs_new(&{}); if (!s[{d}].a) {exit}",
+                init_guard(unit, &class.name, target, exit),
                 class_record(target)
             ),
             Op::LdcString(units) => format!(
-                "s[{d}].a = {}(); if (!s[{d}].a) {ret_default}",
+                "s[{d}].a = {}(); if (!s[{d}].a) {exit}",
                 literal_symbol(units)
             ),
             Op::NewArray(element) => {
                 let r = d - 1;
                 format!(
-                    "if (s[{r}].i < 0) {} s[{r}].a = jabs_new_array(s[{r}].i, sizeof({}), JABS_COMPONENT_PRIMITIVE, NULL, \"[{element}\", NULL); if (!s[{r}].a) {ret_default}",
-                    throw("java/lang/NegativeArraySizeException"),
+                    "if (s[{r}].i < 0) {} s[{r}].a = jabs_new_array(s[{r}].i, sizeof({}), JABS_COMPONENT_PRIMITIVE, NULL, \"[{element}\", NULL); if (!s[{r}].a) {exit}",
+                    throw("java/lang/NegativeArraySizeException", exit),
                     element_type(*element)
                 )
             }
@@ -2015,8 +2159,8 @@ fn emit_method(
                     "NULL".to_string()
                 };
                 format!(
-                    "if (s[{r}].i < 0) {} s[{r}].a = jabs_new_array(s[{r}].i, sizeof(jabs_object *), {kind}, {record}, \"[{}\", {component_descriptor}); if (!s[{r}].a) {ret_default}",
-                    throw("java/lang/NegativeArraySizeException"),
+                    "if (s[{r}].i < 0) {} s[{r}].a = jabs_new_array(s[{r}].i, sizeof(jabs_object *), {kind}, {record}, \"[{}\", {component_descriptor}); if (!s[{r}].a) {exit}",
+                    throw("java/lang/NegativeArraySizeException", exit),
                     c_escape(&element)
                 )
             }
@@ -2036,7 +2180,7 @@ fn emit_method(
                 };
                 let checks = format!(
                     "if (!s[{array}].a) {npe} if ((uint32_t)s[{index}].i >= (uint32_t)((jabs_array *)s[{array}].a)->length) {}",
-                    throw("java/lang/ArrayIndexOutOfBoundsException")
+                    throw("java/lang/ArrayIndexOutOfBoundsException", exit)
                 );
                 match element {
                     // Statically null: the null check always throws.
@@ -2059,7 +2203,7 @@ fn emit_method(
                             let store_check = if *family == 'A' {
                                 format!(
                                     "if ({value} && !jabs_array_store_ok((jabs_array *)s[{array}].a, {value})) {} ",
-                                    throw("java/lang/ArrayStoreException")
+                                    throw("java/lang/ArrayStoreException", exit)
                                 )
                             } else {
                                 String::new()
@@ -2074,7 +2218,7 @@ fn emit_method(
             Op::CheckCast { class: target } => format!(
                 "if (s[{r}].a && !jabs_is_instance(s[{r}].a, &{})) {}",
                 class_record(target),
-                throw("java/lang/ClassCastException"),
+                throw("java/lang/ClassCastException", exit),
                 r = d - 1
             ),
             Op::InstanceOf { class: target } => {
@@ -2105,6 +2249,23 @@ fn emit_method(
             }
         };
         let _ = writeln!(out, "    {line}");
+    }
+    // Handler dispatch: test catch types in table order; the matching handler starts with only
+    // the exception on the stack. Unmatched exceptions propagate to the caller.
+    for (n, chain) in a.dispatch.iter().enumerate() {
+        let _ = writeln!(out, "E{n}:;");
+        for catch in chain {
+            let test = match &catch.class {
+                Some(c) => format!("jabs_is_instance(jabs_pending, &{})", class_record(c)),
+                None => "1".to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "    if ({test}) {{ s[0].a = jabs_pending; jabs_pending = NULL; goto L{}; }}",
+                catch.handler
+            );
+        }
+        let _ = writeln!(out, "    {ret_default}");
     }
     let _ = writeln!(out, "}}\n");
 }
@@ -2309,7 +2470,7 @@ fn emit_stubs(
             "return 0;"
         };
         let body = if is_abstract {
-            format!("jabs_pending = \"java/lang/AbstractMethodError\"; {ret}")
+            format!("{} {ret}", raise("java/lang/AbstractMethodError"))
         } else {
             format!(
                 "jabs_not_compiled(\"{}\");",
@@ -2346,18 +2507,13 @@ fn emit_stubs(
                 ItableTarget::Impl(key) if !live(&class.name, key) => stub_for(out, key),
                 ItableTarget::Impl(_) => {}
                 ItableTarget::Abstract | ItableTarget::Ambiguous => {
-                    let error = if matches!(entry.target, ItableTarget::Abstract) {
+                    let error = raise(if matches!(entry.target, ItableTarget::Abstract) {
                         "java/lang/AbstractMethodError"
                     } else {
                         "java/lang/IncompatibleClassChangeError"
-                    };
+                    });
                     let name = error_stub_symbol(&class.name, &entry.name, &entry.descriptor);
-                    write_stub(
-                        out,
-                        &name,
-                        &sig,
-                        &format!("jabs_pending = \"{error}\"; {ret}"),
-                    );
+                    write_stub(out, &name, &sig, &format!("{error} {ret}"));
                 }
             }
         }
@@ -2476,6 +2632,49 @@ fn emit_class_record(
     );
 }
 
+/// Define the runtime's exception hooks: VM exceptions are instances of the JDK classes when
+/// their records exist, else of name-only records (catchable only by name-free paths).
+fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
+    let mut records = Vec::new();
+    for (name, _) in VM_EXCEPTIONS {
+        if recorded.contains(name) {
+            records.push(format!("&{}", class_record(name)));
+        } else {
+            let synthetic = mangled("jabs_vmx_", &[name]);
+            let _ = writeln!(
+                out,
+                "const jabs_class {synthetic} = {{ \"{name}\", 0, NULL, NULL, NULL, 0, NULL, 0, 0 }};"
+            );
+            records.push(format!("&{synthetic}"));
+        }
+    }
+    let _ = writeln!(out, "static jabs_object *jabs_vm_throwable(int kind) {{");
+    let _ = writeln!(
+        out,
+        "    static const jabs_class *const records[] = {{ {} }};",
+        records.join(", ")
+    );
+    let _ = writeln!(out, "    const jabs_class *c = records[kind];");
+    let _ = writeln!(
+        out,
+        "    jabs_object *o = (jabs_object *)calloc(1, c->size > sizeof(jabs_object) ? c->size : sizeof(jabs_object));"
+    );
+    let _ = writeln!(
+        out,
+        "    if (!o) {{ fputs(\"jabs: out of memory while raising an exception\\n\", stderr); abort(); }}"
+    );
+    let _ = writeln!(out, "    o->cls = c;\n    return o;\n}}");
+    let error_test = if recorded.contains("java/lang/Error") {
+        format!("jabs_is_instance(o, &{})", class_record("java/lang/Error"))
+    } else {
+        "strstr(o->cls->name, \"Error\") != NULL".to_string()
+    };
+    let _ = writeln!(
+        out,
+        "static int jabs_is_error(const jabs_object *o) {{ return {error_test}; }}\n"
+    );
+}
+
 /// Classes whose initialization must precede this one's: the superclass, then (for classes)
 /// every superinterface that declares a non-abstract instance method.
 fn init_prerequisites(unit: &Unit, class: &ClassFile) -> Vec<String> {
@@ -2542,7 +2741,7 @@ fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
     let _ = writeln!(out, "    if ({state} == 1 || {state} == 2) return 0;");
     let _ = writeln!(
         out,
-        "    if ({state} == 3) {{ jabs_pending = \"java/lang/NoClassDefFoundError\"; return -1; }}"
+        "    if ({state} == 3) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NO_CLASS_DEF_FOUND); return -1; }}"
     );
     let _ = writeln!(out, "    {state} = 1;");
     // Superclass first, then superinterfaces with default methods (JVMS 5.5 step 7).
@@ -2644,6 +2843,15 @@ fn reachable(
         }));
         keys
     };
+    // The runtime may raise any VM exception, so those classes have instances.
+    for (name, _) in VM_EXCEPTIONS {
+        if unit.get(name).is_some() && unit.chain(name).is_ok() {
+            add_records(name, &mut out.records);
+            if out.instantiated.insert(name.to_string()) {
+                work.extend(implementations(name).into_iter().filter(|k| compiled(k)));
+            }
+        }
+    }
     loop {
         while let Some(class) = pending_inits.pop() {
             if !initializable.contains(&class) || !out.inits.insert(class.clone()) {
@@ -2664,6 +2872,11 @@ fn reachable(
         let Some(Ok((_, analyzed))) = results.get(&key) else {
             continue;
         };
+        for catch in analyzed.dispatch.iter().flatten() {
+            if let Some(c) = &catch.class {
+                add_records(c, &mut out.records);
+            }
+        }
         pending_inits.push(key.0.clone());
         for dep in &analyzed.deps {
             match dep {
@@ -2905,9 +3118,11 @@ pub fn compile_unit_rooted(
     for name in &interface_records {
         emit_interface_record(&mut source, unit.get(name).unwrap());
     }
+    let recorded_names: BTreeSet<&str> = recorded.iter().map(|c| c.name.as_str()).collect();
     for class in &recorded {
         emit_class_record(&mut source, &unit, class, &live);
     }
+    emit_vm_throwables(&mut source, &recorded_names);
     let mut literals: BTreeSet<Vec<u16>> = emission
         .methods
         .iter()

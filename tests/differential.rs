@@ -178,8 +178,16 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 8] = [
-    "Arith", "Statics", "BadInit", "Node", "Shapes", "Arrays", "Strings", "Ifaces",
+const FIXTURE_SOURCES: [&str; 9] = [
+    "Arith",
+    "Statics",
+    "BadInit",
+    "Node",
+    "Shapes",
+    "Arrays",
+    "Strings",
+    "Ifaces",
+    "Exceptions",
 ];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
@@ -308,6 +316,28 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     for name in ["dogEyes", "arraysAreCloneable", "nullReceiver"] {
         out.push(("Ifaces", name, vec![]));
     }
+    // Exceptions: try/catch/finally over runtime-raised exceptions.
+    for b in [0, 1, 3] {
+        for name in [
+            "finallyCounts",
+            "finallyRethrows",
+            "rethrow",
+            "caughtIdentity",
+            "instanceOfCaught",
+            "passesThrough",
+        ] {
+            out.push(("Exceptions", name, vec![I(b)]));
+        }
+        out.push(("Exceptions", "divide", vec![I(7), I(b)]));
+        out.push(("Exceptions", "nested", vec![I(7), I(b)]));
+        out.push(("Exceptions", "npeCatch", vec![I(b)]));
+    }
+    for i in [-1, 0, 2, 3] {
+        out.push(("Exceptions", "index", vec![I(i)]));
+        out.push(("Exceptions", "broad", vec![I(i)]));
+    }
+    out.push(("Exceptions", "loopWithCatch", vec![I(5)]));
+    out.push(("Exceptions", "throwNull", vec![]));
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -329,7 +359,7 @@ static void pi(int32_t v) { printf("I %08" PRIx32 "\n", (uint32_t)v); }
 static void pj(int64_t v) { printf("J %016" PRIx64 "\n", (uint64_t)v); }
 static void pf(float v) { uint32_t b; if (v != v) b = 0x7fc00000u; else memcpy(&b, &v, 4); printf("F %08" PRIx32 "\n", b); }
 static void pd(double v) { uint64_t b; if (v != v) b = UINT64_C(0x7ff8000000000000); else memcpy(&b, &v, 8); printf("D %016" PRIx64 "\n", b); }
-static int check(void) { if (jabs_pending) { printf("throw %s\n", jabs_pending); jabs_pending = 0; return 1; } return 0; }
+static int check(void) { if (jabs_pending) { printf("throw %s\n", jabs_pending->cls->name); jabs_pending = 0; return 1; } return 0; }
 "#;
 
 /// Clang target arguments that can find a C library: the default target first,
@@ -589,6 +619,23 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         reference[at("Ifaces", "dogEyes", None)],
         format!("I {:08x}", 3)
+    );
+    // Exceptions: finally ran once before the rethrow reached the outer catch (1000 - 1).
+    assert_eq!(
+        reference[at("Exceptions", "finallyRethrows", Some(0))],
+        format!("I {:08x}", 999)
+    );
+    assert_eq!(
+        reference[at("Exceptions", "rethrow", Some(0))],
+        "throw java/lang/ArithmeticException"
+    );
+    assert_eq!(
+        reference[at("Exceptions", "caughtIdentity", Some(0))],
+        format!("I {:08x}", 1)
+    );
+    assert_eq!(
+        reference[at("Exceptions", "throwNull", None)],
+        "throw java/lang/NullPointerException"
     );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(
