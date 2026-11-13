@@ -61,7 +61,7 @@ typedef union jabs_value {
 
 /* Internal class name of the pending exception, or NULL. */
 /* The exception being thrown (a Throwable object), or NULL. */
-static _Thread_local jabs_object *jabs_pending;
+extern _Thread_local jabs_object *jabs_pending;
 
 /* Exceptions the runtime itself raises, by kind. The generated unit defines jabs_vm_throwable,
  * which allocates an instance of the JDK class when it is in the unit. Constructors are not run
@@ -81,9 +81,9 @@ enum {
     JABS_VM_ILLEGAL_MONITOR_STATE,
     JABS_VM_CLONE_NOT_SUPPORTED
 };
-static jabs_object *jabs_vm_throwable(int kind);
+jabs_object *jabs_vm_throwable(int kind);
 /* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
-static int jabs_is_error(const jabs_object *o);
+int jabs_is_error(const jabs_object *o);
 
 /* Allocate a zeroed object: all-zero bytes are every field's Java default (0, 0.0, false, null).
  * There is no garbage collector yet, so objects live until the process exits. */
@@ -192,10 +192,8 @@ static inline void *jabs_array_data(jabs_array *a) {
 
 /* Shared record for every array object: arrays are instances of no compiled class.
  * A function-local static avoids unused-variable warnings in programs without arrays. */
-static inline const jabs_class *jabs_array_class(void) {
-    static const jabs_class record = { "[", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 };
-    return &record;
-}
+extern const jabs_class jabs_array_class_record;
+static inline const jabs_class *jabs_array_class(void) { return &jabs_array_class_record; }
 
 static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target);
 
@@ -319,13 +317,13 @@ static inline jabs_object *jabs_new(const jabs_class *cls) {
 /* ---- Native methods implemented by the runtime (JVM intrinsics) ---- */
 
 /* Identity hash: stable per object, never 0, distinct for consecutive requests. */
+extern uint32_t jabs_hash_next;
 static inline int32_t jabs_identity_hash(jabs_object *o) {
-    static uint32_t next = 0x9e3779b9u;
     if (o->hash == 0) {
-        next ^= next << 13;
-        next ^= next >> 17;
-        next ^= next << 5;
-        o->hash = next ? (next & 0x7fffffffu) | 1u : 1u;
+        jabs_hash_next ^= jabs_hash_next << 13;
+        jabs_hash_next ^= jabs_hash_next >> 17;
+        jabs_hash_next ^= jabs_hash_next << 5;
+        o->hash = jabs_hash_next ? (jabs_hash_next & 0x7fffffffu) | 1u : 1u;
     }
     return (int32_t)o->hash;
 }

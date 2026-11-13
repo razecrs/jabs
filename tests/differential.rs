@@ -520,7 +520,8 @@ fn native_matches_reference_jvm() {
         unsupported.is_empty(),
         "unexpectedly unsupported: {unsupported:#?}"
     );
-    let mut c = compiled.c_source.clone();
+    // The harness is its own file next to the compiled program's split files.
+    let mut c = String::from("#include \"jabs_unit.h\"\n");
     c.push_str(C_PRINTERS);
     // One small non-inlined function per case: a single huge main makes clang -O2 crawl.
     let mut case_functions = String::new();
@@ -578,34 +579,65 @@ fn native_matches_reference_jvm() {
     let reference = run(Command::new("java").arg("-cp").arg(root).arg("Runner"));
     eprintln!("reference JVM run: {:.1?}", phase.elapsed());
 
-    let c_path = root.join("fixtures.c");
-    fs::write(&c_path, c).unwrap();
+    // Compile the program's files in parallel (the reachable JDK code is large), then link.
+    let mut sources = Vec::new();
+    for (name, contents) in &compiled.c_files {
+        fs::write(root.join(name), contents).unwrap();
+        if name.ends_with(".c") {
+            sources.push(root.join(name));
+        }
+    }
+    let harness = root.join("harness.c");
+    fs::write(&harness, c).unwrap();
+    sources.push(harness);
     let exe = root.join(if cfg!(windows) {
         "fixtures.exe"
     } else {
         "fixtures"
     });
+    let target = clang_target_args(root);
+    let flags = [
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unused-function",
+        "-Wno-unused-label",
+        "-D_CRT_SECURE_NO_WARNINGS",
+    ];
     let phase = std::time::Instant::now();
+    let objects: Vec<_> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                let object = source.with_extension("o");
+                let target = &target;
+                scope.spawn(move || {
+                    run(Command::new("clang")
+                        .args(target)
+                        .args(flags)
+                        .arg("-c")
+                        .arg(source)
+                        .arg("-o")
+                        .arg(&object));
+                    object
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().unwrap()).collect()
+    });
     run(Command::new("clang")
-        .args(clang_target_args(root))
-        .args([
-            "-std=c11",
-            "-O2",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-Wno-unused-function",
-            "-Wno-unused-label",
-        ])
-        .arg(&c_path)
+        .args(&target)
+        .args(&objects)
         .arg("-o")
         .arg(&exe)
-        .arg(if cfg!(windows) {
-            "-D_CRT_SECURE_NO_WARNINGS"
-        } else {
-            "-lm"
-        }));
-    eprintln!("clang: {:.1?}", phase.elapsed());
+        .args(if cfg!(windows) { None } else { Some("-lm") }));
+    eprintln!(
+        "clang ({} files, parallel): {:.1?}",
+        sources.len(),
+        phase.elapsed()
+    );
     let phase = std::time::Instant::now();
     let native = run(&mut Command::new(&exe));
     eprintln!("native run: {:.1?}", phase.elapsed());

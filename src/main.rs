@@ -53,8 +53,12 @@ enum Action {
         /// Also put this Java installation's java.base in the unit; only code reachable from the inputs is emitted.
         #[arg(long)]
         jdk: Option<PathBuf>,
+        /// Write the program as one C file.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Write the program as a header plus many C files, for parallel compilation.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
     },
     /// Launch a profile on the JVM after verifying its artifacts; prints a JSON timing report.
     Run {
@@ -100,7 +104,12 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Action::InspectJar { jar } => print_json(jabs::jar::inspect_jar(&jar)?),
         Action::Coverage { jar, jdk } => print_json(jabs::jar::coverage(&jar, jdk.as_deref())?),
-        Action::Compile { inputs, jdk, out } => {
+        Action::Compile {
+            inputs,
+            jdk,
+            out,
+            out_dir,
+        } => {
             let mut classes = jabs::jar::load_classes(&inputs)?;
             let roots: std::collections::BTreeSet<String> =
                 classes.iter().map(|c| c.name.clone()).collect();
@@ -113,6 +122,14 @@ fn execute(cli: Cli) -> Result<()> {
             if let Some(out) = out {
                 std::fs::write(&out, &compiled.c_source)
                     .with_context(|| format!("write {}", out.display()))?;
+            }
+            if let Some(dir) = out_dir {
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("create {}", dir.display()))?;
+                for (name, contents) in &compiled.c_files {
+                    std::fs::write(dir.join(name), contents)
+                        .with_context(|| format!("write {}", dir.join(name).display()))?;
+                }
             }
             print_json(compiled)
         }

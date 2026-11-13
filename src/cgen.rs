@@ -304,6 +304,61 @@ pub struct CompiledUnit {
     pub methods: Vec<MethodReport>,
     #[serde(skip)]
     pub c_source: String,
+    /// The same program split for parallel compilation: (file name, contents). The first is the
+    /// shared header every other file includes.
+    #[serde(skip)]
+    pub c_files: Vec<(String, String)>,
+}
+
+/// Definitions of the runtime's globals; exactly one file of a program contains them.
+const RUNTIME_GLOBALS: &str = "_Thread_local jabs_object *jabs_pending;\n\
+const jabs_class jabs_array_class_record = { \"[\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 };\n\
+uint32_t jabs_hash_next = 0x9e3779b9u;\n\n";
+
+/// Extern declarations for the external definitions in `code` (records, vtables, static fields
+/// and non-static functions), so other files can reference them.
+fn declarations_for(code: &str) -> String {
+    let mut out = String::new();
+    for line in code.lines() {
+        if line.starts_with("static")
+            || line.starts_with(' ')
+            || line.starts_with('#')
+            || line.starts_with("typedef")
+        {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("const jabs_class ") {
+            if let Some(name) = rest.split(' ').next() {
+                let _ = writeln!(out, "extern const jabs_class {name};");
+            }
+        } else if let Some(rest) = line.strip_prefix("void (*const ") {
+            if let Some(name) = rest.split('[').next() {
+                let _ = writeln!(out, "extern void (*const {name}[])(void);");
+            }
+        } else if line.ends_with(';') && line.contains(" jf_") && !line.contains('(') {
+            let _ = writeln!(out, "extern {line}");
+        } else if let (Some(open), Some(brace)) = (line.find('('), line.find(") {")) {
+            // A function definition on one line ("T name(params) { ... }") or opening a body.
+            if open < brace && !line[..open].contains('=') {
+                let _ = writeln!(out, "{};", &line[..brace + 1]);
+            }
+        }
+    }
+    out
+}
+
+/// Split method definitions into roughly equal groups for parallel compilation.
+fn method_chunks(methods: &[String], files: usize) -> Vec<String> {
+    let total: usize = methods.iter().map(String::len).sum();
+    let target = (total / files.max(1)).max(1);
+    let mut chunks = vec![String::new()];
+    for m in methods {
+        if chunks.last().unwrap().len() >= target {
+            chunks.push(String::new());
+        }
+        chunks.last_mut().unwrap().push_str(m);
+    }
+    chunks
 }
 
 /// One type from a descriptor: `code` is I J F D Z B C S, `L` (with `class`) or `V` for void.
@@ -2699,7 +2754,7 @@ fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>) {
         };
         let length = if latin1 { units.len() } else { units.len() * 2 };
         let name = literal_symbol(units);
-        let _ = writeln!(out, "static jabs_object *{name}(void) {{");
+        let _ = writeln!(out, "jabs_object *{name}(void) {{");
         let _ = writeln!(out, "    static jabs_object *interned;");
         let _ = writeln!(out, "    if (interned) return interned;");
         let _ = writeln!(out, "    if ({}() != 0) return NULL;", init_symbol(STRING));
@@ -3006,7 +3061,7 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
             records.push(format!("&{synthetic}"));
         }
     }
-    let _ = writeln!(out, "static jabs_object *jabs_vm_throwable(int kind) {{");
+    let _ = writeln!(out, "jabs_object *jabs_vm_throwable(int kind) {{");
     let _ = writeln!(
         out,
         "    static const jabs_class *const records[] = {{ {} }};",
@@ -3029,7 +3084,7 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
     };
     let _ = writeln!(
         out,
-        "static int jabs_is_error(const jabs_object *o) {{ return {error_test}; }}\n"
+        "int jabs_is_error(const jabs_object *o) {{ return {error_test}; }}\n"
     );
 }
 
@@ -3093,7 +3148,7 @@ static jabs_object *jabs_string_from_utf8(const char *text) {{
 }}
 
 /* Copy an all-ASCII Latin-1 String into `out`; 0 if it is not one or does not fit. */
-static int jabs_string_to_ascii(jabs_object *s, char *out, size_t size) {{
+int jabs_string_to_ascii(jabs_object *s, char *out, size_t size) {{
     jabs_array *v = (jabs_array *)(({string_struct} *)s)->{value};
     if ((({string_struct} *)s)->{coder} != 0 || !v || (size_t)v->length >= size) return 0;
     memcpy(out, jabs_array_data(v), (size_t)v->length);
@@ -3109,7 +3164,7 @@ static int jabs_is_primitive_name(const char *n) {{
 
 /* The Class object for an internal name ("java/lang/String"), array descriptor ("[I") or
  * primitive name ("int"). Created once; the same object is returned afterwards. */
-static jabs_object *jabs_class_object(const char *name) {{
+jabs_object *jabs_class_object(const char *name) {{
     for (size_t i = 0; i < jabs_class_count; i++) if (strcmp(jabs_class_entries[i].name, name) == 0) return jabs_class_entries[i].object;
     if ({class_init}() != 0) return NULL;
     jabs_object *c = jabs_new(&{class_record_name});
@@ -3163,12 +3218,12 @@ static jabs_class_entry *jabs_class_entry_of(jabs_object *c) {{
 }}
 
 /* Object.getClass. */
-static jabs_object *jabs_class_of(jabs_object *o) {{
+jabs_object *jabs_class_of(jabs_object *o) {{
     return jabs_class_object(o->cls == jabs_array_class() ? ((jabs_array *)o)->descriptor : o->cls->name);
 }}
 
 /* Class.isInstance(o) for non-null o. */
-static int32_t jabs_class_is_instance(jabs_object *c, jabs_object *o) {{
+int32_t jabs_class_is_instance(jabs_object *c, jabs_object *o) {{
     jabs_class_entry *e = jabs_class_entry_of(c);
     if (!e || jabs_is_primitive_name(e->name)) return 0;
     if (strcmp(e->name, "java/lang/Object") == 0) return 1;
@@ -3185,7 +3240,7 @@ static int32_t jabs_class_is_instance(jabs_object *c, jabs_object *o) {{
 }}
 
 /* Class.isAssignableFrom(other) for non-null other. */
-static int32_t jabs_class_assignable_from(jabs_object *c, jabs_object *other) {{
+int32_t jabs_class_assignable_from(jabs_object *c, jabs_object *other) {{
     if (c == other) return 1;
     jabs_class_entry *a = jabs_class_entry_of(c), *b = jabs_class_entry_of(other);
     if (!a || !b || jabs_is_primitive_name(a->name) || jabs_is_primitive_name(b->name)) return 0;
@@ -3200,7 +3255,7 @@ static int32_t jabs_class_assignable_from(jabs_object *c, jabs_object *other) {{
 }}
 
 /* Class.getSuperclass: null for Object, interfaces and primitives; Object for arrays. */
-static jabs_object *jabs_class_superclass(jabs_object *c) {{
+jabs_object *jabs_class_superclass(jabs_object *c) {{
     jabs_class_entry *e = jabs_class_entry_of(c);
     if (!e || jabs_is_primitive_name(e->name) || strcmp(e->name, "java/lang/Object") == 0) return NULL;
     if (e->name[0] == '[') return jabs_class_object("java/lang/Object");
@@ -3349,6 +3404,27 @@ fn emitted_init_targets(
 /// the callee's exact signature (under its real symbol) or a class init function, each stopping
 /// with the reason; plus static field storage for classes whose initialization is a stub, so
 /// field references still link (the guard stops before they are touched).
+/// Methods emitted code calls directly that are not emitted themselves (they get stubs).
+fn reached_stub_targets(
+    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    emission: &Emission,
+) -> BTreeSet<MethodKey> {
+    let mut calls = BTreeSet::new();
+    for key in &emission.methods {
+        let Some(Ok((_, a))) = results.get(key) else {
+            continue;
+        };
+        for resolved in a.resolved.values() {
+            if let Resolved::Call(CallKind::Direct(target)) = resolved
+                && !emission.methods.contains(target)
+            {
+                calls.insert(target.clone());
+            }
+        }
+    }
+    calls
+}
+
 fn emit_reached_stubs(
     out: &mut String,
     unit: &Unit,
@@ -3862,7 +3938,23 @@ pub fn compile_unit_rooted(
     for class in emitted_init_targets(&unit, &results, &emission) {
         let _ = writeln!(source, "int {}(void);", init_symbol(&class));
     }
-    source.push('\n');
+    // Callers reach not-compiled methods through stubs under the real symbol: declare those too.
+    for key in reached_stub_targets(&results, &emission) {
+        let Some(class) = unit.get(&key.0) else {
+            continue;
+        };
+        let Some(method) = class
+            .methods
+            .iter()
+            .find(|m| m.name == key.1 && m.descriptor == key.2)
+        else {
+            continue;
+        };
+        if let Ok(sig) = parse_signature(&key.2) {
+            let _ = writeln!(source, "{};", prototype(&key.0, method, &sig));
+        }
+    }
+    source.push_str("\n/* @@definitions@@ */\n");
     // A vtable entry is real code only for instantiated classes; everything else is a stub.
     let live = |class: &str, key: &MethodKey| {
         emission.instantiated.contains(class) && emission.methods.contains(key)
@@ -3920,6 +4012,14 @@ pub fn compile_unit_rooted(
         emit_statics_and_init(&mut source, &unit, class);
     }
     emit_reached_stubs(&mut source, &unit, &results, &emission, &init_ok);
+    // Everything above the methods: shared declarations, then data and support definitions.
+    let header_end = source
+        .find(&format!("\n{}", "/* @@definitions@@ */"))
+        .unwrap_or(0);
+    let shared = source[..header_end].to_string();
+    let support = source[header_end..].to_string();
+    source.clear();
+    let mut method_texts: Vec<String> = Vec::new();
     let mut methods = Vec::new();
     for class in classes {
         for method in &class.methods {
@@ -3940,18 +4040,22 @@ pub fn compile_unit_rooted(
                         for i in 0..sig.params.len() {
                             let _ = write!(unused, " (void)a{i};");
                         }
+                        let mut text = String::new();
                         let _ = writeln!(
-                            source,
+                            text,
                             "/* native {}.{}{} */",
                             class.name, method.name, method.descriptor
                         );
                         let _ = writeln!(
-                            source,
+                            text,
                             "{} {{{unused} {body} }}\n",
                             prototype(&class.name, method, sig)
                         );
+                        method_texts.push(text);
                     } else {
-                        emit_method(&mut source, &unit, class, method, sig, analyzed);
+                        let mut text = String::new();
+                        emit_method(&mut text, &unit, class, method, sig, analyzed);
+                        method_texts.push(text);
                     }
                     MethodStatus::Compiled {
                         symbol: symbol(&key.0, &key.1, &key.2),
@@ -3998,6 +4102,29 @@ pub fn compile_unit_rooted(
         abstract_methods,
         self_contained: self_contained_count,
         methods,
-        c_source: source,
+        c_source: format!(
+            "{shared}{RUNTIME_GLOBALS}{support}{}",
+            method_texts.concat()
+        ),
+        c_files: {
+            let header = format!(
+                "{shared}\n/* Definitions elsewhere in this program. */\n{}",
+                declarations_for(&support)
+            );
+            let mut files = vec![
+                ("jabs_unit.h".to_string(), header),
+                (
+                    "unit_0.c".to_string(),
+                    format!("#include \"jabs_unit.h\"\n{RUNTIME_GLOBALS}{support}"),
+                ),
+            ];
+            for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
+                files.push((
+                    format!("unit_{}.c", i + 1),
+                    format!("#include \"jabs_unit.h\"\n{chunk}"),
+                ));
+            }
+            files
+        },
     }
 }
