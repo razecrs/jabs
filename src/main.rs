@@ -41,9 +41,10 @@ enum Action {
     InspectJar { jar: PathBuf },
     /// Measure how much of a JAR compiles and rank what blocks the rest.
     Coverage { jar: PathBuf },
-    /// Compile a class's numeric static methods to C; reports every unsupported method.
-    CompileClass {
-        class: PathBuf,
+    /// Compile class files (or every class in jars) together as one unit; reports every unsupported method.
+    Compile {
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -91,11 +92,9 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Action::InspectJar { jar } => print_json(jabs::jar::inspect_jar(&jar)?),
         Action::Coverage { jar } => print_json(jabs::jar::coverage(&jar)?),
-        Action::CompileClass { class, out } => {
-            let bytes =
-                std::fs::read(&class).with_context(|| format!("read {}", class.display()))?;
-            let parsed = jabs::classfile::ClassFile::parse(&bytes)?;
-            let compiled = jabs::cgen::compile_class(&parsed);
+        Action::Compile { inputs, out } => {
+            let classes = jabs::jar::load_classes(&inputs)?;
+            let compiled = jabs::cgen::compile_unit(&classes);
             if let Some(out) = out {
                 std::fs::write(&out, &compiled.c_source)
                     .with_context(|| format!("write {}", out.display()))?;

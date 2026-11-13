@@ -258,41 +258,56 @@ fn blocker_category(reason: &str) -> String {
         .split_once(": ")
         .filter(|(pc, _)| pc.starts_with("pc "))
         .map_or(reason, |(_, r)| r);
-    if reason.contains("outside this class") {
-        "calls into another class".into()
-    } else if reason.contains("objects of other classes") {
-        "new of another class".into()
-    } else if reason.contains("is inherited") {
-        "inherited member (cross-class)".into()
-    } else if reason.contains("in another class is not compiled") {
-        "field of another class".into()
-    } else if reason.starts_with("arrays in") || reason.contains("arrays in ") {
-        "arrays".into()
-    } else if reason.contains("is not compiled yet (only primitives") {
-        "field of an unsupported type".into()
-    } else if reason.starts_with("calls ") {
-        "calls a method that is not compiled".into()
-    } else if reason.starts_with("call to ") {
-        "calls into another class".into()
-    } else if reason.contains("cross-class initialization") {
-        "initialization of a superclass/superinterface (cross-class)".into()
-    } else if reason.starts_with("static initializer not compiled") {
-        "static initializer not compiled".into()
-    } else if reason.contains("in another class is not compiled")
-        || reason.contains("cross-class field")
-    {
-        "static field of another class".into()
-    } else if reason.starts_with("reference types in") {
-        "reference types in signature".into()
-    } else if let Some(op) = reason.strip_prefix("opcode ") {
-        format!("opcode {}", op.split(" (").next().unwrap_or(op))
-    } else {
-        reason.into()
+    let rules: [(&str, &str); 16] = [
+        (
+            "class hierarchy incomplete",
+            "superclass/interface outside the unit (JDK or other jars)",
+        ),
+        (
+            "is inherited from outside the unit",
+            "call inherited from outside the unit (e.g. Object methods)",
+        ),
+        (
+            "is not in the compilation unit",
+            "uses a class outside the unit (JDK or other jars)",
+        ),
+        (
+            "or its hierarchy is outside the unit",
+            "type relationship outside the unit",
+        ),
+        (
+            "which cannot be initialized",
+            "initializes a class that cannot be initialized",
+        ),
+        ("static initializer of", "static initializer not compiled"),
+        (
+            "type test against",
+            "instanceof/checkcast against an interface or outside class",
+        ),
+        ("arrays in", "arrays"),
+        ("interface instance methods", "interface instance methods"),
+        ("synchronized", "synchronized methods"),
+        ("exception handlers", "exception handlers (try/catch)"),
+        ("no bytecode", "abstract or native methods"),
+        ("calls ", "calls a method that is not compiled"),
+        (
+            "not declared in the unit",
+            "field declared outside the unit",
+        ),
+        ("super calls", "super calls"),
+        ("constructor", "constructor call shape"),
+    ];
+    if let Some((_, category)) = rules.iter().find(|(needle, _)| reason.contains(needle)) {
+        return category.to_string();
     }
+    if let Some(op) = reason.strip_prefix("opcode ") {
+        return format!("opcode {}", op.split(" (").next().unwrap_or(op));
+    }
+    reason.to_string()
 }
 
-/// Run the C compiler front end over every class in a JAR (without writing C) and tally what blocks it.
-pub fn coverage(path: &Path) -> Result<Coverage> {
+/// Parse every class in a JAR (multi-release overlays skipped); returns (classes, entries tried, unparsable).
+pub fn read_jar_classes(path: &Path) -> Result<(Vec<ClassFile>, usize, usize)> {
     let file = File::open(path).with_context(|| format!("open jar {}", path.display()))?;
     let mut archive =
         zip::ZipArchive::new(file).with_context(|| format!("read zip {}", path.display()))?;
@@ -303,38 +318,74 @@ pub fn coverage(path: &Path) -> Result<Coverage> {
             archive.len()
         );
     }
-    let (mut classes, mut unparsable, mut methods, mut compiled) = (0, 0, 0, 0);
-    let mut blockers: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut classes, mut tried, mut unparsable) = (Vec::new(), 0, 0);
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
         let name = entry.name().to_owned();
-        if !name.ends_with(".class") || name.starts_with("META-INF/versions/") {
+        if !name.ends_with(".class")
+            || name.starts_with("META-INF/versions/")
+            || name.ends_with("module-info.class")
+        {
             continue;
         }
-        classes += 1;
-        let Ok(class) =
-            read_bounded(entry, MAX_CLASS_BYTES, &name).and_then(|b| ClassFile::parse(&b))
-        else {
-            unparsable += 1;
-            continue;
-        };
-        let unit = crate::cgen::compile_class(&class);
-        methods += unit.methods.len();
-        compiled += unit.compiled;
-        for method in unit.methods {
-            if let crate::cgen::MethodStatus::Unsupported { reason } = method.status {
-                *blockers.entry(blocker_category(&reason)).or_default() += 1;
+        tried += 1;
+        match read_bounded(entry, MAX_CLASS_BYTES, &name).and_then(|b| ClassFile::parse(&b)) {
+            Ok(class) => classes.push(class),
+            Err(_) => unparsable += 1,
+        }
+    }
+    Ok((classes, tried, unparsable))
+}
+
+/// Load classes from `.class` files and jars, failing on anything unparsable.
+pub fn load_classes(inputs: &[std::path::PathBuf]) -> Result<Vec<ClassFile>> {
+    let mut classes = Vec::new();
+    for input in inputs {
+        if input
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("class"))
+        {
+            let bytes =
+                std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+            classes.push(
+                ClassFile::parse(&bytes).with_context(|| format!("parse {}", input.display()))?,
+            );
+        } else {
+            let (found, _, unparsable) = read_jar_classes(input)?;
+            if unparsable > 0 {
+                bail!(
+                    "{}: {unparsable} classes could not be parsed",
+                    input.display()
+                );
             }
+            classes.extend(found);
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    if let Some(dup) = classes.iter().find(|c| !names.insert(c.name.clone())) {
+        bail!("class {} appears twice in the inputs", dup.name);
+    }
+    Ok(classes)
+}
+
+/// Compile every class in a JAR together as one unit (without writing C) and tally what blocks the rest.
+pub fn coverage(path: &Path) -> Result<Coverage> {
+    let (classes, tried, unparsable) = read_jar_classes(path)?;
+    let unit = crate::cgen::compile_unit(&classes);
+    let mut blockers: BTreeMap<String, usize> = BTreeMap::new();
+    for method in &unit.methods {
+        if let crate::cgen::MethodStatus::Unsupported { reason } = &method.status {
+            *blockers.entry(blocker_category(reason)).or_default() += 1;
         }
     }
     let mut blockers: Vec<_> = blockers.into_iter().collect();
     blockers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(Coverage {
         schema_version: 1,
-        classes,
+        classes: tried,
         unparsable_classes: unparsable,
-        methods,
-        compiled_methods: compiled,
+        methods: unit.compiled + unit.unsupported,
+        compiled_methods: unit.compiled,
         blockers,
     })
 }

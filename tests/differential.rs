@@ -177,7 +177,8 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
     out
 }
 
-const FIXTURE_CLASSES: [&str; 4] = ["Arith", "Statics", "BadInit", "Node"];
+/// Fixture sources; every class they define is compiled together as one unit.
+const FIXTURE_SOURCES: [&str; 5] = ["Arith", "Statics", "BadInit", "Node", "Shapes"];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
@@ -228,6 +229,24 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     out.push(("Node", "nullCall", vec![I(3)]));
     out.push(("Node", "relink", vec![I(5)]));
     out.push(("Node", "lengthOf", vec![I(0)]));
+    // Hierarchy: the first case triggers Shape, Rect, Square initialization in that order.
+    out.push(("Shapes", "initOrder", vec![]));
+    for which in [0, 1, 2] {
+        out.push(("Shapes", "area", vec![I(which), D(1.5)]));
+        out.push(("Shapes", "kind", vec![I(which)]));
+        out.push(("Shapes", "isRect", vec![I(which)]));
+        out.push(("Shapes", "castToRect", vec![I(which)]));
+        out.push(("Shapes", "scaled", vec![I(which), D(-0.5)]));
+        for other in [0, 1, 2] {
+            out.push(("Shapes", "total", vec![I(which), I(other)]));
+        }
+    }
+    out.push(("Shapes", "ids", vec![I(7)]));
+    out.push(("Shapes", "tag", vec![]));
+    out.push(("Shapes", "trace", vec![]));
+    // A superclass whose initializer throws: EIIE first, then NoClassDefFoundError.
+    out.push(("Shapes", "childGet", vec![]));
+    out.push(("Shapes", "childGet", vec![]));
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -324,7 +343,7 @@ fn native_matches_reference_jvm() {
         .args(["--release", "8", "-nowarn", "-Xlint:-options", "-d"])
         .arg(root)
         .args(
-            FIXTURE_CLASSES
+            FIXTURE_SOURCES
                 .iter()
                 .map(|c| fixtures.join(format!("{c}.java"))),
         ));
@@ -332,27 +351,24 @@ fn native_matches_reference_jvm() {
     let mut java = String::from("public class Runner {\n");
     java.push_str(JAVA_PRINTERS);
     java.push_str("    public static void main(String[] args) {\n");
-    let mut c = String::new();
-    let mut classes = Vec::new();
-    for name in FIXTURE_CLASSES {
-        let class =
-            ClassFile::parse(&fs::read(root.join(format!("{name}.class"))).unwrap()).unwrap();
-        let compiled = cgen::compile_class(&class);
-        // Every fixture method except constructors must compile: unsupported is a test failure here.
-        let unsupported: Vec<_> = compiled
-            .methods
-            .iter()
-            .filter(|m| {
-                m.name != "<init>" && matches!(m.status, cgen::MethodStatus::Unsupported { .. })
-            })
-            .collect();
-        assert!(
-            unsupported.is_empty(),
-            "{name}: unexpectedly unsupported: {unsupported:#?}"
-        );
-        c.push_str(&compiled.c_source);
-        classes.push(class);
-    }
+    let classes: Vec<ClassFile> = fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "class"))
+        .map(|p| ClassFile::parse(&fs::read(p).unwrap()).unwrap())
+        .collect();
+    let compiled = cgen::compile_unit(&classes);
+    // Every fixture method must compile: unsupported is a test failure here.
+    let unsupported: Vec<_> = compiled
+        .methods
+        .iter()
+        .filter(|m| matches!(m.status, cgen::MethodStatus::Unsupported { .. }))
+        .collect();
+    assert!(
+        unsupported.is_empty(),
+        "unexpectedly unsupported: {unsupported:#?}"
+    );
+    let mut c = compiled.c_source.clone();
     c.push_str(C_PRINTERS);
     c.push_str("int main(void) {\n");
 
@@ -371,10 +387,10 @@ fn native_matches_reference_jvm() {
         let jargs: Vec<_> = args
             .iter()
             .zip(&sig.params)
-            .map(|(a, p)| java_literal(*a, *p))
+            .map(|(a, p)| java_literal(*a, p.code))
             .collect();
         let cargs: Vec<_> = args.iter().map(|a| c_literal(*a)).collect();
-        let p = printer(sig.ret);
+        let p = printer(sig.ret.code);
         let _ = writeln!(
             java,
             "        try {{ {p}({class_name}.{name}({})); }} catch (Throwable t) {{ pt(t); }}",
@@ -385,7 +401,7 @@ fn native_matches_reference_jvm() {
             c,
             "    if ({}() != 0) check(); else {{ {} r = {}({}); if (!check()) {p}(r); }}",
             cgen::init_symbol(class_name),
-            cgen::c_type(sig.ret),
+            cgen::c_type(sig.ret.code),
             cgen::symbol(class_name, name, &desc),
             cargs.join(", ")
         );
@@ -442,6 +458,33 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         npes, 4,
         "expected exactly four NullPointerExceptions from the Node fixture"
+    );
+    // Guard the hierarchy fixture's key JVM behaviors so they are compared, not skipped.
+    let at = |class: &str, name: &str, args_first: Option<i32>| {
+        all.iter()
+            .position(|(c, n, a)| {
+                *c == class
+                    && *n == name
+                    && args_first.is_none_or(|v| matches!(a.first(), Some(I(x)) if *x == v))
+            })
+            .unwrap()
+    };
+    // Shape(1), then Rect(3), then Square(4): superclasses initialize first.
+    assert_eq!(
+        reference[at("Shapes", "initOrder", None)],
+        format!("J {:016x}", 134)
+    );
+    assert_eq!(
+        reference[at("Shapes", "castToRect", Some(0))],
+        "throw java/lang/ClassCastException"
+    );
+    let child = at("Shapes", "childGet", None);
+    assert_eq!(
+        reference[child..child + 2],
+        [
+            "throw java/lang/ExceptionInInitializerError",
+            "throw java/lang/NoClassDefFoundError"
+        ]
     );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(

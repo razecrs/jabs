@@ -13,16 +13,19 @@ The architecture and rollout are in [PLAN.md](PLAN.md).
 - `inspect-jar`: class-file versions and required Java, loader metadata (Fabric,
   Quilt, NeoForge, `mods.toml`, legacy `mcmod.info`, coremods, LaunchWrapper
   tweakers), mixin configs, native libraries and `invokedynamic` usage.
-- `compile-class`: compiles a class's methods to C11 with Java semantics:
-  primitive arithmetic, branches, loops, switches, static fields and class
-  initialization (JVMS 5.5), and objects of that same class (constructors,
-  fields, virtual calls via a vtable, null checks raising
-  `NullPointerException`). A small bytecode verifier proves every path
-  type-correct before any pointer code is emitted. Everything else is listed
-  per method with the reason it was not compiled. There is no garbage
-  collector yet: objects live until the process exits. A differential test runs
-  2,873 cases on the reference JVM and as native code and requires
-  bit-identical results.
+- `compile`: compiles `.class` files or whole jars together as one unit to
+  C11 with Java semantics: primitive arithmetic and control flow, static
+  fields and class initialization across classes (superclass first, JVMS 5.5),
+  objects with inheritance (constructors, fields, vtables with Java's override
+  rules, `super` calls), `instanceof`/checkcast, and null checks. A bytecode
+  verifier proves every path type-correct against the class hierarchy before
+  any pointer code is emitted. Classes outside the unit (the JDK, other jars)
+  are opaque. A vtable slot whose implementation did not compile holds a stub
+  that stops with a diagnostic (abstract slots throw `AbstractMethodError`), so
+  a class's generated code never depends on which subclasses exist and stays
+  cacheable per class. Every uncompiled method is listed with its reason. No
+  garbage collector yet. A differential test runs 2,903 cases on the reference
+  JVM and as native code and requires bit-identical results.
 - `run`: launches a vanilla **server** profile on the JVM after rehashing every
   artifact, with the main class from the jar manifest and a required exact Java
   version. `--until-ready` reports wall-clock time to the server's `Done` line and

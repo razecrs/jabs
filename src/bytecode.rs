@@ -184,6 +184,14 @@ pub enum Op {
     New {
         class: String,
     },
+    /// Throw ClassCastException unless the reference is null or an instance of `class`.
+    CheckCast {
+        class: String,
+    },
+    /// Push 1 if the reference is a non-null instance of `class`, else 0.
+    InstanceOf {
+        class: String,
+    },
     GetField(MemberRef),
     PutField(MemberRef),
     InvokeVirtual(MemberRef),
@@ -410,6 +418,12 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
             target: branch(pc, c.u16()? as i16 as i32, len)?,
         },
         0xbb => New {
+            class: class.class_name(c.u16()?)?.into(),
+        },
+        0xc0 => CheckCast {
+            class: class.class_name(c.u16()?)?.into(),
+        },
+        0xc1 => InstanceOf {
             class: class.class_name(c.u16()?)?.into(),
         },
         0xb4 | 0xb5 => {

@@ -11,6 +11,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,11 +19,13 @@
 #error "JABS requires FLT_EVAL_METHOD == 0 for Java floating-point semantics"
 #endif
 
-/* A class's runtime record: name, instance size and vtable (one slot per overridable method). */
+/* A class's runtime record: name, instance size, vtable (one slot per overridable method)
+ * and superclass record (NULL directly below java/lang/Object). */
 typedef struct jabs_class {
     const char *name;
     size_t size;
     void (*const *vtable)(void);
+    const struct jabs_class *super;
 } jabs_class;
 
 /* Every object starts with this header; the class's own struct embeds it first. */
@@ -123,6 +126,21 @@ static inline int32_t jabs_fcmpl(float a, float b) { return a > b ? 1 : a == b ?
 static inline int32_t jabs_fcmpg(float a, float b) { return a < b ? -1 : a == b ? 0 : 1; }
 static inline int32_t jabs_dcmpl(double a, double b) { return a > b ? 1 : a == b ? 0 : -1; }
 static inline int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == b ? 0 : 1; }
+
+/* Reached a method that has no native code yet: stop with a diagnostic rather than guess.
+ * The profile must run on the JVM backend until this method compiles. */
+static void jabs_not_compiled(const char *method) {
+    fprintf(stderr, "jabs: %s is not compiled to native code; run this profile on the JVM backend\n", method);
+    abort();
+}
+
+/* instanceof for a class target: walk the object's superclass chain. */
+static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target) {
+    for (const jabs_class *c = o->cls; c; c = c->super) {
+        if (c == target) return 1;
+    }
+    return 0;
+}
 
 static inline jabs_object *jabs_new(const jabs_class *cls) {
     jabs_object *o = (jabs_object *)calloc(1, cls->size);
