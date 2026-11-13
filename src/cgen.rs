@@ -1055,6 +1055,9 @@ enum Resolved {
     /// Array access: the element descriptor char of the array's static type (`Z` vs `B` matters
     /// for stores), or None when the array is statically null (the access always throws).
     Element(Option<char>),
+    /// Member of a class outside the unit: the instruction stops with this diagnostic if it
+    /// ever executes (the JVM likewise resolves references lazily, when first executed).
+    Unresolved(String),
 }
 
 /// Something a compiled method needs to be compiled too.
@@ -1109,7 +1112,11 @@ impl Cx<'_, '_> {
             (true, false) => matches!(target, "java/lang/Cloneable" | "java/io/Serializable"),
             (false, true) => false,
             (false, false) => {
-                self.unit.is_interface(target) || self.unit.is_subclass(name, target) == Some(true)
+                // A class outside the unit is opaque: nothing native accesses a value through it,
+                // so any reference may stand in for it (as the JVM would only check at link time).
+                self.unit.get(target).is_none()
+                    || self.unit.is_interface(target)
+                    || self.unit.is_subclass(name, target) == Some(true)
             }
         }
     }
@@ -1253,6 +1260,90 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
         falls: true,
         ..Step::default()
     };
+    let outside = |class: &str| !class.starts_with('[') && unit.get(class).is_none();
+    let unresolved = match &insn.op {
+        Op::InvokeStatic {
+            class,
+            name,
+            descriptor,
+        } if outside(class) => Some((class.clone(), name.clone(), descriptor.clone(), false, None)),
+        Op::InvokeVirtual(m) | Op::InvokeInterface(m) if outside(&m.class) => Some((
+            m.class.clone(),
+            m.name.clone(),
+            m.descriptor.clone(),
+            true,
+            None,
+        )),
+        Op::GetStatic {
+            class,
+            name,
+            descriptor,
+        } if outside(class) => Some((
+            class.clone(),
+            name.clone(),
+            descriptor.clone(),
+            false,
+            Some(true),
+        )),
+        Op::PutStatic {
+            class,
+            name,
+            descriptor,
+        } if outside(class) => Some((
+            class.clone(),
+            name.clone(),
+            descriptor.clone(),
+            false,
+            Some(false),
+        )),
+        Op::GetField(m) if outside(&m.class) => Some((
+            m.class.clone(),
+            m.name.clone(),
+            m.descriptor.clone(),
+            true,
+            Some(true),
+        )),
+        Op::PutField(m) if outside(&m.class) => Some((
+            m.class.clone(),
+            m.name.clone(),
+            m.descriptor.clone(),
+            true,
+            Some(false),
+        )),
+        _ => None,
+    };
+    if let Some((class, name, descriptor, receiver, field)) = unresolved {
+        match field {
+            None => {
+                let s = parse_signature(&descriptor)?;
+                for p in s.params.iter().rev() {
+                    frame.pop_ty(cx, p, pc)?;
+                }
+                if receiver {
+                    frame.pop_ref(cx, OBJECT, pc)?;
+                }
+                if s.ret.code != 'V' {
+                    frame.stack.push(cx.of_ty(&s.ret));
+                }
+            }
+            Some(is_get) => {
+                let ty = parse_type(&descriptor, &name)?;
+                if !is_get {
+                    frame.pop_ty(cx, &ty, pc)?;
+                }
+                if receiver {
+                    frame.pop_ref(cx, OBJECT, pc)?;
+                }
+                if is_get {
+                    frame.stack.push(cx.of_ty(&ty));
+                }
+            }
+        }
+        out.resolved = Some(Resolved::Unresolved(format!(
+            "{class}.{name}{descriptor}: {class} is not in the compilation unit"
+        )));
+        return Ok(out);
+    }
     match &insn.op {
         Op::Nop => {}
         Op::Goto(t) => {
@@ -2238,6 +2329,10 @@ fn emit_method(
         };
         let exit = exit.as_str();
         let npe = throw("java/lang/NullPointerException", exit);
+        if let Some(Resolved::Unresolved(message)) = resolved {
+            let _ = writeln!(out, "    jabs_not_compiled(\"{}\");", c_escape(message));
+            continue;
+        }
         let line = match &insn.op {
             Op::Nop | Op::Pop | Op::Pop2 => continue,
             Op::Const(v) => format!("s[{d}].{} = {};", field(v.kind()), value_literal(*v)),

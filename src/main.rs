@@ -59,6 +59,9 @@ enum Action {
         /// Write the program as a header plus many C files, for parallel compilation.
         #[arg(long)]
         out_dir: Option<PathBuf>,
+        /// Emit only code reachable from these classes (internal names; default: every input class).
+        #[arg(long)]
+        root: Vec<String>,
     },
     /// Launch a profile on the JVM after verifying its artifacts; prints a JSON timing report.
     Run {
@@ -109,14 +112,25 @@ fn execute(cli: Cli) -> Result<()> {
             jdk,
             out,
             out_dir,
+            root,
         } => {
             let mut classes = jabs::jar::load_classes(&inputs)?;
             let roots: std::collections::BTreeSet<String> =
                 classes.iter().map(|c| c.name.clone()).collect();
+            let inputs_named = roots.clone();
+            let roots: std::collections::BTreeSet<String> = if root.is_empty() {
+                roots
+            } else {
+                root.into_iter().collect()
+            };
             if let Some(java) = jdk {
                 let home = jabs::jdk::java_home(&java)?;
                 let (library, _, _) = jabs::jdk::read_module(&home, "java.base")?;
-                classes.extend(library.into_iter().filter(|c| !roots.contains(&c.name)));
+                classes.extend(
+                    library
+                        .into_iter()
+                        .filter(|c| !inputs_named.contains(&c.name)),
+                );
             }
             let compiled = jabs::cgen::compile_unit_rooted(&classes, Some(&roots));
             if let Some(out) = out {
