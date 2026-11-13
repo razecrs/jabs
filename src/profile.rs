@@ -47,6 +47,20 @@ pub struct Launch {
     pub jvm_args: Vec<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Behavior-preserving launch optimizations, each individually enabled.
+    #[serde(default)]
+    pub optimizations: Vec<Optimization>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Optimization {
+    /// Put a Mojang bundler's verified nested jars directly on the classpath.
+    Unbundle,
+    /// Use local copies of the game jars without signature files (needs `unbundle`).
+    StripSignatures,
+    /// Train once, then start from a JVM AOT cache (JEP 483/514; Java 25+).
+    AotCache,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "server-26.3",
+  "minecraft_version": "26.3",
+  "java_major": 25,
+  "loader": { "kind": "vanilla" },
+  "backend": "jvm",
+  "artifacts": [
+    {
+      "id": "server",
+      "role": "game",
+      "path": "../local/servers/26.3-server.jar",
+      "sha256": "REPLACE_WITH_JABS_HASH_OUTPUT"
+    }
+  ],
+  "launch": {
+    "side": "server",
+    "jvm_args": ["-Xmx2G"],
+    "args": ["nogui"],
+    "optimizations": ["unbundle", "strip_signatures", "aot_cache"]
+  }
+}

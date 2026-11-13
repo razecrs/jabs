@@ -1,10 +1,12 @@
 //! `jabs run` for the JVM backend: verified artifacts, explicit Java version, measured startup.
 
-use crate::profile::{self, Backend, LoaderKind, Role, Side};
+use crate::bundler;
+use crate::profile::{self, Backend, LoaderKind, Optimization, Role, Side};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -18,6 +20,8 @@ pub struct RunOptions {
     pub until_ready: bool,
     /// Kill the game if it has not exited this long after launch.
     pub timeout: Duration,
+    /// Build a missing AOT cache during this run (only `jabs prepare` sets this).
+    pub train_aot: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,9 +40,23 @@ pub struct RunReport {
     pub ready_line: Option<String>,
     pub stopped_by_jabs: bool,
     pub killed_after_timeout: bool,
+    /// What each requested optimization actually did on this run.
+    pub optimizations: Vec<OptimizationOutcome>,
     pub exit_code: Option<i32>,
     pub total_ms: u64,
     pub measurement: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OptimizationOutcome {
+    pub name: Optimization,
+    pub status: String,
+}
+
+/// Full `java -version` text, part of the AOT cache key (a cache only works with the exact JDK build).
+fn java_identity(java: &Path) -> Result<String> {
+    let output = Command::new(java).arg("-version").output()?;
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 /// Major version of a Java executable, from `java.specification.version` (`1.8` -> 8, `25` -> 25).
@@ -180,22 +198,110 @@ pub fn run(profile_path: &Path, options: &RunOptions) -> Result<RunReport> {
     let game = artifact_path(Role::Game)
         .next()
         .context("profile has no game artifact")?;
-    let main_class = match &launch.main_class {
+    let wants = |o: Optimization| launch.optimizations.contains(&o);
+    // Absolute: the JVM resolves paths from the game's working directory, not ours.
+    let jabs_dir = std::path::absolute(working_directory.join(".jabs"))?;
+    let mut outcomes = Vec::new();
+    let mut main_class = match &launch.main_class {
         Some(main) => main.clone(),
         None => manifest_main_class(&game)?,
     };
     // Absolute paths: the game runs in its own working directory.
-    let classpath: Vec<PathBuf> = std::iter::once(game)
-        .chain(artifact_path(Role::Library))
-        .chain(artifact_path(Role::Loader))
-        .map(|p| std::path::absolute(&p).unwrap_or(p))
+    let mut game_jars = vec![std::path::absolute(&game)?];
+    if wants(Optimization::StripSignatures) && !wants(Optimization::Unbundle) {
+        bail!(
+            "strip_signatures needs unbundle (signatures are stripped from the unbundled copies)"
+        );
+    }
+    if wants(Optimization::Unbundle) {
+        if bundler::is_bundler(&game)? {
+            let sha = &profile
+                .artifacts
+                .iter()
+                .find(|a| a.role == Role::Game)
+                .unwrap()
+                .sha256;
+            let strip = wants(Optimization::StripSignatures);
+            let unbundled = bundler::unbundle(&game, sha, &jabs_dir.join("unbundled"), strip)?;
+            if launch.main_class.is_none() {
+                main_class = unbundled.main_class;
+            }
+            game_jars = unbundled.classpath;
+            let how = if unbundled.extracted {
+                "extracted and verified"
+            } else {
+                "verified and reused"
+            };
+            outcomes.push(OptimizationOutcome {
+                name: Optimization::Unbundle,
+                status: how.into(),
+            });
+            if strip {
+                outcomes.push(OptimizationOutcome {
+                    name: Optimization::StripSignatures,
+                    status: "game jars run from local unsigned copies".into(),
+                });
+            }
+        } else {
+            outcomes.push(OptimizationOutcome {
+                name: Optimization::Unbundle,
+                status: "skipped: game artifact is not a bundler jar".into(),
+            });
+        }
+    }
+    let classpath: Vec<PathBuf> = game_jars
+        .into_iter()
+        .chain(
+            artifact_path(Role::Library)
+                .chain(artifact_path(Role::Loader))
+                .map(|p| std::path::absolute(&p).unwrap_or(p)),
+        )
         .collect();
+
+    let mut aot_args = Vec::new();
+    let mut aot_training: Option<(PathBuf, PathBuf)> = None;
+    if wants(Optimization::AotCache) {
+        if major < 25 {
+            bail!(
+                "aot_cache needs Java 25+ (single-step AOT training, JEP 514); this profile uses Java {major}"
+            );
+        }
+        // The cache is only valid for the exact JDK, JVM flags, main class and classpath contents.
+        let mut key = Sha256::new();
+        key.update(java_identity(&java)?);
+        key.update(launch.jvm_args.join("\n"));
+        key.update(&main_class);
+        for jar in &classpath {
+            key.update(profile::hash_file(jar)?.1);
+        }
+        let key = format!("{:x}", key.finalize());
+        let cache = jabs_dir.join("aot").join(format!("{key}.aot"));
+        fs::create_dir_all(cache.parent().unwrap())?;
+        if cache.exists() {
+            aot_args.push(format!("-XX:AOTCache={}", cache.display()));
+            outcomes.push(OptimizationOutcome {
+                name: Optimization::AotCache,
+                status: "used existing cache".into(),
+            });
+        } else if options.train_aot {
+            let partial = cache.with_file_name(format!("{key}.training.aot"));
+            aot_args.push(format!("-XX:AOTCacheOutput={}", partial.display()));
+            aot_training = Some((partial, cache));
+        } else {
+            // Never train implicitly: a training start is several times slower than a normal one.
+            outcomes.push(OptimizationOutcome {
+                name: Optimization::AotCache,
+                status: "no cache for this exact JDK and classpath; started without it (`jabs prepare` builds it)".into(),
+            });
+        }
+    }
     let classpath = std::env::join_paths(&classpath)
         .context("artifact path contains the classpath separator")?;
 
     let mut command = Command::new(&java);
     command
         .args(&launch.jvm_args)
+        .args(&aot_args)
         .arg("-cp")
         .arg(&classpath)
         .arg(&main_class)
@@ -258,6 +364,20 @@ pub fn run(profile_path: &Path, options: &RunOptions) -> Result<RunReport> {
         }
     };
     let total_ms = started.elapsed().as_millis() as u64;
+    // The JVM writes the cache at exit; only a clean exit publishes it.
+    if let Some((partial, cache)) = aot_training {
+        let status = if status.success() && partial.exists() {
+            fs::rename(&partial, &cache)?;
+            "trained during this run (slower); later runs use it"
+        } else {
+            fs::remove_file(&partial).ok();
+            "training did not complete; no cache written"
+        };
+        outcomes.push(OptimizationOutcome {
+            name: Optimization::AotCache,
+            status: status.into(),
+        });
+    }
     forward_out.join().ok();
     forward_err.join().ok();
     // Drain readiness lines that arrived just before exit.
@@ -281,6 +401,7 @@ pub fn run(profile_path: &Path, options: &RunOptions) -> Result<RunReport> {
         ready_line,
         stopped_by_jabs,
         killed_after_timeout: killed,
+        optimizations: outcomes,
         exit_code: status.code(),
         total_ms,
         measurement: "one run; wall clock from process spawn; disk cache and world state not controlled",

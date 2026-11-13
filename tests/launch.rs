@@ -82,6 +82,7 @@ fn options() -> RunOptions {
     RunOptions {
         until_ready: true,
         timeout: Duration::from_secs(60),
+        train_aot: false,
     }
 }
 

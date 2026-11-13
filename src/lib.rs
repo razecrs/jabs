@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod bundler;
 pub mod bytecode;
 pub mod cgen;
 pub mod classfile;

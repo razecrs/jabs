@@ -69,7 +69,22 @@ fn execute(cli: Cli) -> Result<()> {
     match cli.command {
         Action::Inspect { profile: path } => print_json(profile::inspect(&path)?),
         Action::Prepare { profile, cache } => {
-            print_json(preparation::prepare(&profile, &cache, false)?)
+            let integrity = preparation::prepare(&profile, &cache, false)?;
+            // Launch caches (the JVM AOT cache) are built here so `run` never pays for training.
+            let wants_aot = profile::load(&profile)?
+                .launch
+                .is_some_and(|l| l.optimizations.contains(&profile::Optimization::AotCache));
+            let training = if wants_aot {
+                let options = jabs::launch::RunOptions {
+                    until_ready: true,
+                    timeout: std::time::Duration::from_secs(1800),
+                    train_aot: true,
+                };
+                Some(jabs::launch::run(&profile, &options)?)
+            } else {
+                None
+            };
+            print_json(serde_json::json!({ "integrity": integrity, "launch_training": training }))
         }
         Action::Verify { profile, cache } => {
             print_json(preparation::prepare(&profile, &cache, true)?)
@@ -107,6 +122,7 @@ fn execute(cli: Cli) -> Result<()> {
             let options = jabs::launch::RunOptions {
                 until_ready,
                 timeout: std::time::Duration::from_secs(timeout_secs),
+                train_aot: false,
             };
             print_json(jabs::launch::run(&profile, &options)?)
         }

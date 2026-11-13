@@ -25,6 +25,24 @@ The architecture and rollout are in [PLAN.md](PLAN.md).
   stops it cleanly. JABS never accepts the Minecraft EULA for you: the server's
   `eula.txt` must already say `eula=true`.
 
+Launch optimizations (each opt-in per profile under `launch.optimizations`, and
+reported per run):
+
+- `unbundle`: runs a Mojang bundler's nested jars (each verified against the
+  bundler's listed SHA-256) directly on the classpath, in the bundler's order.
+- `strip_signatures`: runs local unsigned copies of the game jars, because the
+  JVM AOT cache skips classes from signed jars. The originals stay verified;
+  the copies never leave your machine.
+- `aot_cache`: Java 25+ AOT cache (JEP 483/514). `jabs prepare` performs the
+  one-time training start; `jabs run` only uses an existing cache and never
+  trains implicitly.
+
+Measured on one Windows machine, 26.3 dedicated server, existing world, time to
+the `Done` line: stock `java -jar` 8.6-9.0 s (3 runs); all three optimizations
+4.4-6.0 s (10 runs, median about 4.6 s). The training start took 38 s. These
+are startup numbers only; gameplay and tick performance are unchanged and not
+yet measured. See `examples/server-profile.json`.
+
 JABS **does not launch clients or mod loaders yet, verify bytecode, compile object-using Java,
 or execute mods natively**. `prepare` caches integrity
 metadata only. It reports zero compiled units. `run` requires a `launch` section.
