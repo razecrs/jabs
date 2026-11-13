@@ -250,6 +250,8 @@ pub struct Coverage {
     pub compiled_methods: usize,
     /// Normalized unsupported reason -> method count, most common first.
     pub blockers: Vec<(String, usize)>,
+    /// The JDK classes compiled in the same unit, when requested.
+    pub jdk: Option<PartCoverage>,
 }
 
 /// Collapse per-method details (pcs, names, descriptors) so reasons group into categories.
@@ -311,10 +313,18 @@ pub fn read_jar_classes(path: &Path) -> Result<(Vec<ClassFile>, usize, usize)> {
     let file = File::open(path).with_context(|| format!("open jar {}", path.display()))?;
     let mut archive =
         zip::ZipArchive::new(file).with_context(|| format!("read zip {}", path.display()))?;
+    classes_from_zip(&mut archive, "", &path.display().to_string())
+}
+
+/// Parse the classes under `prefix` in an open zip (jar or jmod); returns (classes, entries tried, unparsable).
+pub fn classes_from_zip<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    prefix: &str,
+    label: &str,
+) -> Result<(Vec<ClassFile>, usize, usize)> {
     if archive.len() > MAX_ENTRIES {
         bail!(
-            "{} has {} entries; limit is {MAX_ENTRIES}",
-            path.display(),
+            "{label} has {} entries; limit is {MAX_ENTRIES}",
             archive.len()
         );
     }
@@ -322,9 +332,12 @@ pub fn read_jar_classes(path: &Path) -> Result<(Vec<ClassFile>, usize, usize)> {
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
         let name = entry.name().to_owned();
-        if !name.ends_with(".class")
-            || name.starts_with("META-INF/versions/")
-            || name.ends_with("module-info.class")
+        let Some(rel) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        if !rel.ends_with(".class")
+            || rel.starts_with("META-INF/versions/")
+            || rel.ends_with("module-info.class")
         {
             continue;
         }
@@ -368,24 +381,83 @@ pub fn load_classes(inputs: &[std::path::PathBuf]) -> Result<Vec<ClassFile>> {
     Ok(classes)
 }
 
-/// Compile every class in a JAR together as one unit (without writing C) and tally what blocks the rest.
-pub fn coverage(path: &Path) -> Result<Coverage> {
-    let (classes, tried, unparsable) = read_jar_classes(path)?;
-    let unit = crate::cgen::compile_unit(&classes);
+/// Coverage of one part of a unit (the jar, or the JDK classes compiled alongside it).
+#[derive(Debug, Serialize)]
+pub struct PartCoverage {
+    pub classes: usize,
+    pub methods: usize,
+    pub compiled_methods: usize,
+    /// Normalized unsupported reason -> method count, most common first.
+    pub blockers: Vec<(String, usize)>,
+}
+
+/// Count compiled/unsupported methods of the unit's classes in `names`, with ranked blockers.
+fn part_coverage(
+    unit: &crate::cgen::CompiledUnit,
+    names: &std::collections::HashSet<&str>,
+) -> PartCoverage {
     let mut blockers: BTreeMap<String, usize> = BTreeMap::new();
-    for method in &unit.methods {
-        if let crate::cgen::MethodStatus::Unsupported { reason } = &method.status {
-            *blockers.entry(blocker_category(reason)).or_default() += 1;
+    let (mut methods, mut compiled) = (0, 0);
+    for method in unit
+        .methods
+        .iter()
+        .filter(|m| names.contains(m.class.as_str()))
+    {
+        match &method.status {
+            crate::cgen::MethodStatus::Compiled { .. } => {
+                methods += 1;
+                compiled += 1;
+            }
+            crate::cgen::MethodStatus::Unsupported { reason } => {
+                methods += 1;
+                *blockers.entry(blocker_category(reason)).or_default() += 1;
+            }
+            crate::cgen::MethodStatus::Abstract => {}
         }
     }
     let mut blockers: Vec<_> = blockers.into_iter().collect();
     blockers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    PartCoverage {
+        classes: names.len(),
+        methods,
+        compiled_methods: compiled,
+        blockers,
+    }
+}
+
+/// Compile every class in a JAR (plus, optionally, the JDK's java.base) as one unit, without
+/// writing C, and tally what blocks the rest.
+pub fn coverage(path: &Path, jdk: Option<&Path>) -> Result<Coverage> {
+    let (mut classes, tried, unparsable) = read_jar_classes(path)?;
+    let jar_names: Vec<String> = classes.iter().map(|c| c.name.clone()).collect();
+    let mut jdk_names = Vec::new();
+    if let Some(java) = jdk {
+        let home = crate::jdk::java_home(java)?;
+        let (library, _, library_unparsable) = crate::jdk::read_module(&home, "java.base")?;
+        if library_unparsable > 0 {
+            bail!("{library_unparsable} java.base classes could not be parsed");
+        }
+        // A jar class with the same name as a JDK class would be shadowed by the boot loader.
+        let mine: std::collections::HashSet<&str> = jar_names.iter().map(String::as_str).collect();
+        for class in library {
+            if !mine.contains(class.name.as_str()) {
+                jdk_names.push(class.name.clone());
+                classes.push(class);
+            }
+        }
+    }
+    let unit = crate::cgen::compile_unit(&classes);
+    let jar_set = jar_names.iter().map(String::as_str).collect();
+    let jar = part_coverage(&unit, &jar_set);
+    let jdk_part = (!jdk_names.is_empty())
+        .then(|| part_coverage(&unit, &jdk_names.iter().map(String::as_str).collect()));
     Ok(Coverage {
-        schema_version: 1,
+        schema_version: 2,
         classes: tried,
         unparsable_classes: unparsable,
-        methods: unit.compiled + unit.unsupported,
-        compiled_methods: unit.compiled,
-        blockers,
+        methods: jar.methods,
+        compiled_methods: jar.compiled_methods,
+        blockers: jar.blockers,
+        jdk: jdk_part,
     })
 }

@@ -40,7 +40,12 @@ enum Action {
     /// Inventory a JAR: class-file versions, loader metadata, mixins, natives.
     InspectJar { jar: PathBuf },
     /// Measure how much of a JAR compiles and rank what blocks the rest.
-    Coverage { jar: PathBuf },
+    Coverage {
+        jar: PathBuf,
+        /// Also compile this Java installation's java.base in the same unit (e.g. `java`).
+        #[arg(long)]
+        jdk: Option<PathBuf>,
+    },
     /// Compile class files (or every class in jars) together as one unit; reports every unsupported method.
     Compile {
         #[arg(required = true)]
@@ -91,7 +96,7 @@ fn execute(cli: Cli) -> Result<()> {
             print_json(preparation::prepare(&profile, &cache, true)?)
         }
         Action::InspectJar { jar } => print_json(jabs::jar::inspect_jar(&jar)?),
-        Action::Coverage { jar } => print_json(jabs::jar::coverage(&jar)?),
+        Action::Coverage { jar, jdk } => print_json(jabs::jar::coverage(&jar, jdk.as_deref())?),
         Action::Compile { inputs, out } => {
             let classes = jabs::jar::load_classes(&inputs)?;
             let compiled = jabs::cgen::compile_unit(&classes);

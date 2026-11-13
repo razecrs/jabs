@@ -142,7 +142,7 @@ fn coverage_counts_classes_and_skips_overlays() {
             ("demo/Broken.class", b"\xCA\xFE"),
         ],
     );
-    let report = jar::coverage(&path).unwrap();
+    let report = jar::coverage(&path, None).unwrap();
     assert_eq!(
         (report.classes, report.unparsable_classes, report.methods),
         (2, 1, 0)
