@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "scenario": "synthetic-format-example-not-a-benchmark",
+  "backend": "synthetic",
+  "minecraft_version": "1.21.1",
+  "hardware": "synthetic data; no hardware measured",
+  "settings": "synthetic data; no game executed",
+  "runs": [
+    { "frame_ms": [16, 17, 18, 20, 32], "tick_ms": [3, 4, 5, 8, 12] }
+  ]
+}

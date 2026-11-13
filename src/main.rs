@@ -1,0 +1,132 @@
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use jabs::{benchmark, preparation, profile};
+use serde::Serialize;
+use std::{
+    fs::File,
+    path::PathBuf,
+    process::{Command, ExitCode},
+};
+
+#[derive(Parser)]
+#[command(version, about = "JABS profile integrity and benchmark foundations")]
+struct Cli {
+    #[command(subcommand)]
+    command: Action,
+}
+
+#[derive(Subcommand)]
+enum Action {
+    /// Check pinned local artifact hashes (not runtime compatibility).
+    Inspect { profile: PathBuf },
+    /// Cache verified artifact metadata. Does not compile Minecraft yet.
+    Prepare {
+        profile: PathBuf,
+        #[arg(long, default_value = ".jabs/cache")]
+        cache: PathBuf,
+    },
+    /// Recheck source artifacts and prepared metadata without writing.
+    Verify {
+        profile: PathBuf,
+        #[arg(long, default_value = ".jabs/cache")]
+        cache: PathBuf,
+    },
+    /// Report host platform, tool availability and implementation limits.
+    Doctor,
+    /// Summarize supplied frame/tick measurements; does not run Minecraft.
+    Bench { measurements: PathBuf },
+    /// Compute a local artifact digest for a profile.
+    Hash { file: PathBuf },
+    /// Inventory a JAR: class-file versions, loader metadata, mixins, natives.
+    InspectJar { jar: PathBuf },
+    /// Measure how much of a JAR compiles and rank what blocks the rest.
+    Coverage { jar: PathBuf },
+    /// Compile a class's numeric static methods to C; reports every unsupported method.
+    CompileClass {
+        class: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Reserved launcher interface; execution is not implemented yet.
+    Run { profile: PathBuf },
+}
+
+fn print_json(value: impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+/// Run one CLI subcommand.
+fn execute(cli: Cli) -> Result<()> {
+    match cli.command {
+        Action::Inspect { profile: path } => print_json(profile::inspect(&path)?),
+        Action::Prepare { profile, cache } => {
+            print_json(preparation::prepare(&profile, &cache, false)?)
+        }
+        Action::Verify { profile, cache } => {
+            print_json(preparation::prepare(&profile, &cache, true)?)
+        }
+        Action::InspectJar { jar } => print_json(jabs::jar::inspect_jar(&jar)?),
+        Action::Coverage { jar } => print_json(jabs::jar::coverage(&jar)?),
+        Action::CompileClass { class, out } => {
+            let bytes =
+                std::fs::read(&class).with_context(|| format!("read {}", class.display()))?;
+            let parsed = jabs::classfile::ClassFile::parse(&bytes)?;
+            let compiled = jabs::cgen::compile_class(&parsed);
+            if let Some(out) = out {
+                std::fs::write(&out, &compiled.c_source)
+                    .with_context(|| format!("write {}", out.display()))?;
+            }
+            print_json(compiled)
+        }
+        Action::Hash { file } => {
+            let (bytes, sha256) = profile::hash_file(&file)?;
+            print_json(serde_json::json!({ "bytes": bytes, "sha256": sha256 }))
+        }
+        Action::Bench { measurements } => {
+            let data = serde_json::from_reader(
+                File::open(&measurements)
+                    .with_context(|| format!("open {}", measurements.display()))?,
+            )
+            .context("invalid measurements JSON")?;
+            print_json(benchmark::summarize(data)?)
+        }
+        Action::Run { profile: path } => {
+            let profile = profile::load(&path)?;
+            bail!(
+                "execution backend {:?} is not implemented; profile {} was not launched",
+                profile.backend,
+                profile.name
+            )
+        }
+        Action::Doctor => {
+            let tools: Vec<_> = [("java", "-version"), ("javac", "-version"), ("clang", "--version"), ("rustc", "--version")]
+                .into_iter().map(|(name, arg)| {
+                    match Command::new(name).arg(arg).output() {
+                        Ok(output) => {
+                            let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                            serde_json::json!({ "tool": name, "available": output.status.success(), "version_output": text.trim() })
+                        },
+                        Err(error) => serde_json::json!({ "tool": name, "available": false, "error": error.to_string() }),
+                    }
+                }).collect();
+            print_json(
+                serde_json::json!({ "schema_version": 1, "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH, "tools": tools,
+                "capabilities": ["profile_integrity", "metadata_cache", "measurement_summary", "jar_inventory", "numeric_static_method_compilation"],
+                "unimplemented": ["launch", "object_model", "garbage_collection", "class_initialization", "exceptions_handlers", "benchmark_capture"],
+                "note": "tool discovery does not establish target or Java-version compatibility" }),
+            )
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    match execute(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}

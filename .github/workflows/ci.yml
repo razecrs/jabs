@@ -1,0 +1,22 @@
+name: foundations
+on: [push, pull_request]
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo test --locked
+        env:
+          JABS_REQUIRE_TOOLS: '1'
+      - run: cargo clippy --locked --all-targets -- -D warnings
