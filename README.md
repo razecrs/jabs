@@ -19,9 +19,15 @@ The architecture and rollout are in [PLAN.md](PLAN.md).
   was not compiled. A differential test runs 2,807 edge cases on the reference
   JVM and as native code and requires bit-identical results.
 
-JABS **does not launch Minecraft, verify bytecode, compile object-using Java,
-execute mods, or capture game benchmarks yet**. `prepare` caches integrity
-metadata only. It reports zero compiled units. `run` fails explicitly.
+- `run`: launches a vanilla **server** profile on the JVM after rehashing every
+  artifact, with the main class from the jar manifest and a required exact Java
+  version. `--until-ready` reports wall-clock time to the server's `Done` line and
+  stops it cleanly. JABS never accepts the Minecraft EULA for you: the server's
+  `eula.txt` must already say `eula=true`.
+
+JABS **does not launch clients or mod loaders yet, verify bytecode, compile object-using Java,
+or execute mods natively**. `prepare` caches integrity
+metadata only. It reports zero compiled units. `run` requires a `launch` section.
 No performance advantage has been measured.
 
 ## Getting started

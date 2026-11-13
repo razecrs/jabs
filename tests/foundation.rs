@@ -156,5 +156,5 @@ fn cli_success_and_unsupported_execution() {
     assert_eq!(output["profile"], "fixture");
     let run = Command::new(exe).arg("run").arg(&path).output().unwrap();
     assert!(!run.status.success());
-    assert!(String::from_utf8_lossy(&run.stderr).contains("not implemented"));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("analysis-only"));
 }

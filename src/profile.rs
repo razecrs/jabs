@@ -18,6 +18,35 @@ pub struct Profile {
     pub loader: Loader,
     pub backend: Backend,
     pub artifacts: Vec<Artifact>,
+    /// How `jabs run` starts this profile; absent means the profile is analysis-only.
+    #[serde(default)]
+    pub launch: Option<Launch>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    Client,
+    Server,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Launch {
+    pub side: Side,
+    /// Game directory (worlds, logs, eula.txt), relative to the profile; defaults to `run/<profile name>`.
+    #[serde(default)]
+    pub working_directory: Option<PathBuf>,
+    /// Java executable; defaults to `java` on PATH. Its major version must equal `java_major`.
+    #[serde(default)]
+    pub java: Option<PathBuf>,
+    /// Overrides the game artifact's manifest `Main-Class`.
+    #[serde(default)]
+    pub main_class: Option<String>,
+    #[serde(default)]
+    pub jvm_args: Vec<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

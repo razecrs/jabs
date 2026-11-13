@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use jabs::{benchmark, preparation, profile};
 use serde::Serialize;
@@ -47,8 +47,16 @@ enum Action {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Reserved launcher interface; execution is not implemented yet.
-    Run { profile: PathBuf },
+    /// Launch a profile on the JVM after verifying its artifacts; prints a JSON timing report.
+    Run {
+        profile: PathBuf,
+        /// Stop the server once it reports ready (startup measurement).
+        #[arg(long)]
+        until_ready: bool,
+        /// Kill the game if still running after this many seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
+    },
 }
 
 fn print_json(value: impl Serialize) -> Result<()> {
@@ -91,13 +99,16 @@ fn execute(cli: Cli) -> Result<()> {
             .context("invalid measurements JSON")?;
             print_json(benchmark::summarize(data)?)
         }
-        Action::Run { profile: path } => {
-            let profile = profile::load(&path)?;
-            bail!(
-                "execution backend {:?} is not implemented; profile {} was not launched",
-                profile.backend,
-                profile.name
-            )
+        Action::Run {
+            profile,
+            until_ready,
+            timeout_secs,
+        } => {
+            let options = jabs::launch::RunOptions {
+                until_ready,
+                timeout: std::time::Duration::from_secs(timeout_secs),
+            };
+            print_json(jabs::launch::run(&profile, &options)?)
         }
         Action::Doctor => {
             let tools: Vec<_> = [("java", "-version"), ("javac", "-version"), ("clang", "--version"), ("rustc", "--version")]
@@ -113,8 +124,8 @@ fn execute(cli: Cli) -> Result<()> {
             print_json(
                 serde_json::json!({ "schema_version": 1, "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH, "tools": tools,
-                "capabilities": ["profile_integrity", "metadata_cache", "measurement_summary", "jar_inventory", "numeric_static_method_compilation"],
-                "unimplemented": ["launch", "object_model", "garbage_collection", "class_initialization", "exceptions_handlers", "benchmark_capture"],
+                "capabilities": ["profile_integrity", "metadata_cache", "measurement_summary", "jar_inventory", "numeric_static_method_compilation", "vanilla_server_launch"],
+                "unimplemented": ["client_launch", "mod_loader_launch", "object_model", "garbage_collection", "class_initialization", "exceptions_handlers", "benchmark_capture"],
                 "note": "tool discovery does not establish target or Java-version compatibility" }),
             )
         }
