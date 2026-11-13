@@ -178,7 +178,9 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 6] = ["Arith", "Statics", "BadInit", "Node", "Shapes", "Arrays"];
+const FIXTURE_SOURCES: [&str; 7] = [
+    "Arith", "Statics", "BadInit", "Node", "Shapes", "Arrays", "Strings",
+];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
@@ -277,6 +279,20 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     }
     out.push(("Arrays", "nullArray", vec![I(0)]));
     out.push(("Arrays", "nullLength", vec![]));
+    // Strings: literals built in the JDK's own layout, run through the JDK's own String code.
+    for name in [
+        "length",
+        "lengthUtf16",
+        "emptyLength",
+        "same",
+        "different",
+        "sameAcross",
+        "loneSurrogate",
+    ] {
+        out.push(("Strings", name, vec![]));
+    }
+    out.push(("Strings", "isEmpty", vec![I(0)]));
+    out.push(("Strings", "isEmpty", vec![I(1)]));
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -381,18 +397,28 @@ fn native_matches_reference_jvm() {
     let mut java = String::from("public class Runner {\n");
     java.push_str(JAVA_PRINTERS);
     java.push_str("    public static void main(String[] args) {\n");
-    let classes: Vec<ClassFile> = fs::read_dir(root)
+    let mut classes: Vec<ClassFile> = fs::read_dir(root)
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|e| e == "class"))
         .map(|p| ClassFile::parse(&fs::read(p).unwrap()).unwrap())
         .collect();
-    let compiled = cgen::compile_unit(&classes);
+    let roots: std::collections::BTreeSet<String> =
+        classes.iter().map(|c| c.name.clone()).collect();
+    // Compile against the real class library, as in production: java.base joins the unit and only
+    // code reachable from the fixtures is emitted.
+    let home = jabs::jdk::java_home(Path::new("java")).unwrap();
+    let (library, _, unparsable) = jabs::jdk::read_module(&home, "java.base").unwrap();
+    assert_eq!(unparsable, 0);
+    classes.extend(library);
+    let compiled = cgen::compile_unit_rooted(&classes, Some(&roots));
     // Every fixture method must compile: unsupported is a test failure here.
     let unsupported: Vec<_> = compiled
         .methods
         .iter()
-        .filter(|m| matches!(m.status, cgen::MethodStatus::Unsupported { .. }))
+        .filter(|m| {
+            roots.contains(&m.class) && matches!(m.status, cgen::MethodStatus::Unsupported { .. })
+        })
         .collect();
     assert!(
         unsupported.is_empty(),

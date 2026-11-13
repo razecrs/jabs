@@ -92,6 +92,8 @@ pub struct ClassFile {
     pub interfaces: Vec<String>,
     pub fields: Vec<Member>,
     pub methods: Vec<Member>,
+    /// Exact UTF-16 text of each Utf8 constant that a String constant refers to.
+    pub string_units: std::collections::HashMap<u16, Vec<u16>>,
 }
 
 pub(crate) struct Cursor<'a> {
@@ -137,6 +139,11 @@ impl<'a> Cursor<'a> {
 
 /// Decode JVM modified UTF-8 (encoded NUL, surrogate pairs as two 3-byte units).
 pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String> {
+    Ok(String::from_utf16_lossy(&modified_utf8_units(bytes)?))
+}
+
+/// Exact UTF-16 code units of a modified UTF-8 constant (unpaired surrogates preserved).
+pub fn modified_utf8_units(bytes: &[u8]) -> Result<Vec<u16>> {
     let mut units = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -163,7 +170,7 @@ pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String> {
         units.push(unit);
         i += len;
     }
-    Ok(String::from_utf16_lossy(&units))
+    Ok(units)
 }
 
 /// Walk an attribute table, handing each (name, payload) to `on`.
@@ -238,6 +245,7 @@ impl ClassFile {
         if count == 0 {
             bail!("empty constant pool");
         }
+        let mut raw_utf8: Vec<(u16, &[u8])> = Vec::new();
         let mut pool = Vec::with_capacity(count);
         pool.push(Constant::Unusable);
         while pool.len() < count {
@@ -245,7 +253,9 @@ impl ClassFile {
             let entry = match tag {
                 1 => {
                     let len = c.u16()? as usize;
-                    Constant::Utf8(decode_modified_utf8(c.take(len)?)?)
+                    let bytes = c.take(len)?;
+                    raw_utf8.push((pool.len() as u16, bytes));
+                    Constant::Utf8(decode_modified_utf8(bytes)?)
                 }
                 3 => Constant::Integer(c.u32()? as i32),
                 4 => Constant::Float(c.u32()?),
@@ -297,6 +307,19 @@ impl ClassFile {
                 _ => bail!("unknown constant-pool tag {tag} at index {}", pool.len()),
             };
             pool.push(entry);
+        }
+        let literal_texts: std::collections::HashSet<u16> = pool
+            .iter()
+            .filter_map(|c| match c {
+                Constant::String(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        let mut string_units = std::collections::HashMap::new();
+        for (index, bytes) in raw_utf8 {
+            if literal_texts.contains(&index) {
+                string_units.insert(index, modified_utf8_units(bytes)?);
+            }
         }
         let access = c.u16()?;
         let this_class = c.u16()?;
@@ -357,6 +380,7 @@ impl ClassFile {
             interfaces,
             fields,
             methods,
+            string_units,
         })
     }
 

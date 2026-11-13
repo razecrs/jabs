@@ -184,6 +184,8 @@ pub enum Op {
     New {
         class: String,
     },
+    /// `ldc` of a String constant: its exact UTF-16 code units.
+    LdcString(Vec<u16>),
     /// Load an element; the char is the element family: I J F D A, B (byte or boolean), C, S.
     ArrayLoad(char),
     /// Store an element; same element families as `ArrayLoad`.
@@ -304,6 +306,13 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
                 c.u16()?
             };
             let value = match class.pool.get(index as usize) {
+                Some(Constant::String(text)) if opcode != 0x14 => {
+                    let units = class
+                        .string_units
+                        .get(text)
+                        .ok_or_else(|| anyhow::anyhow!("string constant {index} has no text"))?;
+                    return Ok(LdcString(units.clone()));
+                }
                 Some(Constant::Integer(v)) if opcode != 0x14 => Value::I(*v),
                 Some(Constant::Float(v)) if opcode != 0x14 => Value::F(*v),
                 Some(Constant::Long(v)) if opcode == 0x14 => Value::J(*v),

@@ -129,7 +129,7 @@ static inline int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == 
 
 /* Reached a method that has no native code yet: stop with a diagnostic rather than guess.
  * The profile must run on the JVM backend until this method compiles. */
-static inline void jabs_not_compiled(const char *method) {
+static inline _Noreturn void jabs_not_compiled(const char *method) {
     fprintf(stderr, "jabs: %s is not compiled to native code; run this profile on the JVM backend\n", method);
     abort();
 }

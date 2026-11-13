@@ -50,6 +50,9 @@ enum Action {
     Compile {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
+        /// Also put this Java installation's java.base in the unit; only code reachable from the inputs is emitted.
+        #[arg(long)]
+        jdk: Option<PathBuf>,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -97,9 +100,16 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Action::InspectJar { jar } => print_json(jabs::jar::inspect_jar(&jar)?),
         Action::Coverage { jar, jdk } => print_json(jabs::jar::coverage(&jar, jdk.as_deref())?),
-        Action::Compile { inputs, out } => {
-            let classes = jabs::jar::load_classes(&inputs)?;
-            let compiled = jabs::cgen::compile_unit(&classes);
+        Action::Compile { inputs, jdk, out } => {
+            let mut classes = jabs::jar::load_classes(&inputs)?;
+            let roots: std::collections::BTreeSet<String> =
+                classes.iter().map(|c| c.name.clone()).collect();
+            if let Some(java) = jdk {
+                let home = jabs::jdk::java_home(&java)?;
+                let (library, _, _) = jabs::jdk::read_module(&home, "java.base")?;
+                classes.extend(library.into_iter().filter(|c| !roots.contains(&c.name)));
+            }
+            let compiled = jabs::cgen::compile_unit_rooted(&classes, Some(&roots));
             if let Some(out) = out {
                 std::fs::write(&out, &compiled.c_source)
                     .with_context(|| format!("write {}", out.display()))?;

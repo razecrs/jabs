@@ -31,6 +31,15 @@ use std::{
 
 pub const RUNTIME_PRELUDE: &str = include_str!("../runtime/jabs_rt.h");
 const OBJECT: &str = "java/lang/Object";
+const STRING: &str = "java/lang/String";
+
+/// Fields the JDK 9+ String layout must have for compiled literals: value, coder, hash, hashIsZero.
+const STRING_FIELDS: [(&str, &str); 4] = [
+    ("value", "[B"),
+    ("coder", "B"),
+    ("hash", "I"),
+    ("hashIsZero", "Z"),
+];
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -1001,6 +1010,26 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             frame.stack.push(VType::Uninit(pc));
             out.deps.push(Dep::Init(class.clone()));
         }
+        Op::LdcString(_) => {
+            let Some(string) = unit.get(STRING) else {
+                bail!(
+                    "pc {pc}: string constants need java/lang/String in the unit (add the JDK's java.base)"
+                );
+            };
+            for (name, descriptor) in STRING_FIELDS {
+                if !string.fields.iter().any(|f| {
+                    f.name == name && f.descriptor == descriptor && f.access & ACC_STATIC == 0
+                }) {
+                    bail!(
+                        "pc {pc}: this JDK's String has no {name}:{descriptor} field; only the JDK 9+ layout is supported"
+                    );
+                }
+            }
+            unit.chain(STRING)?;
+            frame.stack.push(VType::Obj(unit.intern(STRING)));
+            // The JVM initializes String before any literal exists; String's own code relies on it.
+            out.deps.push(Dep::Init(STRING.to_string()));
+        }
         Op::NewArray(element) => {
             frame.pop_prim(Kind::I, pc)?;
             frame
@@ -1706,6 +1735,10 @@ fn emit_method(
                 init_guard(unit, &class.name, target, ret_default),
                 class_record(target)
             ),
+            Op::LdcString(units) => format!(
+                "s[{d}].a = {}(); if (!s[{d}].a) {ret_default}",
+                literal_symbol(units)
+            ),
             Op::NewArray(element) => {
                 let r = d - 1;
                 format!(
@@ -1874,6 +1907,115 @@ fn emit_object_layout(out: &mut String, class: &ClassFile) {
     let _ = writeln!(out, "}};\n");
 }
 
+/// Text of a `static final String` field's ConstantValue, if it has one.
+fn constant_string(class: &ClassFile, field: &Member) -> Option<Vec<u16>> {
+    match field
+        .constant_value
+        .and_then(|i| class.pool.get(i as usize))
+    {
+        Some(Constant::String(text)) if field.descriptor == "Ljava/lang/String;" => {
+            class.string_units.get(text).cloned()
+        }
+        _ => None,
+    }
+}
+
+/// C name of the function returning the (interned) String object for a literal.
+fn literal_symbol(units: &[u16]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for u in units {
+        hasher.update(u.to_le_bytes());
+    }
+    format!("jl_{:x}", hasher.finalize())[..27].to_string()
+}
+
+/// Emit one function per distinct string literal. Each builds its String once (Latin-1 when every
+/// char fits in a byte, else UTF-16 in the target's byte order, as the JDK's compact strings do)
+/// and returns the same object afterwards, so equal literals are the same object everywhere.
+fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>) {
+    if literals.is_empty() {
+        return;
+    }
+    let string = object_struct(STRING);
+    let record = class_record(STRING);
+    for units in literals {
+        let latin1 = units.iter().all(|&u| u <= 0xFF);
+        let bytes = |little: bool| -> String {
+            let mut b: Vec<String> = Vec::new();
+            for &u in units {
+                if latin1 {
+                    b.push(format!("{}", u as u8));
+                } else if little {
+                    b.extend([format!("{}", u & 0xFF), format!("{}", u >> 8)]);
+                } else {
+                    b.extend([format!("{}", u >> 8), format!("{}", u & 0xFF)]);
+                }
+            }
+            if b.is_empty() {
+                "0".to_string()
+            } else {
+                b.join(",")
+            }
+        };
+        let length = if latin1 { units.len() } else { units.len() * 2 };
+        let name = literal_symbol(units);
+        let _ = writeln!(out, "static jabs_object *{name}(void) {{");
+        let _ = writeln!(out, "    static jabs_object *interned;");
+        let _ = writeln!(out, "    if (interned) return interned;");
+        let _ = writeln!(out, "    if ({}() != 0) return NULL;", init_symbol(STRING));
+        if latin1 {
+            let _ = writeln!(
+                out,
+                "    static const unsigned char bytes[] = {{ {} }};",
+                bytes(true)
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__"
+            );
+            let _ = writeln!(
+                out,
+                "    static const unsigned char bytes[] = {{ {} }};",
+                bytes(false)
+            );
+            let _ = writeln!(out, "#else");
+            let _ = writeln!(
+                out,
+                "    static const unsigned char bytes[] = {{ {} }};",
+                bytes(true)
+            );
+            let _ = writeln!(out, "#endif");
+        }
+        let _ = writeln!(
+            out,
+            "    jabs_object *value = jabs_new_array({length}, 1, JABS_COMPONENT_PRIMITIVE, NULL, \"[B\", NULL);"
+        );
+        let _ = writeln!(out, "    if (!value) return NULL;");
+        let _ = writeln!(
+            out,
+            "    memcpy(jabs_array_data((jabs_array *)value), bytes, {length});"
+        );
+        let _ = writeln!(out, "    jabs_object *s = jabs_new(&{record});");
+        let _ = writeln!(out, "    if (!s) return NULL;");
+        let _ = writeln!(
+            out,
+            "    (({string} *)s)->{} = value;",
+            instance_field("value")
+        );
+        let _ = writeln!(
+            out,
+            "    (({string} *)s)->{} = {};",
+            instance_field("coder"),
+            if latin1 { 0 } else { 1 }
+        );
+        let _ = writeln!(out, "    interned = s;");
+        let _ = writeln!(out, "    return s;\n}}");
+    }
+    out.push('\n');
+}
+
 /// C name of the stub that stands in for an implementation that is not compiled.
 fn stub_symbol(key: &MethodKey) -> String {
     mangled("jx_", &[&key.0, &key.1, &key.2])
@@ -1887,7 +2029,7 @@ fn emit_stubs(
     out: &mut String,
     unit: &Unit,
     laid_out: &[&ClassFile],
-    compiled: &BTreeSet<MethodKey>,
+    live: &dyn Fn(&str, &MethodKey) -> bool,
 ) {
     let mut done = BTreeSet::new();
     for class in laid_out {
@@ -1901,7 +2043,7 @@ fn emit_stubs(
                 slot.name.clone(),
                 slot.descriptor.clone(),
             );
-            if compiled.contains(&key) || !done.insert(key.clone()) {
+            if live(&class.name, &key) || !done.insert(key.clone()) {
                 continue;
             }
             // Calls with unparsable descriptors (arrays) never compile, so their slots stay NULL.
@@ -1946,7 +2088,7 @@ fn emit_class_record(
     out: &mut String,
     unit: &Unit,
     class: &ClassFile,
-    compiled: &BTreeSet<MethodKey>,
+    live: &dyn Fn(&str, &MethodKey) -> bool,
 ) {
     let vtable_name = mangled("jv_", &[&class.name]);
     let slots = unit
@@ -1957,7 +2099,7 @@ fn emit_class_record(
         .iter()
         .map(|s| {
             let key = (s.owner.clone(), s.name.clone(), s.descriptor.clone());
-            if compiled.contains(&key) {
+            if live(&class.name, &key) {
                 format!("(void (*)(void)){}", symbol(&key.0, &key.1, &key.2))
             } else if parse_signature(&key.2).is_ok() {
                 format!("(void (*)(void)){}", stub_symbol(&key))
@@ -2013,13 +2155,16 @@ fn init_prerequisites(unit: &Unit, class: &ClassFile) -> Vec<String> {
 
 /// Emit a class's static field storage and initialization function (JVMS 5.5, single-threaded).
 fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
+    let init = init_symbol(&class.name);
+    let state = format!("{init}_state");
     let mut constants = String::new();
     for f in class.fields.iter().filter(|f| f.access & ACC_STATIC != 0) {
         let Some(ty) = storage_type(&f.descriptor) else {
             continue;
         };
         let sym = field_symbol(&class.name, &f.name);
-        let _ = writeln!(out, "static {ty} {sym};");
+        // External linkage: fields only read through inlined constants must not trip unused warnings.
+        let _ = writeln!(out, "{ty} {sym};");
         // ConstantValue fields are set by the initialization procedure itself, before <clinit> runs.
         let value = match f.constant_value.and_then(|i| class.pool.get(i as usize)) {
             Some(Constant::Integer(v)) => Some(Value::I(*v)),
@@ -2031,10 +2176,14 @@ fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
         if let Some(value) = value {
             let literal = narrow_for_store(&f.descriptor, &value_literal(value));
             let _ = writeln!(constants, "    {sym} = {literal};");
+        } else if let Some(units) = constant_string(class, f) {
+            let _ = writeln!(
+                constants,
+                "    {sym} = {}(); if (!{sym}) {{ {state} = 3; return -1; }}",
+                literal_symbol(&units)
+            );
         }
     }
-    let init = init_symbol(&class.name);
-    let state = format!("{init}_state");
     let _ = writeln!(
         out,
         "\n/* 0 = uninitialized, 1 = initializing, 2 = initialized, 3 = erroneous. */"
@@ -2084,6 +2233,128 @@ fn structural_problem(unit: &Unit, class: &ClassFile) -> Option<String> {
 
 /// Compile a set of classes together into one C unit.
 pub fn compile_unit(classes: &[ClassFile]) -> CompiledUnit {
+    compile_unit_rooted(classes, None)
+}
+
+/// What emission needs: the methods to emit, the classes needing a runtime record, the classes
+/// that are instantiated (whose vtables must hold real code), and the classes to initialize.
+struct Emission {
+    methods: BTreeSet<MethodKey>,
+    records: BTreeSet<String>,
+    instantiated: BTreeSet<String>,
+    inits: BTreeSet<String>,
+}
+
+/// Everything reachable from the root classes. `new K` makes K's compiled vtable implementations
+/// reachable, since virtual calls may now dispatch to them; vtables of classes never
+/// instantiated hold stubs, which no call can reach because no such object exists.
+fn reachable(
+    unit: &Unit,
+    classes: &[ClassFile],
+    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    initializable: &BTreeSet<String>,
+    roots: &BTreeSet<String>,
+) -> Emission {
+    let compiled = |k: &MethodKey| matches!(results.get(k), Some(Ok(_)));
+    let mut out = Emission {
+        methods: BTreeSet::new(),
+        records: BTreeSet::new(),
+        instantiated: BTreeSet::new(),
+        inits: BTreeSet::new(),
+    };
+    let mut work: Vec<MethodKey> = Vec::new();
+    let mut pending_inits: Vec<String> = Vec::new();
+    for class in classes.iter().filter(|c| roots.contains(&c.name)) {
+        pending_inits.push(class.name.clone());
+        for m in &class.methods {
+            let key = (class.name.clone(), m.name.clone(), m.descriptor.clone());
+            if compiled(&key) {
+                work.push(key);
+            }
+        }
+    }
+    // A record for `class` also needs records for its superclasses (instanceof walks them).
+    let add_records = |name: &str, records: &mut BTreeSet<String>| {
+        if let Ok(chain) = unit.chain(name) {
+            for c in chain.iter() {
+                records.insert(c.name.clone());
+            }
+        }
+    };
+    loop {
+        while let Some(class) = pending_inits.pop() {
+            if !initializable.contains(&class) || !out.inits.insert(class.clone()) {
+                continue;
+            }
+            let clinit = (class.clone(), "<clinit>".to_string(), "()V".to_string());
+            if compiled(&clinit) {
+                work.push(clinit);
+            }
+            if let Some(c) = unit.get(&class) {
+                pending_inits.extend(init_prerequisites(unit, c));
+            }
+        }
+        let Some(key) = work.pop() else { break };
+        if !out.methods.insert(key.clone()) {
+            continue;
+        }
+        let Some(Ok((_, analyzed))) = results.get(&key) else {
+            continue;
+        };
+        pending_inits.push(key.0.clone());
+        for dep in &analyzed.deps {
+            match dep {
+                Dep::Method(m) if compiled(m) => work.push(m.clone()),
+                Dep::Method(_) => {}
+                Dep::Init(c) => pending_inits.push(c.clone()),
+            }
+        }
+        for insn in &analyzed.insns {
+            match &insn.op {
+                Op::New { class } => {
+                    add_records(class, &mut out.records);
+                    if out.instantiated.insert(class.clone()) {
+                        for slot in unit.vtable(class).map(|v| (*v).clone()).unwrap_or_default() {
+                            let k = (slot.owner, slot.name, slot.descriptor);
+                            if compiled(&k) {
+                                work.push(k);
+                            }
+                        }
+                    }
+                }
+                Op::LdcString(_) => {
+                    add_records(STRING, &mut out.records);
+                    if out.instantiated.insert(STRING.to_string()) {
+                        for slot in unit
+                            .vtable(STRING)
+                            .map(|v| (*v).clone())
+                            .unwrap_or_default()
+                        {
+                            let k = (slot.owner, slot.name, slot.descriptor);
+                            if compiled(&k) {
+                                work.push(k);
+                            }
+                        }
+                    }
+                }
+                Op::ANewArray { class } | Op::CheckCast { class } | Op::InstanceOf { class }
+                    if !class.starts_with('[') && unit.get(class).is_some() =>
+                {
+                    add_records(class, &mut out.records);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Compile a set of classes together into one C unit, emitting only what is reachable from
+/// `roots` (all classes when None). Every method's status is reported either way.
+pub fn compile_unit_rooted(
+    classes: &[ClassFile],
+    roots: Option<&BTreeSet<String>>,
+) -> CompiledUnit {
     let unit = Unit::new(classes);
     let mut results: BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>> =
         BTreeMap::new();
@@ -2198,10 +2469,24 @@ pub fn compile_unit(classes: &[ClassFile]) -> CompiledUnit {
         .filter(|(_, r)| r.is_ok())
         .map(|(k, _)| k.clone())
         .collect();
-    let initializable: Vec<&ClassFile> = classes
+    let initializable: BTreeSet<String> = classes
         .iter()
         .filter(|c| init_ok[&c.name].is_ok())
+        .map(|c| c.name.clone())
         .collect();
+    let laid_out_all: Vec<&ClassFile> = classes
+        .iter()
+        .filter(|c| c.access & ACC_INTERFACE == 0 && unit.chain(&c.name).is_ok())
+        .collect();
+    let emission = match roots {
+        Some(roots) => reachable(&unit, classes, &results, &initializable, roots),
+        None => Emission {
+            methods: compiled.clone(),
+            records: laid_out_all.iter().map(|c| c.name.clone()).collect(),
+            instantiated: laid_out_all.iter().map(|c| c.name.clone()).collect(),
+            inits: initializable.clone(),
+        },
+    };
 
     let mut source = String::new();
     let _ = writeln!(
@@ -2211,11 +2496,8 @@ pub fn compile_unit(classes: &[ClassFile]) -> CompiledUnit {
     );
     source.push_str(RUNTIME_PRELUDE);
     source.push('\n');
-    // Layouts and records for every class whose hierarchy is complete, superclasses first.
-    let mut laid_out: Vec<&ClassFile> = classes
-        .iter()
-        .filter(|c| c.access & ACC_INTERFACE == 0 && unit.chain(&c.name).is_ok())
-        .collect();
+    // Layouts for every class whose hierarchy is complete, superclasses first (types only).
+    let mut laid_out = laid_out_all.clone();
     laid_out.sort_by_key(|c| {
         (
             unit.chain(&c.name).map(|ch| ch.len()).unwrap_or(0),
@@ -2227,24 +2509,55 @@ pub fn compile_unit(classes: &[ClassFile]) -> CompiledUnit {
     }
     for class in classes {
         for method in &class.methods {
-            if let Some(Ok((sig, _))) = results.get(&(
+            let key = (
                 class.name.clone(),
                 method.name.clone(),
                 method.descriptor.clone(),
-            )) {
+            );
+            if let (true, Some(Ok((sig, _)))) = (emission.methods.contains(&key), results.get(&key))
+            {
                 let _ = writeln!(source, "{};", prototype(&class.name, method, sig));
             }
         }
     }
-    for class in &initializable {
-        let _ = writeln!(source, "int {}(void);", init_symbol(&class.name));
+    for class in &emission.inits {
+        let _ = writeln!(source, "int {}(void);", init_symbol(class));
     }
     source.push('\n');
-    emit_stubs(&mut source, &unit, &laid_out, &compiled);
-    for class in &laid_out {
-        emit_class_record(&mut source, &unit, class, &compiled);
+    // A vtable entry is real code only for instantiated classes; everything else is a stub.
+    let live = |class: &str, key: &MethodKey| {
+        emission.instantiated.contains(class) && emission.methods.contains(key)
+    };
+    let recorded: Vec<&ClassFile> = laid_out
+        .iter()
+        .copied()
+        .filter(|c| emission.records.contains(&c.name))
+        .collect();
+    emit_stubs(&mut source, &unit, &recorded, &live);
+    for class in &recorded {
+        emit_class_record(&mut source, &unit, class, &live);
     }
-    for class in &initializable {
+    let mut literals: BTreeSet<Vec<u16>> = emission
+        .methods
+        .iter()
+        .filter_map(|k| results.get(k)?.as_ref().ok())
+        .flat_map(|(_, a)| a.insns.iter())
+        .filter_map(|i| match &i.op {
+            Op::LdcString(units) => Some(units.clone()),
+            _ => None,
+        })
+        .collect();
+    for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
+        literals.extend(
+            class
+                .fields
+                .iter()
+                .filter(|f| f.access & ACC_STATIC != 0)
+                .filter_map(|f| constant_string(class, f)),
+        );
+    }
+    emit_literals(&mut source, &literals);
+    for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
         emit_statics_and_init(&mut source, &unit, class);
     }
     let mut methods = Vec::new();
@@ -2258,7 +2571,9 @@ pub fn compile_unit(classes: &[ClassFile]) -> CompiledUnit {
             let status = match &results[&key] {
                 _ if method.access & ACC_ABSTRACT != 0 => MethodStatus::Abstract,
                 Ok((sig, analyzed)) => {
-                    emit_method(&mut source, &unit, class, method, sig, analyzed);
+                    if emission.methods.contains(&key) {
+                        emit_method(&mut source, &unit, class, method, sig, analyzed);
+                    }
                     MethodStatus::Compiled {
                         symbol: symbol(&key.0, &key.1, &key.2),
                     }
