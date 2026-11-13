@@ -141,7 +141,7 @@ fn execute(cli: Cli) -> Result<()> {
                 serde_json::json!({ "schema_version": 1, "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH, "tools": tools,
                 "capabilities": ["profile_integrity", "metadata_cache", "measurement_summary", "jar_inventory", "single_class_compilation_with_objects", "vanilla_server_launch"],
-                "unimplemented": ["client_launch", "mod_loader_launch", "cross_class_compilation", "arrays", "garbage_collection", "class_initialization", "exceptions_handlers", "benchmark_capture"],
+                "unimplemented": ["client_launch", "mod_loader_launch", "cross_class_compilation", "arrays", "garbage_collection", "exception_handlers", "benchmark_capture"],
                 "note": "tool discovery does not establish target or Java-version compatibility" }),
             )
         }
