@@ -12,6 +12,8 @@ pub enum Kind {
     J,
     F,
     D,
+    /// Object reference (or null).
+    A,
 }
 
 impl Kind {
@@ -168,6 +170,33 @@ pub enum Op {
         name: String,
         descriptor: String,
     },
+    AConstNull,
+    /// Branch if the reference on the stack is (or, with `is_null: false`, is not) null.
+    IfNull {
+        is_null: bool,
+        target: u32,
+    },
+    /// Branch if two references are (or are not) the same object.
+    IfACmp {
+        equal: bool,
+        target: u32,
+    },
+    New {
+        class: String,
+    },
+    GetField(MemberRef),
+    PutField(MemberRef),
+    InvokeVirtual(MemberRef),
+    /// Constructors, private methods (pre-Java 11 style) and `super.` calls.
+    InvokeSpecial(MemberRef),
+}
+
+/// A resolved field or method reference: owner class, name and descriptor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberRef {
+    pub class: String,
+    pub name: String,
+    pub descriptor: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,7 +235,8 @@ fn branch(pc: u32, offset: i32, len: usize) -> Result<u32> {
     Ok(target as u32)
 }
 
-const KINDS: [Kind; 4] = [Kind::I, Kind::J, Kind::F, Kind::D];
+/// Load/store/return opcode families list kinds in this order; arithmetic uses only the first four.
+const KINDS: [Kind; 5] = [Kind::I, Kind::J, Kind::F, Kind::D, Kind::A];
 const CONDS: [Cond; 6] = [Cond::Eq, Cond::Ne, Cond::Lt, Cond::Ge, Cond::Gt, Cond::Le];
 
 /// Decode an entire method body. Branch targets are checked against the code
@@ -270,13 +300,13 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
             };
             Const(value)
         }
-        0x15..=0x18 => Load(KINDS[(opcode - 0x15) as usize], c.u8()? as u16),
-        0x1a..=0x29 => Load(
+        0x15..=0x19 => Load(KINDS[(opcode - 0x15) as usize], c.u8()? as u16),
+        0x1a..=0x2d => Load(
             KINDS[((opcode - 0x1a) / 4) as usize],
             ((opcode - 0x1a) % 4) as u16,
         ),
-        0x36..=0x39 => Store(KINDS[(opcode - 0x36) as usize], c.u8()? as u16),
-        0x3b..=0x4a => Store(
+        0x36..=0x3a => Store(KINDS[(opcode - 0x36) as usize], c.u8()? as u16),
+        0x3b..=0x4e => Store(
             KINDS[((opcode - 0x3b) / 4) as usize],
             ((opcode - 0x3b) % 4) as u16,
         ),
@@ -369,7 +399,45 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
                 LookupSwitch { default, pairs }
             }
         }
-        0xac..=0xaf => Return(Some(KINDS[(opcode - 0xac) as usize])),
+        0xac..=0xb0 => Return(Some(KINDS[(opcode - 0xac) as usize])),
+        0x01 => AConstNull,
+        0xa5 | 0xa6 => IfACmp {
+            equal: opcode == 0xa5,
+            target: branch(pc, c.u16()? as i16 as i32, len)?,
+        },
+        0xc6 | 0xc7 => IfNull {
+            is_null: opcode == 0xc6,
+            target: branch(pc, c.u16()? as i16 as i32, len)?,
+        },
+        0xbb => New {
+            class: class.class_name(c.u16()?)?.into(),
+        },
+        0xb4 | 0xb5 => {
+            let (owner, name, descriptor) = class.field_ref(c.u16()?)?;
+            let member = MemberRef {
+                class: owner.into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            if opcode == 0xb4 {
+                GetField(member)
+            } else {
+                PutField(member)
+            }
+        }
+        0xb6 | 0xb7 => {
+            let (owner, name, descriptor) = class.method_ref(c.u16()?)?;
+            let member = MemberRef {
+                class: owner.into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            if opcode == 0xb6 {
+                InvokeVirtual(member)
+            } else {
+                InvokeSpecial(member)
+            }
+        }
         0xb1 => Return(None),
         0xb8 => {
             let (class_name, name, descriptor) = class.method_ref(c.u16()?)?;
@@ -400,8 +468,8 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
             let inner = c.u8()?;
             let index = c.u16()?;
             match inner {
-                0x15..=0x18 => Load(KINDS[(inner - 0x15) as usize], index),
-                0x36..=0x39 => Store(KINDS[(inner - 0x36) as usize], index),
+                0x15..=0x19 => Load(KINDS[(inner - 0x15) as usize], index),
+                0x36..=0x3a => Store(KINDS[(inner - 0x36) as usize], index),
                 0x84 => Iinc(index, c.u16()? as i16 as i32),
                 _ => return Err(unsupported().into()),
             }

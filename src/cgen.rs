@@ -1,11 +1,21 @@
 //! Per-class C emission for the compilable subset.
 //!
-//! A method compiles only when every instruction is understood, the operand
-//! stack is consistent on every path, and every callee also compiles. All
-//! other methods are reported with a specific reason; nothing is guessed.
+//! A method compiles only when every instruction is understood, a small type
+//! verifier proves every path type-correct (references included, since they
+//! become C pointers), and every callee also compiles. All other methods are
+//! reported with a specific reason; nothing is guessed.
+//!
+//! Object model (first slice): objects of the class being compiled only, a
+//! header pointing at a class record with a vtable, fields at JVM widths.
+//! Objects are never freed yet (no garbage collector).
 
-use crate::bytecode::{self, BinOp, Compare, Cond, Convert, DecodeError, Insn, Kind, Op, Value};
-use crate::classfile::{ACC_STATIC, ACC_SYNCHRONIZED, ClassFile, Constant, Member};
+use crate::bytecode::{
+    self, BinOp, Compare, Cond, Convert, DecodeError, Insn, Kind, MemberRef, Op, Value,
+};
+use crate::classfile::{
+    ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_STATIC, ACC_SYNCHRONIZED, ClassFile,
+    Constant, Member,
+};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::{
@@ -41,57 +51,96 @@ pub struct CompiledClass {
     pub c_source: String,
 }
 
-/// Parameter and return types of a primitive-only method descriptor.
+/// Parameter and return types of a method descriptor in the compilable subset.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Signature {
-    /// Raw descriptor characters: I J F D Z B C S.
+    /// Descriptor characters I J F D Z B C S, or `L` for a reference to the class being compiled.
     pub params: Vec<char>,
-    /// Raw return character, `V` for void.
+    /// Same encoding, plus `V` for void.
     pub ret: char,
 }
 
-/// Stack kind for a descriptor char; boolean/byte/char/short all live as int.
+/// Stack kind for a signature char; boolean/byte/char/short all live as int.
 pub fn kind_of(c: char) -> Option<Kind> {
     match c {
         'I' | 'Z' | 'B' | 'C' | 'S' => Some(Kind::I),
         'J' => Some(Kind::J),
         'F' => Some(Kind::F),
         'D' => Some(Kind::D),
+        'L' => Some(Kind::A),
         _ => None,
     }
 }
 
-/// Parse a primitive-only method descriptor; reference types are rejected until the object model exists.
-pub fn parse_signature(descriptor: &str) -> Result<Signature> {
-    let Some(rest) = descriptor.strip_prefix('(') else {
-        bail!("invalid method descriptor {descriptor}")
-    };
-    let Some((params, ret)) = rest.split_once(')') else {
-        bail!("invalid method descriptor {descriptor}")
-    };
-    if params.contains(['L', '['])
-        || ret.len() != 1
-        || !(ret == "V" || kind_of(ret.chars().next().unwrap()).is_some())
-    {
-        bail!("reference types in {descriptor} need the object model");
+/// Map one field/parameter descriptor to a signature char; only this class's references are allowed.
+fn type_char(descriptor: &str, method: &str, this_class: &str) -> Result<char> {
+    match descriptor.as_bytes() {
+        [c] if b"IJFDZBCS".contains(c) => Ok(*c as char),
+        [b'L', .., b';'] if &descriptor[1..descriptor.len() - 1] == this_class => Ok('L'),
+        [b'L', ..] => bail!(
+            "reference types in {method}: {descriptor} is another class; only references to the class being compiled are supported yet"
+        ),
+        [b'[', ..] => bail!("arrays in {method} are not compiled yet"),
+        _ => bail!("invalid descriptor {descriptor} in {method}"),
     }
-    let params: Vec<char> = params.chars().collect();
-    if params.iter().any(|&c| kind_of(c).is_none()) {
-        bail!("invalid method descriptor {descriptor}");
-    }
-    Ok(Signature {
-        params,
-        ret: ret.chars().next().unwrap(),
-    })
 }
 
-/// C type used for a descriptor char in generated signatures (`void` for V).
+/// Split the parameter list of a method descriptor into single-type descriptors.
+fn split_params(params: &str) -> Result<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut rest = params;
+    while !rest.is_empty() {
+        let mut end = rest.bytes().take_while(|&b| b == b'[').count();
+        end += match rest.as_bytes().get(end) {
+            Some(b'L') => rest[end..]
+                .find(';')
+                .map(|i| i + 1)
+                .unwrap_or(rest.len() + 1),
+            Some(_) => 1,
+            None => rest.len() + 1,
+        };
+        if end > rest.len() {
+            bail!("invalid method descriptor parameters {params}");
+        }
+        out.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    Ok(out)
+}
+
+/// Parse a method descriptor whose reference types may only name `this_class`.
+pub fn parse_signature_in(descriptor: &str, this_class: &str) -> Result<Signature> {
+    let Some((params, ret)) = descriptor
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(')'))
+    else {
+        bail!("invalid method descriptor {descriptor}")
+    };
+    let params = split_params(params)?
+        .into_iter()
+        .map(|p| type_char(p, descriptor, this_class))
+        .collect::<Result<Vec<_>>>()?;
+    let ret = if ret == "V" {
+        'V'
+    } else {
+        type_char(ret, descriptor, this_class)?
+    };
+    Ok(Signature { params, ret })
+}
+
+/// Parse a primitive-only method descriptor.
+pub fn parse_signature(descriptor: &str) -> Result<Signature> {
+    parse_signature_in(descriptor, "")
+}
+
+/// C type used for a signature char in generated prototypes (`void` for V).
 pub fn c_type(c: char) -> &'static str {
     match kind_of(c) {
         Some(Kind::I) => "int32_t",
         Some(Kind::J) => "int64_t",
         Some(Kind::F) => "float",
         Some(Kind::D) => "double",
+        Some(Kind::A) => "jabs_object *",
         None => "void",
     }
 }
@@ -103,6 +152,7 @@ fn field(kind: Kind) -> &'static str {
         Kind::J => "j",
         Kind::F => "f",
         Kind::D => "d",
+        Kind::A => "a",
     }
 }
 
@@ -117,36 +167,47 @@ fn mangle(text: &str, out: &mut String) {
     }
 }
 
+/// `prefix` + mangled parts joined by `__`.
+fn mangled(prefix: &str, parts: &[&str]) -> String {
+    let mut out = String::from(prefix);
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push_str("__");
+        }
+        mangle(part, &mut out);
+    }
+    out
+}
+
 /// Stable C symbol for a Java method identity (class, name, descriptor).
 pub fn symbol(class: &str, name: &str, descriptor: &str) -> String {
-    let mut out = String::from("jm_");
-    mangle(class, &mut out);
-    out.push_str("__");
-    mangle(name, &mut out);
-    out.push_str("__");
-    mangle(descriptor, &mut out);
-    out
+    mangled("jm_", &[class, name, descriptor])
 }
 
 /// C symbol for a static field's storage.
 pub fn field_symbol(class: &str, name: &str) -> String {
-    let mut out = String::from("jf_");
-    mangle(class, &mut out);
-    out.push_str("__");
-    mangle(name, &mut out);
-    out
+    mangled("jf_", &[class, name])
 }
 
 /// C symbol of a class's initialization entry point; returns 0 when the class is ready, -1 with `jabs_pending` set.
 pub fn init_symbol(class: &str) -> String {
-    let mut out = String::from("jc_");
-    mangle(class, &mut out);
+    let mut out = mangled("jc_", &[class]);
     out.push_str("__init");
     out
 }
 
-/// C storage type for a primitive static field, sized like the JVM's (so byte fields really hold a byte).
-fn storage_type(descriptor: &str) -> Option<&'static str> {
+/// C struct tag for a class's object layout.
+fn object_struct(class: &str) -> String {
+    format!("struct {}", mangled("jo_", &[class]))
+}
+
+/// C name of an instance field inside the object struct.
+fn instance_field(name: &str) -> String {
+    mangled("f_", &[name])
+}
+
+/// C storage type for a field, sized like the JVM's (so byte fields really hold a byte).
+fn storage_type(descriptor: &str, this_class: &str) -> Option<&'static str> {
     Some(match descriptor {
         "Z" => "uint8_t",
         "B" => "int8_t",
@@ -156,11 +217,14 @@ fn storage_type(descriptor: &str) -> Option<&'static str> {
         "J" => "int64_t",
         "F" => "float",
         "D" => "double",
+        d if d.len() > 2 && d.starts_with('L') && &d[1..d.len() - 1] == this_class => {
+            "jabs_object *"
+        }
         _ => return None,
     })
 }
 
-/// Expression converting a stack value into a field's storage type (putstatic narrowing; boolean keeps bit 0).
+/// Expression converting a stack value into a field's storage type (put narrowing; boolean keeps bit 0).
 fn narrow_for_store(descriptor: &str, value: &str) -> String {
     match descriptor {
         "Z" => format!("(uint8_t)({value} & 1)"),
@@ -171,136 +235,338 @@ fn narrow_for_store(descriptor: &str, value: &str) -> String {
     }
 }
 
-/// Find this class's own primitive static field, or explain why the access cannot be compiled.
-fn own_static_field<'a>(
+/// Find a field declared by this class with the given staticness, or explain why the access cannot be compiled.
+fn own_field<'a>(
     class: &'a ClassFile,
-    owner: &str,
-    name: &str,
-    descriptor: &str,
+    m: &MemberRef,
+    want_static: bool,
     pc: u32,
 ) -> Result<&'a Member> {
-    if owner != class.name {
-        bail!("pc {pc}: static field {owner}.{name} in another class is not compiled yet");
+    if m.class != class.name {
+        bail!(
+            "pc {pc}: field {}.{} in another class is not compiled yet",
+            m.class,
+            m.name
+        );
     }
     let Some(field) = class
         .fields
         .iter()
-        .find(|f| f.name == name && f.descriptor == descriptor)
+        .find(|f| f.name == m.name && f.descriptor == m.descriptor)
     else {
         bail!(
-            "pc {pc}: static field {name} is inherited; cross-class field resolution is not compiled yet"
+            "pc {pc}: field {} is inherited; cross-class field resolution is not compiled yet",
+            m.name
         );
     };
-    if field.access & ACC_STATIC == 0 {
-        bail!("pc {pc}: {name} is not a static field");
+    if (field.access & ACC_STATIC != 0) != want_static {
+        bail!(
+            "pc {pc}: field {} has the wrong staticness for this instruction",
+            m.name
+        );
     }
-    if storage_type(descriptor).is_none() {
-        bail!("pc {pc}: static field {name} of reference type {descriptor} needs the object model");
+    if storage_type(&m.descriptor, &class.name).is_none() {
+        bail!(
+            "pc {pc}: field {} of type {} is not compiled yet (only primitives and this class's references)",
+            m.name,
+            m.descriptor
+        );
     }
     Ok(field)
 }
 
-struct Analyzed {
-    insns: Vec<Insn>,
-    /// Operand stack (one entry per value) before each instruction.
-    stacks: Vec<Vec<Kind>>,
-    targets: BTreeSet<u32>,
-    callees: BTreeSet<(String, String)>,
+/// Find a method declared by this class, or explain why the call cannot be compiled.
+fn own_method<'a>(class: &'a ClassFile, m: &MemberRef, pc: u32) -> Result<&'a Member> {
+    if m.class != class.name {
+        bail!(
+            "pc {pc}: call to {}.{}{} outside this class is not compiled yet",
+            m.class,
+            m.name,
+            m.descriptor
+        );
+    }
+    class
+        .methods
+        .iter()
+        .find(|x| x.name == m.name && x.descriptor == m.descriptor)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pc {pc}: {}{} is inherited (e.g. from java/lang/Object); cross-class calls are not compiled yet",
+                m.name,
+                m.descriptor
+            )
+        })
 }
 
-/// Pop one value and require it to be `want`.
-fn pop(stack: &mut Vec<Kind>, want: Kind, pc: u32) -> Result<()> {
-    match stack.pop() {
-        Some(k) if k == want => Ok(()),
-        other => bail!("pc {pc}: expected {want:?} on stack, found {other:?}"),
+/// Verification type of a local variable or stack slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VType {
+    /// Unusable (unset, or the second half of a long/double, or merged incompatible types).
+    Top,
+    I,
+    J,
+    F,
+    D,
+    Null,
+    /// Initialized reference to an instance of the class being compiled.
+    Obj,
+    /// `this` inside a constructor before the superclass constructor has run.
+    UninitThis,
+    /// Result of `new` at this pc, before its constructor has run.
+    Uninit(u32),
+}
+
+impl VType {
+    /// Verification type of a primitive kind.
+    fn of(kind: Kind) -> VType {
+        match kind {
+            Kind::I => VType::I,
+            Kind::J => VType::J,
+            Kind::F => VType::F,
+            Kind::D => VType::D,
+            Kind::A => VType::Obj,
+        }
+    }
+    fn category(self) -> u16 {
+        if matches!(self, VType::J | VType::D) {
+            2
+        } else {
+            1
+        }
+    }
+    fn is_reference(self) -> bool {
+        matches!(
+            self,
+            VType::Null | VType::Obj | VType::UninitThis | VType::Uninit(_)
+        )
+    }
+    /// Least common type at a control-flow join: null merges into a reference; anything else must match.
+    fn merge(self, other: VType) -> Option<VType> {
+        match (self, other) {
+            (a, b) if a == b => Some(a),
+            (VType::Null, VType::Obj) | (VType::Obj, VType::Null) => Some(VType::Obj),
+            _ => None,
+        }
     }
 }
 
-/// Pop one int/float value (not long/double), as pop/dup/swap require.
-fn pop_cat1(stack: &mut Vec<Kind>, pc: u32) -> Result<Kind> {
-    match stack.pop() {
-        Some(k) if k.category() == 1 => Ok(k),
-        other => bail!("pc {pc}: expected category-1 value, found {other:?}"),
-    }
+#[derive(Debug, Clone, PartialEq)]
+struct Frame {
+    stack: Vec<VType>,
+    locals: Vec<VType>,
 }
 
-/// Simulate the operand stack; return successor pcs (excluding fallthrough when terminal).
-fn step(
-    insn: &Insn,
-    stack: &mut Vec<Kind>,
-    class: &ClassFile,
-    sig: &Signature,
-    max_locals: u16,
-) -> Result<(bool, Vec<u32>)> {
-    let pc = insn.pc;
-    let local = |n: u16, k: Kind| -> Result<()> {
-        if n as u32 + k.category() as u32 > max_locals as u32 {
+impl Frame {
+    fn pop(&mut self, pc: u32) -> Result<VType> {
+        self.stack
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("pc {pc}: stack underflow"))
+    }
+    /// Pop one value and require it to have exactly the primitive type `want`.
+    fn pop_prim(&mut self, want: Kind, pc: u32) -> Result<()> {
+        match self.pop(pc)? {
+            v if v == VType::of(want) && want != Kind::A => Ok(()),
+            other => bail!("pc {pc}: expected {want:?} on stack, found {other:?}"),
+        }
+    }
+    /// Pop an initialized reference or null (what calls, field reads and returns accept).
+    fn pop_ref(&mut self, pc: u32) -> Result<VType> {
+        match self.pop(pc)? {
+            v @ (VType::Obj | VType::Null) => Ok(v),
+            other => bail!("pc {pc}: expected an initialized reference, found {other:?}"),
+        }
+    }
+    /// Pop a value for a signature char (`L` accepts this class's references or null).
+    fn pop_param(&mut self, c: char, pc: u32) -> Result<()> {
+        match kind_of(c).unwrap() {
+            Kind::A => self.pop_ref(pc).map(|_| ()),
+            k => self.pop_prim(k, pc),
+        }
+    }
+    /// Pop one value that is not a long/double, as pop/dup/swap require.
+    fn pop_cat1(&mut self, pc: u32) -> Result<VType> {
+        match self.pop(pc)? {
+            v if v.category() == 1 => Ok(v),
+            other => bail!("pc {pc}: expected category-1 value, found {other:?}"),
+        }
+    }
+    fn local(&self, n: u16, pc: u32) -> Result<VType> {
+        self.locals
+            .get(n as usize)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("pc {pc}: local {n} out of range"))
+    }
+    /// Store into a local; long/double take two slots and break any pair they overwrite.
+    fn set_local(&mut self, n: u16, v: VType, pc: u32) -> Result<()> {
+        let n = n as usize;
+        if n + v.category() as usize > self.locals.len() {
             bail!("pc {pc}: local {n} out of range");
         }
+        if n > 0 && self.locals[n - 1].category() == 2 {
+            self.locals[n - 1] = VType::Top;
+        }
+        self.locals[n] = v;
+        if v.category() == 2 {
+            self.locals[n + 1] = VType::Top;
+        }
         Ok(())
-    };
+    }
+    /// After a constructor call, every copy of the uninitialized object becomes initialized.
+    fn initialize(&mut self, uninit: VType) {
+        for v in self.stack.iter_mut().chain(self.locals.iter_mut()) {
+            if *v == uninit {
+                *v = VType::Obj;
+            }
+        }
+    }
+    /// Merge `other` into `self`; stack shapes must agree, locals that disagree become unusable.
+    fn merge(&self, other: &Frame, pc: u32) -> Result<Frame> {
+        if self.stack.len() != other.stack.len() {
+            bail!("pc {pc}: stack depth differs between paths");
+        }
+        let stack = self
+            .stack
+            .iter()
+            .zip(&other.stack)
+            .map(|(a, b)| {
+                a.merge(*b)
+                    .ok_or_else(|| anyhow::anyhow!("pc {pc}: stack types {a:?} and {b:?} disagree"))
+            })
+            .collect::<Result<_>>()?;
+        let locals = self
+            .locals
+            .iter()
+            .zip(&other.locals)
+            .map(|(a, b)| a.merge(*b).unwrap_or(VType::Top))
+            .collect();
+        Ok(Frame { stack, locals })
+    }
+}
+
+/// How an `invokespecial` compiles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Special {
+    /// A constructor or private method of this class: a direct call.
+    Direct,
+    /// `java/lang/Object.<init>()V`, which has no effect.
+    ObjectInit,
+}
+
+/// Facts about the method being analyzed that instruction checks need.
+struct Context<'a> {
+    class: &'a ClassFile,
+    sig: &'a Signature,
+    is_constructor: bool,
+}
+
+/// What one instruction does to control flow.
+struct Step {
+    /// Execution can continue with the next instruction.
+    falls: bool,
+    /// Branch targets.
+    targets: Vec<u32>,
+    /// Method of this class it calls, as (name, descriptor).
+    callee: Option<(String, String)>,
+}
+
+/// Apply one instruction to the frame and report its control flow.
+fn step(
+    insn: &Insn,
+    frame: &mut Frame,
+    cx: &Context,
+    specials: &mut HashMap<u32, Special>,
+) -> Result<Step> {
+    let pc = insn.pc;
+    let class = cx.class;
     let mut falls = true;
     let mut targets = Vec::new();
+    let mut callee = None;
     match &insn.op {
-        Op::Nop | Op::Goto(_) => {}
-        Op::Const(v) => stack.push(v.kind()),
+        Op::Nop => {}
+        Op::Goto(t) => {
+            falls = false;
+            targets.push(*t);
+        }
+        Op::Const(v) => frame.stack.push(VType::of(v.kind())),
+        Op::AConstNull => frame.stack.push(VType::Null),
+        Op::Load(Kind::A, n) => {
+            let v = frame.local(*n, pc)?;
+            if !v.is_reference() {
+                bail!("pc {pc}: aload of local {n}, which holds {v:?}");
+            }
+            frame.stack.push(v);
+        }
         Op::Load(k, n) => {
-            local(*n, *k)?;
-            stack.push(*k);
+            let v = frame.local(*n, pc)?;
+            if v != VType::of(*k) {
+                bail!("pc {pc}: load of {k:?} from local {n}, which holds {v:?}");
+            }
+            frame.stack.push(v);
+        }
+        Op::Store(Kind::A, n) => {
+            let v = frame.pop(pc)?;
+            if !v.is_reference() {
+                bail!("pc {pc}: astore of {v:?}");
+            }
+            frame.set_local(*n, v, pc)?;
         }
         Op::Store(k, n) => {
-            local(*n, *k)?;
-            pop(stack, *k, pc)?;
+            frame.pop_prim(*k, pc)?;
+            frame.set_local(*n, VType::of(*k), pc)?;
         }
-        Op::Iinc(n, _) => local(*n, Kind::I)?,
+        Op::Iinc(n, _) => {
+            if frame.local(*n, pc)? != VType::I {
+                bail!("pc {pc}: iinc of non-int local {n}");
+            }
+        }
         Op::Pop => {
-            pop_cat1(stack, pc)?;
+            frame.pop_cat1(pc)?;
         }
         Op::Pop2 => {
-            if stack.last().is_some_and(|k| k.category() == 2) {
-                stack.pop();
+            if frame.stack.last().is_some_and(|v| v.category() == 2) {
+                frame.pop(pc)?;
             } else {
-                pop_cat1(stack, pc)?;
-                pop_cat1(stack, pc)?;
+                frame.pop_cat1(pc)?;
+                frame.pop_cat1(pc)?;
             }
         }
         Op::Dup => {
-            let k = pop_cat1(stack, pc)?;
-            stack.extend([k, k]);
+            let v = frame.pop_cat1(pc)?;
+            frame.stack.extend([v, v]);
         }
         Op::DupX1 => {
-            let a = pop_cat1(stack, pc)?;
-            let b = pop_cat1(stack, pc)?;
-            stack.extend([a, b, a]);
+            let a = frame.pop_cat1(pc)?;
+            let b = frame.pop_cat1(pc)?;
+            frame.stack.extend([a, b, a]);
         }
         Op::Dup2 => {
-            if let Some(&k) = stack.last().filter(|k| k.category() == 2) {
-                stack.push(k);
+            if let Some(&v) = frame.stack.last().filter(|v| v.category() == 2) {
+                frame.stack.push(v);
             } else {
-                let a = pop_cat1(stack, pc)?;
-                let b = pop_cat1(stack, pc)?;
-                stack.extend([b, a, b, a]);
+                let a = frame.pop_cat1(pc)?;
+                let b = frame.pop_cat1(pc)?;
+                frame.stack.extend([b, a, b, a]);
             }
         }
         Op::Swap => {
-            let a = pop_cat1(stack, pc)?;
-            let b = pop_cat1(stack, pc)?;
-            stack.extend([a, b]);
+            let a = frame.pop_cat1(pc)?;
+            let b = frame.pop_cat1(pc)?;
+            frame.stack.extend([a, b]);
         }
         Op::Binary(k, op) => {
             let shift = matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr);
-            pop(stack, if shift { Kind::I } else { *k }, pc)?;
-            pop(stack, *k, pc)?;
-            stack.push(*k);
+            frame.pop_prim(if shift { Kind::I } else { *k }, pc)?;
+            frame.pop_prim(*k, pc)?;
+            frame.stack.push(VType::of(*k));
         }
         Op::Neg(k) => {
-            pop(stack, *k, pc)?;
-            stack.push(*k);
+            frame.pop_prim(*k, pc)?;
+            frame.stack.push(VType::of(*k));
         }
         Op::Convert(c) => {
             let (from, to) = c.kinds();
-            pop(stack, from, pc)?;
-            stack.push(to);
+            frame.pop_prim(from, pc)?;
+            frame.stack.push(VType::of(to));
         }
         Op::Compare(c) => {
             let k = match c {
@@ -308,44 +574,60 @@ fn step(
                 Compare::Fcmpl | Compare::Fcmpg => Kind::F,
                 Compare::Dcmpl | Compare::Dcmpg => Kind::D,
             };
-            pop(stack, k, pc)?;
-            pop(stack, k, pc)?;
-            stack.push(Kind::I);
+            frame.pop_prim(k, pc)?;
+            frame.pop_prim(k, pc)?;
+            frame.stack.push(VType::I);
         }
         Op::If(_, t) => {
-            pop(stack, Kind::I, pc)?;
+            frame.pop_prim(Kind::I, pc)?;
             targets.push(*t);
         }
         Op::IfICmp(_, t) => {
-            pop(stack, Kind::I, pc)?;
-            pop(stack, Kind::I, pc)?;
+            frame.pop_prim(Kind::I, pc)?;
+            frame.pop_prim(Kind::I, pc)?;
             targets.push(*t);
+        }
+        Op::IfNull { target, .. } => {
+            frame.pop_ref(pc)?;
+            targets.push(*target);
+        }
+        Op::IfACmp { target, .. } => {
+            frame.pop_ref(pc)?;
+            frame.pop_ref(pc)?;
+            targets.push(*target);
         }
         Op::TableSwitch {
             default,
             targets: ts,
             ..
         } => {
-            pop(stack, Kind::I, pc)?;
+            frame.pop_prim(Kind::I, pc)?;
             falls = false;
             targets.push(*default);
             targets.extend(ts);
         }
         Op::LookupSwitch { default, pairs } => {
-            pop(stack, Kind::I, pc)?;
+            frame.pop_prim(Kind::I, pc)?;
             falls = false;
             targets.push(*default);
             targets.extend(pairs.iter().map(|(_, t)| *t));
         }
         Op::Return(k) => {
-            if *k != kind_of(sig.ret) {
+            if *k != kind_of(cx.sig.ret) {
                 bail!(
                     "pc {pc}: return kind {k:?} does not match descriptor return {}",
-                    sig.ret
+                    cx.sig.ret
                 );
             }
-            if let Some(k) = k {
-                pop(stack, *k, pc)?;
+            match k {
+                Some(Kind::A) => {
+                    frame.pop_ref(pc)?;
+                }
+                Some(k) => frame.pop_prim(*k, pc)?,
+                None => {}
+            }
+            if cx.is_constructor && frame.locals.first() == Some(&VType::UninitThis) {
+                bail!("pc {pc}: constructor returns before calling a superclass constructor");
             }
             falls = false;
         }
@@ -354,49 +636,158 @@ fn step(
             name,
             descriptor,
         } => {
-            if owner != &class.name {
-                bail!(
-                    "pc {pc}: call to {owner}.{name}{descriptor} outside this class is not compiled yet"
-                );
+            let m = MemberRef {
+                class: owner.clone(),
+                name: name.clone(),
+                descriptor: descriptor.clone(),
+            };
+            let target = own_method(class, &m, pc)?;
+            if target.access & ACC_STATIC == 0 {
+                bail!("pc {pc}: invokestatic of instance method {name}");
             }
-            let callee = parse_signature(descriptor)
-                .map_err(|e| anyhow::anyhow!("pc {pc}: call to {name}: {e}"))?;
-            for &p in callee.params.iter().rev() {
-                pop(stack, kind_of(p).unwrap(), pc)?;
+            let s = parse_signature_in(descriptor, &class.name)
+                .map_err(|e| anyhow::anyhow!("pc {pc}: {e}"))?;
+            for &p in s.params.iter().rev() {
+                frame.pop_param(p, pc)?;
             }
-            if let Some(k) = kind_of(callee.ret) {
-                stack.push(k);
+            if let Some(k) = kind_of(s.ret) {
+                frame.stack.push(VType::of(k));
             }
+            callee = Some((name.clone(), descriptor.clone()));
         }
         Op::GetStatic {
             class: owner,
             name,
             descriptor,
-        } => {
-            own_static_field(class, owner, name, descriptor, pc)?;
-            stack.push(kind_of(descriptor.chars().next().unwrap()).unwrap());
         }
-        Op::PutStatic {
+        | Op::PutStatic {
             class: owner,
             name,
             descriptor,
         } => {
-            own_static_field(class, owner, name, descriptor, pc)?;
-            pop(
-                stack,
-                kind_of(descriptor.chars().next().unwrap()).unwrap(),
-                pc,
-            )?;
+            let m = MemberRef {
+                class: owner.clone(),
+                name: name.clone(),
+                descriptor: descriptor.clone(),
+            };
+            own_field(class, &m, true, pc)?;
+            let k = kind_of(type_char(descriptor, name, &class.name)?).unwrap();
+            if matches!(insn.op, Op::GetStatic { .. }) {
+                frame.stack.push(VType::of(k));
+            } else if k == Kind::A {
+                frame.pop_ref(pc)?;
+            } else {
+                frame.pop_prim(k, pc)?;
+            }
+        }
+        Op::New { class: target } => {
+            if *target != class.name {
+                bail!("pc {pc}: new {target}: objects of other classes are not compiled yet");
+            }
+            if class.access & (ACC_ABSTRACT | ACC_INTERFACE) != 0 {
+                bail!("pc {pc}: new of an abstract class or interface");
+            }
+            frame.stack.push(VType::Uninit(pc));
+        }
+        Op::GetField(m) => {
+            own_field(class, m, false, pc)?;
+            frame.pop_ref(pc)?;
+            let k = kind_of(type_char(&m.descriptor, &m.name, &class.name)?).unwrap();
+            frame.stack.push(VType::of(k));
+        }
+        Op::PutField(m) => {
+            own_field(class, m, false, pc)?;
+            let k = kind_of(type_char(&m.descriptor, &m.name, &class.name)?).unwrap();
+            if k == Kind::A {
+                frame.pop_ref(pc)?;
+            } else {
+                frame.pop_prim(k, pc)?;
+            }
+            // Constructors may assign their own fields before calling super().
+            match frame.pop(pc)? {
+                VType::Obj | VType::Null => {}
+                VType::UninitThis if cx.is_constructor => {}
+                other => bail!("pc {pc}: putfield on {other:?}"),
+            }
+        }
+        Op::InvokeVirtual(m) => {
+            let target = own_method(class, m, pc)?;
+            if target.access & ACC_STATIC != 0 || m.name.starts_with('<') {
+                bail!("pc {pc}: invokevirtual of {}", m.name);
+            }
+            let s = parse_signature_in(&m.descriptor, &class.name)
+                .map_err(|e| anyhow::anyhow!("pc {pc}: {e}"))?;
+            for &p in s.params.iter().rev() {
+                frame.pop_param(p, pc)?;
+            }
+            frame.pop_ref(pc)?;
+            if let Some(k) = kind_of(s.ret) {
+                frame.stack.push(VType::of(k));
+            }
+            callee = Some((m.name.clone(), m.descriptor.clone()));
+        }
+        Op::InvokeSpecial(m) => {
+            let object_init =
+                m.class == "java/lang/Object" && m.name == "<init>" && m.descriptor == "()V";
+            if object_init && class.super_name.as_deref() == Some("java/lang/Object") {
+                // Only `this` in a constructor may call the superclass constructor.
+                if frame.pop(pc)? != VType::UninitThis {
+                    bail!(
+                        "pc {pc}: Object.<init> called on something other than uninitialized this"
+                    );
+                }
+                frame.initialize(VType::UninitThis);
+                specials.insert(pc, Special::ObjectInit);
+                return Ok(Step {
+                    falls,
+                    targets,
+                    callee,
+                });
+            }
+            let target = own_method(class, m, pc)?;
+            let s = parse_signature_in(&m.descriptor, &class.name)
+                .map_err(|e| anyhow::anyhow!("pc {pc}: {e}"))?;
+            for &p in s.params.iter().rev() {
+                frame.pop_param(p, pc)?;
+            }
+            if m.name == "<init>" {
+                match frame.pop(pc)? {
+                    v @ VType::Uninit(_) => frame.initialize(v),
+                    VType::UninitThis if cx.is_constructor => frame.initialize(VType::UninitThis),
+                    other => bail!("pc {pc}: constructor called on {other:?}"),
+                }
+            } else if target.access & ACC_PRIVATE != 0 && target.access & ACC_STATIC == 0 {
+                frame.pop_ref(pc)?;
+                if let Some(k) = kind_of(s.ret) {
+                    frame.stack.push(VType::of(k));
+                }
+            } else {
+                bail!(
+                    "pc {pc}: invokespecial of {} (super calls) is not compiled yet",
+                    m.name
+                );
+            }
+            specials.insert(pc, Special::Direct);
+            callee = Some((m.name.clone(), m.descriptor.clone()));
         }
     }
-    if let Op::Goto(t) = insn.op {
-        falls = false;
-        targets.push(t);
-    }
-    Ok((falls, targets))
+    Ok(Step {
+        falls,
+        targets,
+        callee,
+    })
 }
 
-/// Decode a method and type-check every reachable path, or explain why it cannot be compiled.
+struct Analyzed {
+    insns: Vec<Insn>,
+    /// Operand stack types before each instruction.
+    stacks: Vec<Vec<VType>>,
+    targets: BTreeSet<u32>,
+    callees: BTreeSet<(String, String)>,
+    specials: HashMap<u32, Special>,
+}
+
+/// Decode a method and verify every reachable path, or explain why it cannot be compiled.
 fn analyze(
     class: &ClassFile,
     method: &Member,
@@ -414,71 +805,103 @@ fn analyze(
         Err(DecodeError::Unsupported(u)) => return Err(u.to_string()),
         Err(DecodeError::Malformed(e)) => return Err(format!("malformed bytecode: {e:#}")),
     };
+    let is_static = method.access & ACC_STATIC != 0;
+    let is_constructor = method.name == "<init>";
+    let mut entry = Frame {
+        stack: Vec::new(),
+        locals: vec![VType::Top; code.max_locals as usize],
+    };
+    let mut slot = 0u16;
+    let mut place = |v: VType, frame: &mut Frame| -> std::result::Result<(), String> {
+        frame
+            .set_local(slot, v, 0)
+            .map_err(|_| "parameters exceed max_locals".to_string())?;
+        slot += v.category();
+        Ok(())
+    };
+    if !is_static {
+        place(
+            if is_constructor {
+                VType::UninitThis
+            } else {
+                VType::Obj
+            },
+            &mut entry,
+        )?;
+    }
+    for &p in &sig.params {
+        place(VType::of(kind_of(p).unwrap()), &mut entry)?;
+    }
+
     let index: HashMap<u32, usize> = insns
         .iter()
         .enumerate()
         .map(|(i, insn)| (insn.pc, i))
         .collect();
-    let mut stacks: Vec<Option<Vec<Kind>>> = vec![None; insns.len()];
+    let cx = Context {
+        class,
+        sig,
+        is_constructor,
+    };
+    let mut frames: Vec<Option<Frame>> = vec![None; insns.len()];
     let mut targets = BTreeSet::new();
     let mut callees = BTreeSet::new();
-    let mut work = vec![(0usize, Vec::new())];
+    let mut specials = HashMap::new();
+    let mut work = vec![(0usize, entry)];
     while let Some((i, incoming)) = work.pop() {
-        match &stacks[i] {
-            Some(existing) if *existing == incoming => continue,
+        let pc = insns[i].pc;
+        let frame = match &frames[i] {
+            None => incoming,
             Some(existing) => {
-                return Err(format!(
-                    "pc {}: inconsistent stack {existing:?} vs {incoming:?}",
-                    insns[i].pc
-                ));
+                let merged = existing
+                    .merge(&incoming, pc)
+                    .map_err(|e| format!("{e:#}"))?;
+                if merged == *existing {
+                    continue;
+                }
+                merged
             }
-            None => {}
-        }
-        let depth: u32 = incoming.iter().map(|k| k.category() as u32).sum();
+        };
+        let depth: u32 = frame.stack.iter().map(|v| v.category() as u32).sum();
         if depth > code.max_stack as u32 {
-            return Err(format!("pc {}: stack exceeds max_stack", insns[i].pc));
+            return Err(format!("pc {pc}: stack exceeds max_stack"));
         }
-        stacks[i] = Some(incoming.clone());
-        let mut stack = incoming;
-        let (falls, succ) = step(&insns[i], &mut stack, class, sig, code.max_locals)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Op::InvokeStatic {
-            name, descriptor, ..
-        } = &insns[i].op
-        {
-            callees.insert((name.clone(), descriptor.clone()));
-        }
+        frames[i] = Some(frame.clone());
+        let mut next = frame;
+        let Step {
+            falls,
+            targets: succ,
+            callee,
+        } = step(&insns[i], &mut next, &cx, &mut specials).map_err(|e| format!("{e:#}"))?;
+        callees.extend(callee);
         for t in succ {
             let Some(&j) = index.get(&t) else {
-                return Err(format!(
-                    "pc {}: branch target {t} is not an instruction",
-                    insns[i].pc
-                ));
+                return Err(format!("pc {pc}: branch target {t} is not an instruction"));
             };
             targets.insert(t);
-            work.push((j, stack.clone()));
+            work.push((j, next.clone()));
         }
         if falls {
             if i + 1 >= insns.len() {
                 return Err(format!(
-                    "pc {}: execution falls off the end of the method",
-                    insns[i].pc
+                    "pc {pc}: execution falls off the end of the method"
                 ));
             }
-            work.push((i + 1, stack));
+            work.push((i + 1, next));
         }
     }
     // Unreachable instructions are never emitted.
     let (insns, stacks): (Vec<_>, Vec<_>) = insns
         .into_iter()
-        .zip(stacks)
-        .filter_map(|(insn, s)| s.map(|s| (insn, s)))
+        .zip(frames)
+        .filter_map(|(insn, f)| f.map(|f| (insn, f.stack)))
         .unzip();
     Ok(Analyzed {
         insns,
         stacks,
         targets,
         callees,
+        specials,
     })
 }
 
@@ -504,30 +927,51 @@ fn cond_op(c: Cond) -> &'static str {
     }
 }
 
+/// C parameter list for a method: `self` first for instance methods.
+fn c_params(method: &Member, sig: &Signature, names: bool) -> String {
+    let mut params = Vec::new();
+    if method.access & ACC_STATIC == 0 {
+        params.push(if names {
+            "jabs_object *self".to_string()
+        } else {
+            "jabs_object *".to_string()
+        });
+    }
+    for (i, &p) in sig.params.iter().enumerate() {
+        params.push(if names {
+            format!("{} a{i}", c_type(p))
+        } else {
+            c_type(p).to_string()
+        });
+    }
+    if params.is_empty() {
+        "void".into()
+    } else {
+        params.join(", ")
+    }
+}
+
 /// C function prototype for a compiled method.
 fn prototype(class: &str, method: &Member, sig: &Signature) -> String {
-    let params: Vec<String> = sig
-        .params
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| format!("{} a{i}", c_type(p)))
-        .collect();
     format!(
         "{} {}({})",
         c_type(sig.ret),
         symbol(class, &method.name, &method.descriptor),
-        if params.is_empty() {
-            "void".into()
-        } else {
-            params.join(", ")
-        }
+        c_params(method, sig, true)
     )
+}
+
+/// Everything emission needs about the class beyond one method.
+struct ClassLayout {
+    /// Virtual method (name, descriptor) -> vtable slot.
+    vtable: HashMap<(String, String), usize>,
 }
 
 /// Emit one analyzed method as C: locals and stack become `jabs_value` arrays, pcs become labels.
 fn emit_method(
     out: &mut String,
     class: &ClassFile,
+    layout: &ClassLayout,
     method: &Member,
     sig: &Signature,
     a: &Analyzed,
@@ -556,12 +1000,67 @@ fn emit_method(
     );
     let _ = writeln!(out, "    (void)l; (void)s;");
     let mut slot = 0usize;
+    if method.access & ACC_STATIC == 0 {
+        let _ = writeln!(out, "    l[0].a = self;");
+        slot = 1;
+    }
     for (i, &p) in sig.params.iter().enumerate() {
         let k = kind_of(p).unwrap();
         let _ = writeln!(out, "    l[{slot}].{} = a{i};", field(k));
         slot += k.category() as usize;
     }
     let throw = |exc: &str| format!("{{ jabs_pending = \"{exc}\"; {ret_default} }}");
+    let npe = throw("java/lang/NullPointerException");
+    let obj = object_struct(&class.name);
+    // Call `name descriptor` with the receiver (if any) and arguments taken from the stack.
+    let call = |name: &str,
+                descriptor: &str,
+                d: usize,
+                receiver: bool,
+                virtual_slot: Option<usize>|
+     -> String {
+        let callee = parse_signature_in(descriptor, &class.name).unwrap();
+        let base = d - callee.params.len();
+        let mut args: Vec<String> = Vec::new();
+        let result_at = if receiver { base - 1 } else { base };
+        if receiver {
+            args.push(format!("s[{}].a", base - 1));
+        }
+        args.extend(
+            callee
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| format!("s[{}].{}", base + i, field(kind_of(p).unwrap()))),
+        );
+        let function = match virtual_slot {
+            Some(slot) => {
+                let target = class
+                    .methods
+                    .iter()
+                    .find(|m| m.name == name && m.descriptor == descriptor)
+                    .unwrap();
+                format!(
+                    "(({} (*)({}))s[{}].a->cls->vtable[{slot}])",
+                    c_type(callee.ret),
+                    c_params(target, &callee, false),
+                    base - 1
+                )
+            }
+            None => symbol(&class.name, name, descriptor),
+        };
+        let invoke = format!("{function}({})", args.join(", "));
+        let null_check = if receiver {
+            format!("if (!s[{}].a) {npe} ", base - 1)
+        } else {
+            String::new()
+        };
+        let assign = match kind_of(callee.ret) {
+            Some(k) => format!("s[{result_at}].{} = {invoke};", field(k)),
+            None => format!("{invoke};"),
+        };
+        format!("{null_check}{assign} if (jabs_pending) {ret_default}")
+    };
     for (insn, stack) in a.insns.iter().zip(&a.stacks) {
         if a.targets.contains(&insn.pc) {
             let _ = writeln!(out, "L{}:;", insn.pc);
@@ -570,6 +1069,7 @@ fn emit_method(
         let line = match &insn.op {
             Op::Nop | Op::Pop | Op::Pop2 => continue,
             Op::Const(v) => format!("s[{d}].{} = {};", field(v.kind()), value_literal(*v)),
+            Op::AConstNull => format!("s[{d}].a = NULL;"),
             Op::Load(k, n) => format!("s[{d}].{f} = l[{n}].{f};", f = field(*k)),
             Op::Store(k, n) => format!("l[{n}].{f} = s[{}].{f};", d - 1, f = field(*k)),
             Op::Iinc(n, c) => format!("l[{n}].i = jabs_iadd(l[{n}].i, {c});"),
@@ -682,6 +1182,21 @@ fn emit_method(
                 cond_op(*c),
                 d - 1
             ),
+            Op::IfNull { is_null, target } => {
+                format!(
+                    "if (s[{}].a {} NULL) goto L{target};",
+                    d - 1,
+                    if *is_null { "==" } else { "!=" }
+                )
+            }
+            Op::IfACmp { equal, target } => {
+                format!(
+                    "if (s[{}].a {} s[{}].a) goto L{target};",
+                    d - 2,
+                    if *equal { "==" } else { "!=" },
+                    d - 1
+                )
+            }
             Op::Goto(t) => format!("goto L{t};"),
             Op::TableSwitch {
                 default,
@@ -717,39 +1232,67 @@ fn emit_method(
             }
             Op::InvokeStatic {
                 name, descriptor, ..
-            } => {
-                let callee = parse_signature(descriptor).unwrap();
-                let base = d - callee.params.len();
-                let args: Vec<String> = callee
-                    .params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &p)| format!("s[{}].{}", base + i, field(kind_of(p).unwrap())))
-                    .collect();
-                let call = format!(
-                    "{}({})",
-                    symbol(&class.name, name, descriptor),
-                    args.join(", ")
-                );
-                let assign = match kind_of(callee.ret) {
-                    Some(k) => format!("s[{base}].{} = {call};", field(k)),
-                    None => format!("{call};"),
-                };
-                format!("{assign} if (jabs_pending) {ret_default}")
-            }
+            } => call(name, descriptor, d, false, None),
             Op::GetStatic {
                 name, descriptor, ..
             } => {
-                let k = kind_of(descriptor.chars().next().unwrap()).unwrap();
+                let k = kind_of(type_char(descriptor, name, &class.name).unwrap()).unwrap();
                 format!("s[{d}].{} = {};", field(k), field_symbol(&class.name, name))
             }
             Op::PutStatic {
                 name, descriptor, ..
             } => {
-                let k = kind_of(descriptor.chars().next().unwrap()).unwrap();
+                let k = kind_of(type_char(descriptor, name, &class.name).unwrap()).unwrap();
                 let value = narrow_for_store(descriptor, &format!("s[{}].{}", d - 1, field(k)));
                 format!("{} = {value};", field_symbol(&class.name, name))
             }
+            Op::New { .. } => {
+                format!(
+                    "s[{d}].a = jabs_new(&{}); if (!s[{d}].a) {ret_default}",
+                    mangled("jk_", &[&class.name])
+                )
+            }
+            Op::GetField(m) => {
+                let k = kind_of(type_char(&m.descriptor, &m.name, &class.name).unwrap()).unwrap();
+                let r = d - 1;
+                format!(
+                    "if (!s[{r}].a) {npe} s[{r}].{} = (({obj} *)s[{r}].a)->{};",
+                    field(k),
+                    instance_field(&m.name)
+                )
+            }
+            Op::PutField(m) => {
+                let k = kind_of(type_char(&m.descriptor, &m.name, &class.name).unwrap()).unwrap();
+                let (r, v) = (d - 2, d - 1);
+                let value = narrow_for_store(&m.descriptor, &format!("s[{v}].{}", field(k)));
+                format!(
+                    "if (!s[{r}].a) {npe} (({obj} *)s[{r}].a)->{} = {value};",
+                    instance_field(&m.name)
+                )
+            }
+            Op::InvokeVirtual(m) => {
+                let target = class
+                    .methods
+                    .iter()
+                    .find(|x| x.name == m.name && x.descriptor == m.descriptor)
+                    .unwrap();
+                // Private, final and final-class methods cannot be overridden: call them directly.
+                let fixed =
+                    target.access & (ACC_PRIVATE | ACC_FINAL) != 0 || class.access & ACC_FINAL != 0;
+                let slot = if fixed {
+                    None
+                } else {
+                    layout
+                        .vtable
+                        .get(&(m.name.clone(), m.descriptor.clone()))
+                        .copied()
+                };
+                call(&m.name, &m.descriptor, d, true, slot)
+            }
+            Op::InvokeSpecial(m) => match a.specials[&insn.pc] {
+                Special::ObjectInit => "/* java/lang/Object.<init>()V has no effect */".into(),
+                Special::Direct => call(&m.name, &m.descriptor, d, true, None),
+            },
         };
         let _ = writeln!(out, "    {line}");
     }
@@ -765,11 +1308,77 @@ fn int_case(key: i32) -> String {
     }
 }
 
+/// Emit the object layout struct: the header, then every instance field at its JVM width.
+fn emit_object_layout(out: &mut String, class: &ClassFile) {
+    let _ = writeln!(
+        out,
+        "{} {{\n    jabs_object header;",
+        object_struct(&class.name)
+    );
+    for f in class.fields.iter().filter(|f| f.access & ACC_STATIC == 0) {
+        match storage_type(&f.descriptor, &class.name) {
+            Some(ty) => {
+                let _ = writeln!(out, "    {ty} {};", instance_field(&f.name));
+            }
+            // Present so the layout is complete; no compiled code can access it yet.
+            None => {
+                let _ = writeln!(
+                    out,
+                    "    void *{}; /* {}: not accessible yet */",
+                    instance_field(&f.name),
+                    f.descriptor
+                );
+            }
+        }
+    }
+    let _ = writeln!(out, "}};\n");
+}
+
+/// Emit the vtable and class record. Only compiled methods get entries; the rest stay NULL and
+/// are never called, because a call compiles only when its target method compiles.
+fn emit_class_record(
+    out: &mut String,
+    class: &ClassFile,
+    virtuals: &[&Member],
+    compiled: &BTreeSet<(String, String)>,
+) {
+    let vtable = mangled("jv_", &[&class.name]);
+    let entries: Vec<String> = virtuals
+        .iter()
+        .map(|m| {
+            if compiled.contains(&(m.name.clone(), m.descriptor.clone())) {
+                format!(
+                    "(void (*)(void)){}",
+                    symbol(&class.name, &m.name, &m.descriptor)
+                )
+            } else {
+                "0".into()
+            }
+        })
+        .collect();
+    let entries = if entries.is_empty() {
+        "0".to_string()
+    } else {
+        entries.join(", ")
+    };
+    let _ = writeln!(
+        out,
+        "static void (*const {vtable}[])(void) = {{ {entries} }};"
+    );
+    let _ = writeln!(
+        out,
+        "static const jabs_class {} = {{ \"{}\", sizeof({}), {vtable} }};\n",
+        mangled("jk_", &[&class.name]),
+        class.name,
+        object_struct(&class.name)
+    );
+}
+
 /// Emit static field storage and the class initialization function (JVMS 5.5, single-threaded).
 fn emit_statics_and_init(out: &mut String, class: &ClassFile, has_clinit: bool) {
     let mut constants = String::new();
     for f in class.fields.iter().filter(|f| f.access & ACC_STATIC != 0) {
-        let Some(ty) = storage_type(&f.descriptor) else {
+        let Some(ty) = storage_type(&f.descriptor, &class.name) else {
             continue;
         };
         let sym = field_symbol(&class.name, &f.name);
@@ -818,7 +1427,7 @@ fn emit_statics_and_init(out: &mut String, class: &ClassFile, has_clinit: bool) 
     let _ = writeln!(out, "    return 0;\n}}\n");
 }
 
-/// Compile every eligible static method of one class to a self-contained C unit.
+/// Compile every eligible method of one class to a self-contained C unit.
 pub fn compile_class(class: &ClassFile) -> CompiledClass {
     let clinit_key = ("<clinit>".to_string(), "()V".to_string());
     let has_clinit = class.methods.iter().any(|m| m.name == "<clinit>");
@@ -845,13 +1454,14 @@ pub fn compile_class(class: &ClassFile) -> CompiledClass {
             if let Some(reason) = &foreign_init {
                 return Err(reason.clone());
             }
-            if method.access & ACC_STATIC == 0 {
-                return Err("instance methods need the object model".into());
-            }
             if method.access & ACC_SYNCHRONIZED != 0 {
                 return Err("synchronized methods need monitors".into());
             }
-            let sig = parse_signature(&method.descriptor).map_err(|e| e.to_string())?;
+            if class.access & ACC_INTERFACE != 0 && method.access & ACC_STATIC == 0 {
+                return Err("interface instance methods are not compiled yet".into());
+            }
+            let sig =
+                parse_signature_in(&method.descriptor, &class.name).map_err(|e| e.to_string())?;
             let analyzed = analyze(class, method, &sig)?;
             Ok((sig, analyzed))
         })();
@@ -881,7 +1491,7 @@ pub fn compile_class(class: &ClassFile) -> CompiledClass {
             results.insert(key, Err(reason));
         }
     }
-    // Every static method runs only after <clinit>, so an uncompilable initializer blocks the class.
+    // Every method runs only after <clinit>, so an uncompilable initializer blocks the class.
     if has_clinit
         && foreign_init.is_none()
         && let Some(Err(reason)) = results.get(&clinit_key)
@@ -893,7 +1503,25 @@ pub fn compile_class(class: &ClassFile) -> CompiledClass {
             }
         }
     }
-    let any_compiled = results.values().any(|r| r.is_ok());
+    let compiled: BTreeSet<(String, String)> = results
+        .iter()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    // Overridable instance methods get vtable slots in declaration order.
+    let virtuals: Vec<&Member> = class
+        .methods
+        .iter()
+        .filter(|m| m.access & (ACC_STATIC | ACC_PRIVATE) == 0 && !m.name.starts_with('<'))
+        .collect();
+    let layout = ClassLayout {
+        vtable: virtuals
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ((m.name.clone(), m.descriptor.clone()), i))
+            .collect(),
+    };
 
     let mut source = String::new();
     let _ = writeln!(
@@ -903,20 +1531,31 @@ pub fn compile_class(class: &ClassFile) -> CompiledClass {
     );
     source.push_str(RUNTIME_PRELUDE);
     source.push('\n');
-    let mut methods = Vec::new();
+    if !compiled.is_empty() {
+        emit_object_layout(&mut source, class);
+    }
     for method in &class.methods {
         if let Some(Ok((sig, _))) = results.get(&(method.name.clone(), method.descriptor.clone())) {
             let _ = writeln!(source, "{};", prototype(&class.name, method, sig));
         }
     }
     source.push('\n');
-    if any_compiled {
+    // The class record is only referenced by `new`, so emit it only when compiled code allocates.
+    let allocates = results
+        .values()
+        .filter_map(|r| r.as_ref().ok())
+        .any(|(_, a)| a.insns.iter().any(|i| matches!(i.op, Op::New { .. })));
+    if allocates {
+        emit_class_record(&mut source, class, &virtuals, &compiled);
+    }
+    if !compiled.is_empty() {
         emit_statics_and_init(&mut source, class, has_clinit);
     }
+    let mut methods = Vec::new();
     for method in &class.methods {
         let status = match &results[&(method.name.clone(), method.descriptor.clone())] {
             Ok((sig, analyzed)) => {
-                emit_method(&mut source, class, method, sig, analyzed);
+                emit_method(&mut source, class, &layout, method, sig, analyzed);
                 MethodStatus::Compiled {
                     symbol: symbol(&class.name, &method.name, &method.descriptor),
                 }

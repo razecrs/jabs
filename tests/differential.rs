@@ -177,7 +177,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
     out
 }
 
-const FIXTURE_CLASSES: [&str; 3] = ["Arith", "Statics", "BadInit"];
+const FIXTURE_CLASSES: [&str; 4] = ["Arith", "Statics", "BadInit", "Node"];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
@@ -208,6 +208,27 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
             .into_iter()
             .map(|(name, args)| ("Statics", name, args)),
     );
+    // Objects: every case calls a static entry point that builds and uses Node instances.
+    for n in [0, 1, 2, 5, 100] {
+        out.push(("Node", "build", vec![I(n)]));
+        out.push(("Node", "totalWeight", vec![I(n)]));
+        if n > 0 {
+            out.push(("Node", "lengthOf", vec![I(n)]));
+        }
+    }
+    for v in [0, 1, 7, 128, 255, -129, i32::MIN] {
+        out.push(("Node", "tagOf", vec![I(v)]));
+        out.push(("Node", "marked", vec![I(v)]));
+        out.push(("Node", "privateCall", vec![I(v)]));
+        out.push(("Node", "sameObject", vec![I(v)]));
+    }
+    out.push(("Node", "defaults", vec![]));
+    out.push(("Node", "nullField", vec![]));
+    out.push(("Node", "nullCall", vec![I(0)]));
+    out.push(("Node", "nullCall", vec![I(3)]));
+    out.push(("Node", "relink", vec![I(5)]));
+    out.push(("Node", "lengthOf", vec![I(0)]));
+    // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
     out
@@ -412,6 +433,16 @@ fn native_matches_reference_jvm() {
     let reference: Vec<_> = reference.lines().collect();
     let native: Vec<_> = native.lines().collect();
     assert_eq!(reference.len(), all.len());
+    // Guard that the object fixture really reaches NullPointerException on the JVM (build(0),
+    // nullField, nullCall(0), lengthOf(0)), so those paths are compared rather than skipped.
+    let npes = reference
+        .iter()
+        .filter(|l| **l == "throw java/lang/NullPointerException")
+        .count();
+    assert_eq!(
+        npes, 4,
+        "expected exactly four NullPointerExceptions from the Node fixture"
+    );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(
         reference[reference.len() - 2..],

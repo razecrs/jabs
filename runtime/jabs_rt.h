@@ -11,21 +11,39 @@
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if FLT_EVAL_METHOD != 0
 #error "JABS requires FLT_EVAL_METHOD == 0 for Java floating-point semantics"
 #endif
 
+/* A class's runtime record: name, instance size and vtable (one slot per overridable method). */
+typedef struct jabs_class {
+    const char *name;
+    size_t size;
+    void (*const *vtable)(void);
+} jabs_class;
+
+/* Every object starts with this header; the class's own struct embeds it first. */
+typedef struct jabs_object {
+    const jabs_class *cls;
+} jabs_object;
+
 typedef union jabs_value {
     int32_t i;
     int64_t j;
     float f;
     double d;
+    jabs_object *a;
 } jabs_value;
 
 /* Internal class name of the pending exception, or NULL. */
 static _Thread_local const char *jabs_pending;
+
+/* Allocate a zeroed object: all-zero bytes are every field's Java default (0, 0.0, false, null).
+ * There is no garbage collector yet, so objects live until the process exits. */
+static inline jabs_object *jabs_new(const jabs_class *cls);
 
 /* Exception a failed static initializer reports (JVMS 5.5 step 11): Errors pass through,
  * anything else becomes ExceptionInInitializerError. Until the class hierarchy is modeled,
@@ -105,5 +123,15 @@ static inline int32_t jabs_fcmpl(float a, float b) { return a > b ? 1 : a == b ?
 static inline int32_t jabs_fcmpg(float a, float b) { return a < b ? -1 : a == b ? 0 : 1; }
 static inline int32_t jabs_dcmpl(double a, double b) { return a > b ? 1 : a == b ? 0 : -1; }
 static inline int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == b ? 0 : 1; }
+
+static inline jabs_object *jabs_new(const jabs_class *cls) {
+    jabs_object *o = (jabs_object *)calloc(1, cls->size);
+    if (!o) {
+        jabs_pending = "java/lang/OutOfMemoryError";
+        return NULL;
+    }
+    o->cls = cls;
+    return o;
+}
 
 #endif

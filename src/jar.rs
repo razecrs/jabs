@@ -258,7 +258,19 @@ fn blocker_category(reason: &str) -> String {
         .split_once(": ")
         .filter(|(pc, _)| pc.starts_with("pc "))
         .map_or(reason, |(_, r)| r);
-    if reason.starts_with("calls ") {
+    if reason.contains("outside this class") {
+        "calls into another class".into()
+    } else if reason.contains("objects of other classes") {
+        "new of another class".into()
+    } else if reason.contains("is inherited") {
+        "inherited member (cross-class)".into()
+    } else if reason.contains("in another class is not compiled") {
+        "field of another class".into()
+    } else if reason.starts_with("arrays in") || reason.contains("arrays in ") {
+        "arrays".into()
+    } else if reason.contains("is not compiled yet (only primitives") {
+        "field of an unsupported type".into()
+    } else if reason.starts_with("calls ") {
         "calls a method that is not compiled".into()
     } else if reason.starts_with("call to ") {
         "calls into another class".into()

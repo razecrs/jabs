@@ -13,12 +13,16 @@ The architecture and rollout are in [PLAN.md](PLAN.md).
 - `inspect-jar`: class-file versions and required Java, loader metadata (Fabric,
   Quilt, NeoForge, `mods.toml`, legacy `mcmod.info`, coremods, LaunchWrapper
   tweakers), mixin configs, native libraries and `invokedynamic` usage.
-- `compile-class`: compiles static methods that use only int/long/float/double
-  (arithmetic, conversions, branches, loops, switches, calls within the class)
-  to C11 with Java semantics. Every other method is listed with the reason it
-  was not compiled. A differential test runs 2,807 edge cases on the reference
-  JVM and as native code and requires bit-identical results.
-
+- `compile-class`: compiles a class's methods to C11 with Java semantics:
+  primitive arithmetic, branches, loops, switches, static fields and class
+  initialization (JVMS 5.5), and objects of that same class (constructors,
+  fields, virtual calls via a vtable, null checks raising
+  `NullPointerException`). A small bytecode verifier proves every path
+  type-correct before any pointer code is emitted. Everything else is listed
+  per method with the reason it was not compiled. There is no garbage
+  collector yet: objects live until the process exits. A differential test runs
+  2,873 cases on the reference JVM and as native code and requires
+  bit-identical results.
 - `run`: launches a vanilla **server** profile on the JVM after rehashing every
   artifact, with the main class from the jar manifest and a required exact Java
   version. `--until-ready` reports wall-clock time to the server's `Done` line and
