@@ -248,6 +248,8 @@ pub struct Coverage {
     pub unparsable_classes: usize,
     pub methods: usize,
     pub compiled_methods: usize,
+    /// Compiled methods that never reach a not-compiled stub.
+    pub self_contained_methods: usize,
     /// Normalized unsupported reason -> method count, most common first.
     pub blockers: Vec<(String, usize)>,
     /// The JDK classes compiled in the same unit, when requested.
@@ -391,6 +393,8 @@ pub struct PartCoverage {
     pub classes: usize,
     pub methods: usize,
     pub compiled_methods: usize,
+    /// Compiled methods that never reach a not-compiled stub.
+    pub self_contained_methods: usize,
     /// Normalized unsupported reason -> method count, most common first.
     pub blockers: Vec<(String, usize)>,
 }
@@ -401,16 +405,20 @@ fn part_coverage(
     names: &std::collections::HashSet<&str>,
 ) -> PartCoverage {
     let mut blockers: BTreeMap<String, usize> = BTreeMap::new();
-    let (mut methods, mut compiled) = (0, 0);
+    let (mut methods, mut compiled, mut self_contained) = (0, 0, 0);
     for method in unit
         .methods
         .iter()
         .filter(|m| names.contains(m.class.as_str()))
     {
         match &method.status {
-            crate::cgen::MethodStatus::Compiled { .. } => {
+            crate::cgen::MethodStatus::Compiled {
+                self_contained: whole,
+                ..
+            } => {
                 methods += 1;
                 compiled += 1;
+                self_contained += *whole as usize;
             }
             crate::cgen::MethodStatus::Unsupported { reason } => {
                 methods += 1;
@@ -425,6 +433,7 @@ fn part_coverage(
         classes: names.len(),
         methods,
         compiled_methods: compiled,
+        self_contained_methods: self_contained,
         blockers,
     }
 }
@@ -461,6 +470,7 @@ pub fn coverage(path: &Path, jdk: Option<&Path>) -> Result<Coverage> {
         unparsable_classes: unparsable,
         methods: jar.methods,
         compiled_methods: jar.compiled_methods,
+        self_contained_methods: jar.self_contained_methods,
         blockers: jar.blockers,
         jdk: jdk_part,
     })

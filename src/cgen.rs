@@ -270,8 +270,10 @@ const STRING_FIELDS: [(&str, &str); 4] = [
 #[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MethodStatus {
+    /// The body is native. `self_contained`: nothing reachable from it hits a not-compiled stub.
     Compiled {
         symbol: String,
+        self_contained: bool,
     },
     Unsupported {
         reason: String,
@@ -297,6 +299,8 @@ pub struct CompiledUnit {
     pub unsupported: usize,
     /// Abstract methods (counted in neither `compiled` nor `unsupported`).
     pub abstract_methods: usize,
+    /// Compiled methods whose whole reachable call graph and class initialization is native.
+    pub self_contained: usize,
     pub methods: Vec<MethodReport>,
     #[serde(skip)]
     pub c_source: String,
@@ -3319,6 +3323,192 @@ fn structural_problem(unit: &Unit, class: &ClassFile) -> Option<String> {
     None
 }
 
+/// Classes whose init function emitted code may call: the methods' own classes, their init
+/// dependencies, and the prerequisites of every class initialized.
+fn emitted_init_targets(
+    unit: &Unit,
+    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    emission: &Emission,
+) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = emission.inits.clone();
+    for key in &emission.methods {
+        if let Some(Ok((_, a))) = results.get(key) {
+            out.extend(a.deps.iter().filter_map(|d| match d {
+                Dep::Init(c) => Some(c.clone()),
+                Dep::Method(_) => None,
+            }));
+        }
+    }
+    for class in emission.inits.iter().filter_map(|c| unit.get(c)) {
+        out.extend(init_prerequisites(unit, class));
+    }
+    out
+}
+
+/// Emit stand-ins for what emitted code may call but the unit could not compile: a function with
+/// the callee's exact signature (under its real symbol) or a class init function, each stopping
+/// with the reason; plus static field storage for classes whose initialization is a stub, so
+/// field references still link (the guard stops before they are touched).
+fn emit_reached_stubs(
+    out: &mut String,
+    unit: &Unit,
+    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    emission: &Emission,
+    init_ok: &HashMap<String, std::result::Result<(), String>>,
+) {
+    let mut calls: BTreeSet<MethodKey> = BTreeSet::new();
+    let mut statics: BTreeSet<String> = BTreeSet::new();
+    for key in &emission.methods {
+        let Some(Ok((_, a))) = results.get(key) else {
+            continue;
+        };
+        for (pc, resolved) in &a.resolved {
+            match resolved {
+                Resolved::Call(CallKind::Direct(target)) if !emission.methods.contains(target) => {
+                    calls.insert(target.clone());
+                }
+                Resolved::Field(declaring) if !emission.inits.contains(declaring) => {
+                    let is_static = a.insns.iter().any(|i| {
+                        i.pc == *pc && matches!(i.op, Op::GetStatic { .. } | Op::PutStatic { .. })
+                    });
+                    if is_static {
+                        statics.insert(declaring.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for target in &calls {
+        let Some(class) = unit.get(&target.0) else {
+            continue;
+        };
+        let Some(method) = class
+            .methods
+            .iter()
+            .find(|m| m.name == target.1 && m.descriptor == target.2)
+        else {
+            continue;
+        };
+        let Ok(sig) = parse_signature(&target.2) else {
+            continue;
+        };
+        let reason = match results.get(target) {
+            Some(Err(reason)) => reason.clone(),
+            _ => "not reached by reachability analysis".to_string(),
+        };
+        let mut unused = String::new();
+        if method.access & ACC_STATIC == 0 {
+            unused.push_str(" (void)self;");
+        }
+        for i in 0..sig.params.len() {
+            let _ = write!(unused, " (void)a{i};");
+        }
+        let message = c_escape(&format!("{}.{}{} ({reason})", target.0, target.1, target.2));
+        let _ = writeln!(
+            out,
+            "{} {{{unused} jabs_not_compiled(\"{message}\"); }}",
+            prototype(&target.0, method, &sig)
+        );
+    }
+    for class in emitted_init_targets(unit, results, emission).difference(&emission.inits) {
+        let reason = match init_ok.get(class) {
+            Some(Err(reason)) => reason.clone(),
+            _ => "not in the compilation unit".to_string(),
+        };
+        let message = c_escape(&format!(
+            "class {class} cannot be initialized natively ({reason})"
+        ));
+        let _ = writeln!(
+            out,
+            "int {}(void) {{ jabs_not_compiled(\"{message}\"); }}",
+            init_symbol(class)
+        );
+    }
+    for class in statics.iter().filter_map(|c| unit.get(c)) {
+        for f in class.fields.iter().filter(|f| f.access & ACC_STATIC != 0) {
+            if let Some(ty) = storage_type(&f.descriptor) {
+                let _ = writeln!(out, "{ty} {};", field_symbol(&class.name, &f.name));
+            }
+        }
+    }
+    out.push('\n');
+}
+
+/// Compiled methods that never reach a stub: every method they may call directly and every class
+/// they may initialize (with its whole initializer) is native too. Greatest fixpoint: start from
+/// everything compiled and remove methods with a missing dependency until nothing changes.
+fn self_contained_methods(
+    unit: &Unit,
+    classes: &[ClassFile],
+    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    initializable: &BTreeSet<String>,
+) -> BTreeSet<MethodKey> {
+    // Nodes are methods and class initializations; an edge points from a dependency to what
+    // depends on it. Everything not compiled (or not initializable) is bad, and badness flows to
+    // dependents. One pass over the reverse graph: linear in the number of dependencies.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum Node {
+        Method(MethodKey),
+        Class(String),
+    }
+    let mut dependents: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
+    let mut edge = |from: Node, to: Node| dependents.entry(from).or_default().push(to);
+    for (key, result) in results {
+        let Ok((_, a)) = result else { continue };
+        let me = Node::Method(key.clone());
+        if key.1 != "<clinit>" {
+            edge(Node::Class(key.0.clone()), me.clone());
+        }
+        for dep in &a.deps {
+            match dep {
+                Dep::Method(m) => edge(Node::Method(m.clone()), me.clone()),
+                Dep::Init(c) => edge(Node::Class(c.clone()), me.clone()),
+            }
+        }
+    }
+    for class in classes {
+        let me = Node::Class(class.name.clone());
+        let clinit = (
+            class.name.clone(),
+            "<clinit>".to_string(),
+            "()V".to_string(),
+        );
+        if results.contains_key(&clinit) {
+            edge(Node::Method(clinit), me.clone());
+        }
+        for p in init_prerequisites(unit, class) {
+            edge(Node::Class(p), me.clone());
+        }
+    }
+    let mut bad: BTreeSet<Node> = BTreeSet::new();
+    let mut work: Vec<Node> = Vec::new();
+    // Seeds: methods that did not compile, called methods that do not exist, classes that
+    // cannot be initialized (including ones outside the unit).
+    for node in dependents.keys() {
+        let seed = match node {
+            Node::Method(m) => !matches!(results.get(m), Some(Ok(_))),
+            Node::Class(c) => !initializable.contains(c),
+        };
+        if seed {
+            work.push(node.clone());
+        }
+    }
+    while let Some(node) = work.pop() {
+        if !bad.insert(node.clone()) {
+            continue;
+        }
+        if let Some(next) = dependents.get(&node) {
+            work.extend(next.iter().filter(|n| !bad.contains(n)).cloned());
+        }
+    }
+    results
+        .iter()
+        .filter(|(k, r)| r.is_ok() && !bad.contains(&Node::Method((*k).clone())))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 /// Compile a set of classes together into one C unit.
 pub fn compile_unit(classes: &[ClassFile]) -> CompiledUnit {
     compile_unit_rooted(classes, None)
@@ -3392,12 +3582,19 @@ fn reachable(
         }));
         keys
     };
+    // Rapid Type Analysis: an implementation is reachable only when its class is instantiated AND
+    // some reachable code calls its (name, descriptor) virtually or through an interface.
+    let mut called: BTreeSet<(String, String)> = BTreeSet::new();
     // The runtime may raise any VM exception, so those classes have instances.
     for (name, _) in VM_EXCEPTIONS {
         if unit.get(name).is_some() && unit.chain(name).is_ok() {
             add_records(name, &mut out.records);
             if out.instantiated.insert(name.to_string()) {
-                work.extend(implementations(name).into_iter().filter(|k| compiled(k)));
+                work.extend(
+                    implementations(name)
+                        .into_iter()
+                        .filter(|k| compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))),
+                );
             }
         }
     }
@@ -3408,7 +3605,11 @@ fn reachable(
             for name in [CLASS, STRING] {
                 add_records(name, &mut out.records);
                 if out.instantiated.insert(name.to_string()) {
-                    work.extend(implementations(name).into_iter().filter(|k| compiled(k)));
+                    work.extend(
+                        implementations(name).into_iter().filter(|k| {
+                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
+                        }),
+                    );
                     pending_inits.push(name.to_string());
                 }
             }
@@ -3451,19 +3652,41 @@ fn reachable(
                 Dep::Init(c) => pending_inits.push(c.clone()),
             }
         }
+        for resolved in analyzed.resolved.values() {
+            let target = match resolved {
+                Resolved::Call(
+                    CallKind::Virtual { target, .. } | CallKind::Interface { target, .. },
+                ) => target,
+                _ => continue,
+            };
+            let selector = (target.1.clone(), target.2.clone());
+            if called.insert(selector.clone()) {
+                for class in &out.instantiated {
+                    work.extend(
+                        implementations(class)
+                            .into_iter()
+                            .filter(|k| k.1 == selector.0 && k.2 == selector.1 && compiled(k)),
+                    );
+                }
+            }
+        }
         for insn in &analyzed.insns {
             match &insn.op {
                 Op::New { class } => {
                     add_records(class, &mut out.records);
                     if out.instantiated.insert(class.clone()) {
-                        work.extend(implementations(class).into_iter().filter(|k| compiled(k)));
+                        work.extend(implementations(class).into_iter().filter(|k| {
+                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
+                        }));
                     }
                 }
                 Op::LdcClass(_) => needs_classes = true,
                 Op::LdcString(_) => {
                     add_records(STRING, &mut out.records);
                     if out.instantiated.insert(STRING.to_string()) {
-                        work.extend(implementations(STRING).into_iter().filter(|k| compiled(k)));
+                        work.extend(implementations(STRING).into_iter().filter(|k| {
+                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
+                        }));
                     }
                 }
                 Op::CheckCast { class } | Op::InstanceOf { class } if class.starts_with('[') => {
@@ -3523,9 +3746,10 @@ pub fn compile_unit_rooted(
             results.insert(key, result);
         }
     }
-    // A class initializes only if its hierarchy is in the unit, its <clinit> compiles and its
-    // prerequisites initialize; a method compiles only if every dependency does. Failures only
-    // spread, so iterating until nothing changes terminates.
+    // A class can be initialized natively when its hierarchy is in the unit, its <clinit> body
+    // compiles and its prerequisites can be initialized. Calls to methods that did not compile
+    // no longer block their callers: they reach a stub that stops with a diagnostic only if it
+    // actually runs. Failures only spread, so iterating until nothing changes terminates.
     let mut init_ok: HashMap<String, std::result::Result<(), String>> = classes
         .iter()
         .map(|c| {
@@ -3564,42 +3788,6 @@ pub fn compile_unit_rooted(
                 changed = true;
             }
         }
-        let failed: Vec<(MethodKey, String)> = results
-            .iter()
-            .filter_map(|(key, r)| {
-                let a = &r.as_ref().ok()?.1;
-                // Every method runs only after its own class is initialized.
-                let own = Dep::Init(key.0.clone());
-                std::iter::once(&own)
-                    .chain(a.deps.iter())
-                    .find_map(|dep| match dep {
-                        Dep::Method(m) => match results.get(m) {
-                            Some(Ok(_)) => None,
-                            _ => Some((
-                                key.clone(),
-                                format!("calls {}.{}{}, which is not compiled", m.0, m.1, m.2),
-                            )),
-                        },
-                        Dep::Init(c) if *c == key.0 && key.1 == "<clinit>" => None,
-                        Dep::Init(c) => match init_ok.get(c) {
-                            Some(Ok(())) => None,
-                            Some(Err(reason)) if *c == key.0 => Some((key.clone(), reason.clone())),
-                            Some(Err(_)) => Some((
-                                key.clone(),
-                                format!("initializes {c}, which cannot be initialized"),
-                            )),
-                            None => Some((
-                                key.clone(),
-                                format!("initializes {c}, which is not in the compilation unit"),
-                            )),
-                        },
-                    })
-            })
-            .collect();
-        for (key, reason) in failed {
-            results.insert(key, Err(reason));
-            changed = true;
-        }
         if !changed {
             break;
         }
@@ -3614,6 +3802,7 @@ pub fn compile_unit_rooted(
         .filter(|c| init_ok[&c.name].is_ok())
         .map(|c| c.name.clone())
         .collect();
+    let self_contained = self_contained_methods(&unit, classes, &results, &initializable);
     let laid_out_all: Vec<&ClassFile> = classes
         .iter()
         .filter(|c| c.access & ACC_INTERFACE == 0 && unit.chain(&c.name).is_ok())
@@ -3669,8 +3858,9 @@ pub fn compile_unit_rooted(
             }
         }
     }
-    for class in &emission.inits {
-        let _ = writeln!(source, "int {}(void);", init_symbol(class));
+    // Every class whose initialization emitted code may trigger: real or stub.
+    for class in emitted_init_targets(&unit, &results, &emission) {
+        let _ = writeln!(source, "int {}(void);", init_symbol(&class));
     }
     source.push('\n');
     // A vtable entry is real code only for instantiated classes; everything else is a stub.
@@ -3729,6 +3919,7 @@ pub fn compile_unit_rooted(
     for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
         emit_statics_and_init(&mut source, &unit, class);
     }
+    emit_reached_stubs(&mut source, &unit, &results, &emission, &init_ok);
     let mut methods = Vec::new();
     for class in classes {
         for method in &class.methods {
@@ -3764,6 +3955,7 @@ pub fn compile_unit_rooted(
                     }
                     MethodStatus::Compiled {
                         symbol: symbol(&key.0, &key.1, &key.2),
+                        self_contained: self_contained.contains(&key),
                     }
                 }
                 Err(reason) => MethodStatus::Unsupported {
@@ -3786,12 +3978,25 @@ pub fn compile_unit_rooted(
         .iter()
         .filter(|m| m.status == MethodStatus::Abstract)
         .count();
+    let self_contained_count = methods
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.status,
+                MethodStatus::Compiled {
+                    self_contained: true,
+                    ..
+                }
+            )
+        })
+        .count();
     CompiledUnit {
         schema_version: 1,
         classes: classes.len(),
         compiled,
         unsupported: methods.len() - compiled - abstract_methods,
         abstract_methods,
+        self_contained: self_contained_count,
         methods,
         c_source: source,
     }

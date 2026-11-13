@@ -505,7 +505,9 @@ fn native_matches_reference_jvm() {
     let (library, _, unparsable) = jabs::jdk::read_module(&home, "java.base").unwrap();
     assert_eq!(unparsable, 0);
     classes.extend(library);
+    let phase = std::time::Instant::now();
     let compiled = cgen::compile_unit_rooted(&classes, Some(&roots));
+    eprintln!("compile_unit: {:.1?}", phase.elapsed());
     // Every fixture method must compile: unsupported is a test failure here.
     let unsupported: Vec<_> = compiled
         .methods
@@ -520,10 +522,12 @@ fn native_matches_reference_jvm() {
     );
     let mut c = compiled.c_source.clone();
     c.push_str(C_PRINTERS);
-    c.push_str("int main(void) {\n");
+    // One small non-inlined function per case: a single huge main makes clang -O2 crawl.
+    let mut case_functions = String::new();
+    let mut case_calls = String::new();
 
     let all = cases();
-    for (class_name, name, args) in &all {
+    for (n, (class_name, name, args)) in all.iter().enumerate() {
         let class = classes.iter().find(|c| c.name == *class_name).unwrap();
         let desc = class
             .methods
@@ -547,9 +551,10 @@ fn native_matches_reference_jvm() {
             jargs.join(", ")
         );
         // Like invokestatic, each call first ensures the class is initialized.
+        let _ = writeln!(case_calls, "    case_{n}();");
         let _ = writeln!(
-            c,
-            "    if ({}() != 0) check(); else {{ {} r = {}({}); if (!check()) {p}(r); }}",
+            case_functions,
+            "__attribute__((noinline)) static void case_{n}(void) {{ if ({}() != 0) check(); else {{ {} r = {}({}); if (!check()) {p}(r); }} }}",
             cgen::init_symbol(class_name),
             cgen::c_type(sig.ret.code),
             cgen::symbol(class_name, name, &desc),
@@ -557,6 +562,9 @@ fn native_matches_reference_jvm() {
         );
     }
     java.push_str("    }\n}\n");
+    c.push_str(&case_functions);
+    c.push_str("int main(void) {\n");
+    c.push_str(&case_calls);
     c.push_str("    return 0;\n}\n");
 
     fs::write(root.join("Runner.java"), java).unwrap();
@@ -566,7 +574,9 @@ fn native_matches_reference_jvm() {
         .arg("-d")
         .arg(root)
         .arg(root.join("Runner.java")));
+    let phase = std::time::Instant::now();
     let reference = run(Command::new("java").arg("-cp").arg(root).arg("Runner"));
+    eprintln!("reference JVM run: {:.1?}", phase.elapsed());
 
     let c_path = root.join("fixtures.c");
     fs::write(&c_path, c).unwrap();
@@ -575,6 +585,7 @@ fn native_matches_reference_jvm() {
     } else {
         "fixtures"
     });
+    let phase = std::time::Instant::now();
     run(Command::new("clang")
         .args(clang_target_args(root))
         .args([
@@ -594,7 +605,10 @@ fn native_matches_reference_jvm() {
         } else {
             "-lm"
         }));
+    eprintln!("clang: {:.1?}", phase.elapsed());
+    let phase = std::time::Instant::now();
     let native = run(&mut Command::new(&exe));
+    eprintln!("native run: {:.1?}", phase.elapsed());
 
     let reference: Vec<_> = reference.lines().collect();
     let native: Vec<_> = native.lines().collect();
