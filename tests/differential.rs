@@ -178,7 +178,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 9] = [
+const FIXTURE_SOURCES: [&str; 10] = [
     "Arith",
     "Statics",
     "BadInit",
@@ -188,6 +188,7 @@ const FIXTURE_SOURCES: [&str; 9] = [
     "Strings",
     "Ifaces",
     "Exceptions",
+    "Sync",
 ];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
@@ -338,6 +339,20 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     }
     out.push(("Exceptions", "loopWithCatch", vec![I(5)]));
     out.push(("Exceptions", "throwNull", vec![]));
+    // Monitors and array casts.
+    for n in [0, 1, 5] {
+        out.push(("Sync", "block", vec![I(n)]));
+        out.push(("Sync", "blockThrows", vec![I(n)]));
+        out.push(("Sync", "reentrant", vec![I(n)]));
+        out.push(("Sync", "twice", vec![I(n)]));
+    }
+    out.push(("Sync", "nullLock", vec![]));
+    for w in [0, 1, 2] {
+        out.push(("Sync", "castIntArray", vec![I(w)]));
+        out.push(("Sync", "arrayKinds", vec![I(w)]));
+        out.push(("Sync", "castShapes", vec![I(w)]));
+    }
+    out.push(("Sync", "rows", vec![]));
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -636,6 +651,23 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         reference[at("Exceptions", "throwNull", None)],
         "throw java/lang/NullPointerException"
+    );
+    // Monitors: the lock was released when the exception left the block, so it is taken again.
+    assert_eq!(
+        reference[at("Sync", "blockThrows", Some(0))],
+        format!("I {:08x}", -1i32 as u32)
+    );
+    assert_eq!(
+        reference[at("Sync", "nullLock", None)],
+        "throw java/lang/NullPointerException"
+    );
+    assert_eq!(
+        reference[at("Sync", "castShapes", Some(1))],
+        "throw java/lang/ClassCastException"
+    );
+    assert_eq!(
+        reference[at("Sync", "arrayKinds", Some(0))],
+        format!("I {:08x}", 111)
     );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(

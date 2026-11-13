@@ -35,7 +35,7 @@ const STRING: &str = "java/lang/String";
 const THROWABLE: &str = "java/lang/Throwable";
 
 /// Exceptions the runtime raises itself, in the order of the JABS_VM_* constants.
-const VM_EXCEPTIONS: [(&str, &str); 11] = [
+const VM_EXCEPTIONS: [(&str, &str); 12] = [
     ("java/lang/NullPointerException", "JABS_VM_NULL_POINTER"),
     ("java/lang/ArithmeticException", "JABS_VM_ARITHMETIC"),
     (
@@ -62,6 +62,10 @@ const VM_EXCEPTIONS: [(&str, &str); 11] = [
         "JABS_VM_INITIALIZER",
     ),
     ("java/lang/OutOfMemoryError", "JABS_VM_OUT_OF_MEMORY"),
+    (
+        "java/lang/IllegalMonitorStateException",
+        "JABS_VM_ILLEGAL_MONITOR_STATE",
+    ),
 ];
 
 /// `jabs_pending = <new VM exception>` for one of `VM_EXCEPTIONS`.
@@ -1287,7 +1291,16 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
         }
         Op::CheckCast { class } | Op::InstanceOf { class } => {
             if class.starts_with('[') {
-                bail!("pc {pc}: arrays in casts are not compiled yet");
+                // Array types: checked at runtime against the array's own descriptor.
+                parse_type(class, "cast")?;
+                frame.pop_ref(cx, OBJECT, pc)?;
+                let result = if matches!(insn.op, Op::CheckCast { .. }) {
+                    VType::Obj(unit.intern(class))
+                } else {
+                    VType::I
+                };
+                frame.stack.push(result);
+                return Ok(out);
             }
             if unit.get(class).is_none() || unit.chain(class).is_err() {
                 bail!(
@@ -1389,6 +1402,9 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 // holds a stub (see `emit_stubs`), so subclasses never change this decision.
                 out.resolved = Some(Resolved::Call(CallKind::Virtual { slot, target: key }));
             }
+        }
+        Op::MonitorEnter | Op::MonitorExit => {
+            frame.pop_ref(cx, OBJECT, pc)?;
         }
         Op::AThrow => {
             if unit.get(THROWABLE).is_none() {
@@ -1815,7 +1831,18 @@ fn emit_method(
         "/* {}.{}{} */",
         class.name, method.name, method.descriptor
     );
-    let _ = writeln!(out, "{} {{", prototype(&class.name, method, sig));
+    let synchronized = method.access & ACC_SYNCHRONIZED != 0;
+    if synchronized {
+        // The body gets a private name; the public symbol is the locking wrapper below.
+        let body = format!(
+            "{}__sync",
+            symbol(&class.name, &method.name, &method.descriptor)
+        );
+        let params = c_params(method.access & ACC_STATIC != 0, sig, true);
+        let _ = writeln!(out, "static {} {body}({params}) {{", c_type(sig.ret.code));
+    } else {
+        let _ = writeln!(out, "{} {{", prototype(&class.name, method, sig));
+    }
     let _ = writeln!(
         out,
         "    jabs_value l[{}] = {{{{0}}}};",
@@ -2079,6 +2106,33 @@ fn emit_method(
                     _ => format!("return {v};"),
                 }
             }
+            Op::MonitorEnter => format!(
+                "if (!s[{r}].a) {npe} jabs_monitor_enter(s[{r}].a);",
+                r = d - 1
+            ),
+            Op::MonitorExit => format!(
+                "if (!s[{r}].a) {npe} if (!jabs_monitor_exit(s[{r}].a)) {}",
+                throw("java/lang/IllegalMonitorStateException", exit),
+                r = d - 1
+            ),
+            // Every reference is an Object: the cast always succeeds and instanceof is a null test.
+            Op::CheckCast { class: target } if target == OBJECT => continue,
+            Op::InstanceOf { class: target } if target == OBJECT => {
+                format!("s[{r}].i = s[{r}].a != NULL;", r = d - 1)
+            }
+            Op::CheckCast { class: target } if target.starts_with('[') => format!(
+                "if (s[{r}].a && !jabs_is_array_instance(s[{r}].a, \"{}\", {})) {}",
+                c_escape(target),
+                array_component_record(unit, target),
+                throw("java/lang/ClassCastException", exit),
+                r = d - 1
+            ),
+            Op::InstanceOf { class: target } if target.starts_with('[') => format!(
+                "s[{r}].i = s[{r}].a ? jabs_is_array_instance(s[{r}].a, \"{}\", {}) : 0;",
+                c_escape(target),
+                array_component_record(unit, target),
+                r = d - 1
+            ),
             Op::AThrow => format!(
                 "if (!s[{r}].a) {npe} jabs_pending = s[{r}].a; {exit}",
                 r = d - 1
@@ -2268,6 +2322,48 @@ fn emit_method(
         let _ = writeln!(out, "    {ret_default}");
     }
     let _ = writeln!(out, "}}\n");
+    if synchronized {
+        emit_synchronized_wrapper(out, class, method, sig);
+    }
+}
+
+/// Lock the receiver (or, for static methods, the class's monitor), run the body, and unlock on
+/// both normal and exceptional completion, as the JVM does for ACC_SYNCHRONIZED methods.
+fn emit_synchronized_wrapper(
+    out: &mut String,
+    class: &ClassFile,
+    method: &Member,
+    sig: &Signature,
+) {
+    let is_static = method.access & ACC_STATIC != 0;
+    let name = symbol(&class.name, &method.name, &method.descriptor);
+    let lock = if is_static {
+        // Static methods lock the class. Class objects are not modeled yet, so each class gets a
+        // dedicated monitor object; nothing else can lock it until `X.class` exists.
+        let monitor = mangled("jcm_", &[&class.name]);
+        let _ = writeln!(out, "static jabs_object {monitor};");
+        format!("&{monitor}")
+    } else {
+        "self".to_string()
+    };
+    let mut args: Vec<String> = Vec::new();
+    if !is_static {
+        args.push("self".into());
+    }
+    args.extend((0..sig.params.len()).map(|i| format!("a{i}")));
+    let call = format!("{name}__sync({})", args.join(", "));
+    let _ = writeln!(out, "{} {{", prototype(&class.name, method, sig));
+    let _ = writeln!(out, "    jabs_object *lock = {lock};");
+    let _ = writeln!(out, "    jabs_monitor_enter(lock);");
+    if sig.ret.code == 'V' {
+        let _ = writeln!(out, "    {call};\n    jabs_monitor_exit(lock);\n}}\n");
+    } else {
+        let _ = writeln!(out, "    {} result = {call};", c_type(sig.ret.code));
+        let _ = writeln!(
+            out,
+            "    jabs_monitor_exit(lock);\n    return result;\n}}\n"
+        );
+    }
 }
 
 /// Switch case label; INT32_MIN needs the macro since `-2147483648` is not an int literal in C.
@@ -2412,6 +2508,21 @@ fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>) {
         let _ = writeln!(out, "    return s;\n}}");
     }
     out.push('\n');
+}
+
+/// `&record` of a one-dimensional reference array's element class when the unit has it, else NULL.
+fn array_component_record(unit: &Unit, array: &str) -> String {
+    match element_class(array) {
+        Some(c)
+            if c != OBJECT
+                && !c.starts_with('[')
+                && unit.get(&c).is_some()
+                && (unit.is_interface(&c) || unit.chain(&c).is_ok()) =>
+        {
+            format!("&{}", class_record(&c))
+        }
+        _ => "NULL".to_string(),
+    }
 }
 
 /// C name of the stub that stands in for an implementation that is not compiled.
@@ -2899,6 +3010,13 @@ fn reachable(
                         work.extend(implementations(STRING).into_iter().filter(|k| compiled(k)));
                     }
                 }
+                Op::CheckCast { class } | Op::InstanceOf { class } if class.starts_with('[') => {
+                    if let Some(c) = element_class(class)
+                        .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
+                    {
+                        add_records(&c, &mut out.records);
+                    }
+                }
                 Op::ANewArray { class } | Op::CheckCast { class } | Op::InstanceOf { class }
                     if !class.starts_with('[') && unit.get(class).is_some() =>
                 {
@@ -2931,9 +3049,6 @@ pub fn compile_unit_rooted(
             let result = (|| {
                 if let Some(reason) = &structural {
                     return Err(reason.clone());
-                }
-                if method.access & ACC_SYNCHRONIZED != 0 {
-                    return Err("synchronized methods need monitors".into());
                 }
 
                 let sig = parse_signature(&method.descriptor).map_err(|e| e.to_string())?;

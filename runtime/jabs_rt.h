@@ -43,6 +43,8 @@ typedef struct jabs_class {
 /* Every object starts with this header; the class's own struct embeds it first. */
 typedef struct jabs_object {
     const jabs_class *cls;
+    /* Monitor entry count. The runtime has a single thread, so the owner is always that thread. */
+    uint32_t monitor;
 } jabs_object;
 
 typedef union jabs_value {
@@ -71,7 +73,8 @@ enum {
     JABS_VM_ABSTRACT_METHOD,
     JABS_VM_NO_CLASS_DEF_FOUND,
     JABS_VM_INITIALIZER,
-    JABS_VM_OUT_OF_MEMORY
+    JABS_VM_OUT_OF_MEMORY,
+    JABS_VM_ILLEGAL_MONITOR_STATE
 };
 static jabs_object *jabs_vm_throwable(int kind);
 /* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
@@ -226,22 +229,63 @@ static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, i
     return &a->header;
 }
 
-/* instanceof: walk the superclass chain for classes, the interface list for interfaces.
- * Arrays implement exactly Cloneable and Serializable. */
-static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target) {
+/* Whether class record `c` is `target` or a subtype of it (superclass chain or interface list). */
+static inline int32_t jabs_class_assignable(const jabs_class *c, const jabs_class *target) {
     if (target->is_interface) {
-        if (o->cls == jabs_array_class()) {
-            return strcmp(target->name, "java/lang/Cloneable") == 0 || strcmp(target->name, "java/io/Serializable") == 0;
-        }
-        for (uint32_t i = 0; i < o->cls->interfaces_len; i++) {
-            if (o->cls->interfaces[i] == target) return 1;
+        for (uint32_t i = 0; i < c->interfaces_len; i++) {
+            if (c->interfaces[i] == target) return 1;
         }
         return 0;
     }
-    for (const jabs_class *c = o->cls; c; c = c->super) {
+    for (; c; c = c->super) {
         if (c == target) return 1;
     }
     return 0;
+}
+
+/* instanceof for a class or interface target. Arrays implement exactly Cloneable and Serializable. */
+static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target) {
+    if (o->cls == jabs_array_class()) {
+        return target->is_interface &&
+               (strcmp(target->name, "java/lang/Cloneable") == 0 || strcmp(target->name, "java/io/Serializable") == 0);
+    }
+    return jabs_class_assignable(o->cls, target);
+}
+
+/* instanceof for an array type `target` (a descriptor such as "[I" or "[LShape;"). `component`
+ * is the record of a class element type when the unit has one. Reference arrays are covariant. */
+static inline int32_t jabs_is_array_instance(const jabs_object *o, const char *target, const jabs_class *component) {
+    if (o->cls != jabs_array_class()) return 0;
+    const jabs_array *a = (const jabs_array *)o;
+    if (strcmp(a->descriptor, target) == 0) return 1;
+    int reference = a->descriptor[1] == 'L' || a->descriptor[1] == '[';
+    /* Primitive arrays are instances only of their exact type (checked above). */
+    if (!reference) return 0;
+    if (strcmp(target, "[Ljava/lang/Object;") == 0) return 1;
+    if (target[1] == 'L') {
+        /* Elements that are arrays are Object, Cloneable and Serializable, nothing else. */
+        if (a->descriptor[1] == '[') {
+            return strcmp(target, "[Ljava/lang/Cloneable;") == 0 || strcmp(target, "[Ljava/io/Serializable;") == 0;
+        }
+        switch (a->component_kind) {
+        case JABS_COMPONENT_CLASS: return component && jabs_class_assignable(a->component, component);
+        case JABS_COMPONENT_ANY: return 0; /* an Object[] is only an Object[] */
+        default: break;
+        }
+    } else if (target[1] != '[' || a->descriptor[1] != '[') {
+        return 0; /* never a primitive array; a one-dimensional reference array is never an array of arrays */
+    }
+    jabs_not_compiled("array type test whose element type is outside the unit or multi-dimensional");
+}
+
+/* monitorenter: with a single thread the monitor is always free or already owned. */
+static inline void jabs_monitor_enter(jabs_object *o) { o->monitor++; }
+
+/* monitorexit: 0 means the thread does not own the monitor (IllegalMonitorStateException). */
+static inline int jabs_monitor_exit(jabs_object *o) {
+    if (o->monitor == 0) return 0;
+    o->monitor--;
+    return 1;
 }
 
 /* invokeinterface: binary search the receiver's interface table; NULL if the class does not

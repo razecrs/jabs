@@ -214,6 +214,8 @@ pub enum Op {
     InvokeInterface(MemberRef),
     /// Throw the Throwable on top of the stack.
     AThrow,
+    MonitorEnter,
+    MonitorExit,
 }
 
 /// A resolved field or method reference: owner class, name and descriptor.
@@ -466,6 +468,8 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
         },
         0xbe => ArrayLength,
         0xbf => AThrow,
+        0xc2 => MonitorEnter,
+        0xc3 => MonitorExit,
         0xc0 => CheckCast {
             class: class.class_name(c.u16()?)?.into(),
         },
