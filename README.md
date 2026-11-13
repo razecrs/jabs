@@ -44,11 +44,8 @@ reported per run):
   one-time training start; `jabs run` only uses an existing cache and never
   trains implicitly.
 
-Measured on one Windows machine, 26.3 dedicated server, existing world, time to
-the `Done` line: stock `java -jar` 8.6-9.0 s (3 runs); all three optimizations
-4.4-6.0 s (10 runs, median about 4.6 s). The training start took 38 s. These
-are startup numbers only; gameplay and tick performance are unchanged and not
-yet measured. See `examples/server-profile.json`.
+Measured results live in [`benchmarks/`](benchmarks/), one dated report per run with
+method, raw numbers, machine and caveats. See `examples/server-profile.json`.
 
 JABS **does not launch clients or mod loaders yet, verify bytecode, compile object-using Java,
 or execute mods natively**. `prepare` caches integrity
