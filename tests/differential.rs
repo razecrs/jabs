@@ -256,6 +256,7 @@ int main(void) { return (int)fmod(1.0, 2.0); }
             .arg(&probe)
             .arg("-o")
             .arg(dir.join("probe.exe"))
+            .args(if cfg!(windows) { None } else { Some("-lm") })
             .output()
             .is_ok_and(|o| o.status.success());
         if ok {
