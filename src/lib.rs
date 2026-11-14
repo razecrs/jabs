@@ -3,6 +3,7 @@ pub mod bundler;
 pub mod bytecode;
 pub mod cgen;
 pub mod classfile;
+pub mod client;
 pub mod jar;
 pub mod jdk;
 pub mod launch;

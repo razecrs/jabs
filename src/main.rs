@@ -63,6 +63,31 @@ enum Action {
         #[arg(long)]
         root: Vec<String>,
     },
+    /// Download (verified against Mojang's hashes) and launch a vanilla client on the JVM, offline sign-in.
+    Client {
+        /// Minecraft version id, e.g. `1.21.1`.
+        version: String,
+        /// Offline player name (servers must run with `online-mode=false`).
+        #[arg(long)]
+        username: String,
+        /// Join this server on startup (`host[:port]`).
+        #[arg(long)]
+        server: Option<String>,
+        /// Where versions, libraries and assets are stored.
+        #[arg(long, default_value = "local/minecraft")]
+        root: PathBuf,
+        /// Game directory (saves, options, logs); default `<root>/instances/<version>`.
+        #[arg(long)]
+        game_dir: Option<PathBuf>,
+        /// Java executable; default: the first installed Java matching the version's requirement.
+        #[arg(long)]
+        java: Option<PathBuf>,
+        #[arg(long, default_value = "4G")]
+        max_memory: String,
+        /// Only download and verify; do not launch.
+        #[arg(long)]
+        install_only: bool,
+    },
     /// Launch a profile on the JVM after verifying its artifacts; prints a JSON timing report.
     Run {
         profile: PathBuf,
@@ -171,6 +196,36 @@ fn execute(cli: Cli) -> Result<()> {
             };
             print_json(jabs::launch::run(&profile, &options)?)
         }
+        Action::Client {
+            version,
+            username,
+            server,
+            root,
+            game_dir,
+            java,
+            max_memory,
+            install_only,
+        } => {
+            if install_only {
+                let report = jabs::client::install(&root, &version)?;
+                eprintln!(
+                    "{} installed ({} files downloaded); needs Java {}",
+                    report.version, report.downloaded, report.java_major
+                );
+                return Ok(());
+            }
+            let code = jabs::client::run(&jabs::client::ClientOptions {
+                root: &root,
+                version: &version,
+                username: &username,
+                game_dir: game_dir.as_deref(),
+                server: server.as_deref(),
+                java: java.as_deref(),
+                max_memory: &max_memory,
+            })?;
+            eprintln!("Minecraft exited with code {code}");
+            Ok(())
+        }
         Action::Doctor => {
             let tools: Vec<_> = [("java", "-version"), ("javac", "-version"), ("clang", "--version"), ("rustc", "--version")]
                 .into_iter().map(|(name, arg)| {
@@ -186,7 +241,7 @@ fn execute(cli: Cli) -> Result<()> {
                 serde_json::json!({ "schema_version": 1, "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH, "tools": tools,
                 "capabilities": ["profile_integrity", "metadata_cache", "measurement_summary", "jar_inventory", "single_class_compilation_with_objects", "vanilla_server_launch"],
-                "unimplemented": ["client_launch", "mod_loader_launch", "class_loaders", "threads", "unsafe", "invokedynamic", "cross_class_compilation", "arrays", "garbage_collection", "exception_handlers", "benchmark_capture"],
+                "unimplemented": ["mod_loader_launch", "class_loaders", "threads", "unsafe", "invokedynamic", "cross_class_compilation", "arrays", "garbage_collection", "exception_handlers", "benchmark_capture"],
                 "note": "tool discovery does not establish target or Java-version compatibility" }),
             )
         }
