@@ -36,7 +36,7 @@ const THROWABLE: &str = "java/lang/Throwable";
 const CLASS: &str = "java/lang/Class";
 
 /// Exceptions the runtime raises itself, in the order of the JABS_VM_* constants.
-const VM_EXCEPTIONS: [(&str, &str); 16] = [
+const VM_EXCEPTIONS: [(&str, &str); 18] = [
     ("java/lang/NullPointerException", "JABS_VM_NULL_POINTER"),
     ("java/lang/ArithmeticException", "JABS_VM_ARITHMETIC"),
     (
@@ -77,6 +77,8 @@ const VM_EXCEPTIONS: [(&str, &str); 16] = [
         "JABS_VM_CLASS_NOT_FOUND",
     ),
     ("java/lang/InstantiationException", "JABS_VM_INSTANTIATION"),
+    ("java/io/FileNotFoundException", "JABS_VM_FILE_NOT_FOUND"),
+    ("java/io/SyncFailedException", "JABS_VM_SYNC_FAILED"),
 ];
 
 /// Native methods the runtime implements: (class, name, descriptor) -> C body. `self` and
@@ -384,6 +386,56 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "return 0; /* no GC: nothing is ever pending */",
         needs_classes: false,
     },
+    // Native libraries: JABS links every native statically, so each library is "built in" (the
+    // JDK's own path for statically linked libraries). Its natives are JABS implementations, or
+    // stop with a diagnostic when called; no DLL or shared object is ever loaded.
+    Intrinsic {
+        key: (
+            "java/lang/System",
+            "mapLibraryName",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        ),
+        body: "return jabs_map_library_name(a0);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "jdk/internal/loader/NativeLibraries",
+            "findBuiltinLib",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        ),
+        body: "return a0;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "jdk/internal/loader/NativeLibraries",
+            "load",
+            "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
+        ),
+        body: "(void)a0; (void)a1; (void)a3; return a2 ? 1 : 0; /* built-in libraries are always present */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "jdk/internal/loader/NativeLibraries",
+            "unload",
+            "(Ljava/lang/String;ZJ)V",
+        ),
+        body: "(void)a0; (void)a1; (void)a2;",
+        needs_classes: false,
+    },
+    // The VM's module table: JABS keeps no VM-side module state (every class is compiled in, and
+    // module access is not enforced yet), so registering modules has nothing to update.
+    Intrinsic {
+        key: (
+            "jdk/internal/loader/BootLoader",
+            "setBootLoaderUnnamedModule0",
+            "(Ljava/lang/Module;)V",
+        ),
+        body: "(void)a0;",
+        needs_classes: false,
+    },
     // Class data sharing: a native program has no CDS archive, so nothing is shared or dumped.
     Intrinsic {
         key: ("jdk/internal/misc/CDS", "getCDSConfigStatus", "()I"),
@@ -472,6 +524,27 @@ const INTRINSICS: &[Intrinsic] = &[
 /// Java (not native) methods JABS replaces, with the reason. Each is behavior-preserving for a
 /// program JABS can run today: (class, name, descriptor) -> C body.
 const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
+    // VarHandles are made by the runtime: a field offset (or static address, or array layout)
+    // plus the value type; accesses compile to memory operations at each call site. Not yet
+    // checked: the lookup's access rights. Static handles initialize the class when created.
+    (
+        "java/lang/invoke/MethodHandles$Lookup",
+        "findVarHandle",
+        "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
+        "(void)self; return jabs_var_handle_field(a0, a1, a2, 0);",
+    ),
+    (
+        "java/lang/invoke/MethodHandles$Lookup",
+        "findStaticVarHandle",
+        "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
+        "(void)self; return jabs_var_handle_field(a0, a1, a2, 1);",
+    ),
+    (
+        "java/lang/invoke/MethodHandles",
+        "arrayElementVarHandle",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
+        "return jabs_var_handle_array(a0);",
+    ),
     // The JDK's version goes through Constructor objects and method handles; the effect is the
     // same: run the public no-arg constructor (its exceptions propagate unwrapped).
     // Not yet checked: the caller's access to the class and constructor.
@@ -490,6 +563,12 @@ const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
         "(void)a0; /* JABS: no GC yet, so no Reference Handler thread */",
     ),
     (
+        "jdk/internal/ref/CleanerImpl",
+        "start",
+        "(Ljava/lang/ref/Cleaner;Ljava/util/concurrent/ThreadFactory;)V",
+        "(void)self; (void)a0; (void)a1; /* JABS: no GC yet, so no Cleaner thread (nothing becomes phantom-reachable) */",
+    ),
+    (
         "java/lang/ref/Finalizer",
         "startFinalizerThread",
         "(Ljava/lang/ThreadGroup;)V",
@@ -499,11 +578,418 @@ const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
 
 /// The C body replacing a Java method, if JABS replaces it.
 fn replacement(key: &MethodKey) -> Option<(String, bool)> {
+    // JDK 25 walks the stack with StackWalker (a lambda); JABS walks native frames instead.
+    if key.0 == "java/lang/SecurityManager"
+        && key.1 == "getClassContext"
+        && key.2 == "()[Ljava/lang/Class;"
+    {
+        return Some((
+            format!(
+                "(void)self; return jabs_class_context((const void *)&{});",
+                symbol(&key.0, &key.1, &key.2)
+            ),
+            true,
+        ));
+    }
     REPLACEMENTS
         .iter()
         .find(|r| r.0 == key.0 && r.1 == key.1 && r.2 == key.2)
-        .map(|r| (r.3.to_string(), r.0 == CLASS))
+        .map(|r| {
+            (
+                r.3.to_string(),
+                r.0 == CLASS || r.3.contains("jabs_var_handle"),
+            )
+        })
 }
+
+/// java.io natives: both file systems (Windows and Unix JDKs) and the file streams, all calling
+/// the OS-neutral glue in runtime/jabs_io.c. (class, name, descriptor, body).
+const IO_NATIVES: &[(&str, &str, &str, &str)] = &[
+    (
+        "java/io/WinNTFileSystem",
+        "initIDs",
+        "()V",
+        "/* field offsets are known at compile time */",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "getBooleanAttributes0",
+        "(Ljava/io/File;)I",
+        "return jabs_io_attributes(a0, 1);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "checkAccess0",
+        "(Ljava/io/File;I)Z",
+        "return jabs_io_check_access(a0, a1);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "getLastModifiedTime0",
+        "(Ljava/io/File;)J",
+        "return jabs_io_last_modified(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "getLength0",
+        "(Ljava/io/File;)J",
+        "return jabs_io_length(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "setPermission0",
+        "(Ljava/io/File;IZZ)Z",
+        "return jabs_io_set_permission(a0, a1, a2, a3);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "createFileExclusively0",
+        "(Ljava/lang/String;)Z",
+        "return jabs_io_create_exclusively(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "list0",
+        "(Ljava/io/File;)[Ljava/lang/String;",
+        "return jabs_io_list(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "createDirectory0",
+        "(Ljava/io/File;)Z",
+        "return jabs_io_create_directory(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "setLastModifiedTime0",
+        "(Ljava/io/File;J)Z",
+        "return jabs_io_set_last_modified(a0, a1);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "setReadOnly0",
+        "(Ljava/io/File;)Z",
+        "return jabs_io_set_read_only(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "delete0",
+        "(Ljava/io/File;Z)Z",
+        "return jabs_io_delete(a0, a1);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "delete0",
+        "(Ljava/io/File;)Z",
+        "return jabs_io_delete(a0, 1);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "rename0",
+        "(Ljava/io/File;Ljava/io/File;)Z",
+        "return jabs_io_rename(a0, a1);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "listRoots0",
+        "()I",
+        "return jabs_fs_roots();",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "getSpace0",
+        "(Ljava/io/File;I)J",
+        "return jabs_io_space(a0, a1);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "getNameMax0",
+        "(Ljava/lang/String;)I",
+        "(void)a0; return 255;",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "canonicalize0",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        "return jabs_io_canonicalize(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "getFinalPath0",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        "return jabs_io_final_path(a0);",
+    ),
+    (
+        "java/io/WinNTFileSystem",
+        "getDriveDirectory",
+        "(I)Ljava/lang/String;",
+        "return jabs_io_drive_directory(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "initIDs",
+        "()V",
+        "/* field offsets are known at compile time */",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "getBooleanAttributes0",
+        "(Ljava/io/File;)I",
+        "return jabs_io_attributes(a0, 0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "checkAccess0",
+        "(Ljava/io/File;I)Z",
+        "return jabs_io_check_access(a0, a1);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "getLastModifiedTime0",
+        "(Ljava/io/File;)J",
+        "return jabs_io_last_modified(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "getLength0",
+        "(Ljava/io/File;)J",
+        "return jabs_io_length(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "setPermission0",
+        "(Ljava/io/File;IZZ)Z",
+        "return jabs_io_set_permission(a0, a1, a2, a3);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "createFileExclusively0",
+        "(Ljava/lang/String;)Z",
+        "return jabs_io_create_exclusively(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "list0",
+        "(Ljava/io/File;)[Ljava/lang/String;",
+        "return jabs_io_list(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "createDirectory0",
+        "(Ljava/io/File;)Z",
+        "return jabs_io_create_directory(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "setLastModifiedTime0",
+        "(Ljava/io/File;J)Z",
+        "return jabs_io_set_last_modified(a0, a1);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "setReadOnly0",
+        "(Ljava/io/File;)Z",
+        "return jabs_io_set_read_only(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "delete0",
+        "(Ljava/io/File;Z)Z",
+        "return jabs_io_delete(a0, a1);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "delete0",
+        "(Ljava/io/File;)Z",
+        "return jabs_io_delete(a0, 1);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "rename0",
+        "(Ljava/io/File;Ljava/io/File;)Z",
+        "return jabs_io_rename(a0, a1);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "listRoots0",
+        "()I",
+        "return jabs_fs_roots();",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "getSpace0",
+        "(Ljava/io/File;I)J",
+        "return jabs_io_space(a0, a1);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "getNameMax0",
+        "(Ljava/lang/String;)I",
+        "(void)a0; return 255;",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "canonicalize0",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        "return jabs_io_canonicalize(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "getFinalPath0",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        "return jabs_io_final_path(a0);",
+    ),
+    (
+        "java/io/UnixFileSystem",
+        "getDriveDirectory",
+        "(I)Ljava/lang/String;",
+        "return jabs_io_drive_directory(a0);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "open0",
+        "(Ljava/lang/String;)V",
+        "jabs_io_open(self, a0, JABS_OPEN_READ);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "read0",
+        "()I",
+        "return jabs_io_read_byte(self);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "readBytes",
+        "([BII)I",
+        "return jabs_io_read_bytes(self, a0, a1, a2);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "length0",
+        "()J",
+        "return jabs_io_stream_length(self);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "position0",
+        "()J",
+        "return jabs_io_position(self);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "skip0",
+        "(J)J",
+        "return jabs_io_skip(self, a0);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "available0",
+        "()I",
+        "return jabs_io_available(self);",
+    ),
+    (
+        "java/io/FileInputStream",
+        "isRegularFile0",
+        "(Ljava/io/FileDescriptor;)Z",
+        "return jabs_io_is_regular(a0);",
+    ),
+    (
+        "java/io/FileOutputStream",
+        "open0",
+        "(Ljava/lang/String;Z)V",
+        "jabs_io_open(self, a0, JABS_OPEN_WRITE | JABS_OPEN_CREATE | (a1 ? JABS_OPEN_APPEND : JABS_OPEN_TRUNCATE));",
+    ),
+    (
+        "java/io/FileOutputStream",
+        "write",
+        "(IZ)V",
+        "(void)a1; jabs_io_write_byte(self, a0);",
+    ),
+    (
+        "java/io/FileOutputStream",
+        "writeBytes",
+        "([BIIZ)V",
+        "(void)a3; jabs_io_write_bytes(self, a0, a1, a2);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "initIDs",
+        "()V",
+        "/* field offsets are known at compile time */",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "open0",
+        "(Ljava/lang/String;I)V",
+        "jabs_io_open(self, a0, jabs_io_raf_flags(a1));",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "read0",
+        "()I",
+        "return jabs_io_read_byte(self);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "readBytes0",
+        "([BII)I",
+        "return jabs_io_read_bytes(self, a0, a1, a2);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "write0",
+        "(I)V",
+        "jabs_io_write_byte(self, a0);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "writeBytes0",
+        "([BII)V",
+        "jabs_io_write_bytes(self, a0, a1, a2);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "getFilePointer",
+        "()J",
+        "return jabs_io_position(self);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "seek0",
+        "(J)V",
+        "jabs_io_seek(self, a0);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "length0",
+        "()J",
+        "return jabs_io_stream_length(self);",
+    ),
+    (
+        "java/io/RandomAccessFile",
+        "setLength0",
+        "(J)V",
+        "jabs_io_set_length(self, a0);",
+    ),
+    (
+        "java/io/FileDescriptor",
+        "close0",
+        "()V",
+        "jabs_io_close_descriptor(self);",
+    ),
+    (
+        "java/io/FileDescriptor",
+        "sync0",
+        "()V",
+        "jabs_io_sync(self);",
+    ),
+    (
+        "java/io/FileCleanable",
+        "cleanupClose0",
+        "(IJ)V",
+        "(void)a1; jabs_io_cleanup_close(a0);",
+    ),
+];
 
 /// The runtime's C body for a native method, if it implements one (and the unit can support it).
 fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(String, bool)> {
@@ -539,27 +1025,26 @@ fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(String, bool)>
             return Some((body, false));
         }
     }
-    if key.0 == "java/io/FileOutputStream" {
-        // this.fd.fd, the int descriptor (stdout 1, stderr 2; files are not opened yet).
-        let fd = format!(
-            "jabs_object *fdo = (({} *)self)->{}; if (!fdo) {{ jabs_pending = jabs_vm_throwable(JABS_VM_IO); return; }} int32_t fd = (({} *)fdo)->{};",
-            object_struct("java/io/FileOutputStream"),
-            instance_field("fd"),
-            object_struct("java/io/FileDescriptor"),
-            instance_field("fd")
-        );
-        let body = match (key.1.as_str(), key.2.as_str()) {
-            ("writeBytes", "([BIIZ)V") => format!(
-                "(void)a3; {fd} if (!a0) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }} jabs_array *b = (jabs_array *)a0; if (a1 < 0 || a2 < 0 || a2 > b->length - a1) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return; }} if (jabs_platform_write(fd, (const char *)jabs_array_data(b) + a1, (size_t)a2) < 0) jabs_pending = jabs_vm_throwable(JABS_VM_IO);"
-            ),
-            ("write", "(IZ)V") => format!(
-                "(void)a1; {fd} unsigned char byte = (unsigned char)a0; if (jabs_platform_write(fd, &byte, 1) < 0) jabs_pending = jabs_vm_throwable(JABS_VM_IO);"
-            ),
-            _ => String::new(),
-        };
-        if !body.is_empty() {
-            return Some((body, false));
-        }
+    if key.0 == "java/lang/SecurityManager"
+        && key.1 == "getClassContext"
+        && key.2 == "()[Ljava/lang/Class;"
+    {
+        return classes_available.then(|| {
+            (
+                format!(
+                    "(void)self; return jabs_class_context((const void *)&{});",
+                    symbol(&key.0, &key.1, &key.2)
+                ),
+                true,
+            )
+        });
+    }
+    if let Some(row) = IO_NATIVES
+        .iter()
+        .find(|r| r.0 == key.0 && r.1 == key.1 && r.2 == key.2)
+    {
+        // The glue in jabs_io.c uses the registry's String and array helpers.
+        return classes_available.then(|| (row.3.to_string(), true));
     }
     if key.0 == UNSAFE
         && let Some((body, needs_classes)) = unsafe_intrinsic(&key.1, &key.2)
@@ -1488,6 +1973,9 @@ enum CallKind {
 #[derive(Debug, Clone)]
 enum Resolved {
     Call(CallKind),
+    /// A signature-polymorphic VarHandle access (`get`, `compareAndSet`, ...): compiled to a
+    /// memory operation on the address the handle describes.
+    VarHandle(String),
     /// Field access resolved to its declaring class.
     Field(String),
     /// Array access: the element descriptor char of the array's static type (`Z` vs `B` matters
@@ -2142,6 +2630,19 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             out.deps.push(Dep::Method(key.clone()));
             out.resolved = Some(Resolved::Call(CallKind::Direct(key)));
         }
+        Op::InvokeVirtual(m) if m.class == VAR_HANDLE && var_handle_mode(&m.name).is_some() => {
+            // Signature polymorphic: the call site's descriptor is the access's type.
+            let s = parse_signature(&m.descriptor)?;
+            for p in s.params.iter().rev() {
+                frame.pop_ty(cx, p, pc)?;
+            }
+            frame.pop_ref(cx, VAR_HANDLE, pc)?;
+            if s.ret.code != 'V' {
+                frame.stack.push(cx.of_ty(&s.ret));
+            }
+            out.resolved = Some(Resolved::VarHandle(m.name.clone()));
+            return Ok(out);
+        }
         Op::InvokeVirtual(m) => {
             if m.name.starts_with('<') {
                 bail!("pc {pc}: invokevirtual of {}", m.name);
@@ -2619,10 +3120,186 @@ fn c_params(is_static: bool, sig: &Signature, names: bool) -> String {
 /// C function prototype for a compiled method.
 fn prototype(class: &str, method: &Member, sig: &Signature) -> String {
     format!(
-        "{} {}({})",
+        "JABS_METHOD {} {}({})",
         c_type(sig.ret.code),
         symbol(class, &method.name, &method.descriptor),
         c_params(method.access & ACC_STATIC != 0, sig, true)
+    )
+}
+
+const VAR_HANDLE: &str = "java/lang/invoke/VarHandle";
+
+/// What a VarHandle access mode does, and how many values it takes after the coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VarHandleOp {
+    Get,
+    Set,
+    CompareAndSet,
+    CompareAndExchange,
+    GetAndSet,
+    GetAndAdd,
+    GetAndBitwise(char),
+}
+
+/// The access mode named `name` (all memory orders are equal with one thread).
+fn var_handle_mode(name: &str) -> Option<(VarHandleOp, usize)> {
+    let base = name
+        .strip_suffix("Acquire")
+        .or_else(|| name.strip_suffix("Release"))
+        .or_else(|| name.strip_suffix("Volatile"))
+        .or_else(|| name.strip_suffix("Opaque"))
+        .or_else(|| name.strip_suffix("Plain"))
+        .unwrap_or(name);
+    Some(match base {
+        "get" => (VarHandleOp::Get, 0),
+        "set" => (VarHandleOp::Set, 1),
+        "compareAndSet" | "weakCompareAndSet" => (VarHandleOp::CompareAndSet, 2),
+        "compareAndExchange" => (VarHandleOp::CompareAndExchange, 2),
+        "getAndSet" => (VarHandleOp::GetAndSet, 1),
+        "getAndAdd" => (VarHandleOp::GetAndAdd, 1),
+        "getAndBitwiseOr" => (VarHandleOp::GetAndBitwise('|'), 1),
+        "getAndBitwiseAnd" => (VarHandleOp::GetAndBitwise('&'), 1),
+        "getAndBitwiseXor" => (VarHandleOp::GetAndBitwise('^'), 1),
+        _ => return None,
+    })
+}
+
+/// C for one VarHandle access at a call site. The coordinates (none: static field; receiver:
+/// instance field; array and index: element) come from the descriptor; the handle's own field
+/// type must equal the call site's value type, otherwise the access stops with a diagnostic
+/// (JABS does not apply VarHandle's asType conversions yet).
+fn var_handle_access(mode: &str, descriptor: &str, d: usize, exit: &str, npe: &str) -> String {
+    let (op, values) = var_handle_mode(mode).expect("resolved as a VarHandle mode");
+    let sig = parse_signature(descriptor).unwrap();
+    let base = d - sig.params.len();
+    let handle = base - 1;
+    let stop = |why: &str| {
+        format!(
+            "jabs_not_compiled(\"VarHandle.{mode}{} ({why})\");",
+            c_escape(descriptor)
+        )
+    };
+    let Some(coordinates) = sig.params.len().checked_sub(values).filter(|c| *c <= 2) else {
+        return stop("unexpected argument count");
+    };
+    let value_ty = if values > 0 {
+        sig.params[coordinates].code
+    } else {
+        sig.ret.code
+    };
+    let ret = sig.ret.code;
+    let ret_ok = match op {
+        VarHandleOp::Set => ret == 'V',
+        VarHandleOp::CompareAndSet => ret == 'Z',
+        _ => ret == value_ty || ret == 'V',
+    };
+    let coordinate_ok = match coordinates {
+        1 => sig.params[0].code == 'L',
+        2 => sig.params[0].code == 'L' && sig.params[1].code == 'I',
+        _ => true,
+    };
+    if !ret_ok
+        || !coordinate_ok
+        || value_ty == 'V'
+        || sig.params[coordinates..].iter().any(|p| p.code != value_ty)
+    {
+        return stop("call-site types JABS does not convert yet");
+    }
+    let c = match value_ty {
+        'Z' => "uint8_t",
+        'B' => "int8_t",
+        'C' => "uint16_t",
+        'S' => "int16_t",
+        'I' => "int32_t",
+        'J' => "int64_t",
+        'F' => "float",
+        'D' => "double",
+        _ => "jabs_object *",
+    };
+    let slot = field(kind_of(value_ty).unwrap());
+    let kind = if value_ty == 'L' { 'L' } else { value_ty };
+    let value = |i: usize| {
+        let v = format!("s[{}].{slot}", base + coordinates + i);
+        if value_ty == 'Z' {
+            format!("(uint8_t)({v} & 1)")
+        } else {
+            format!("({c}){v}")
+        }
+    };
+    let object = if coordinates >= 1 {
+        format!("s[{base}].a")
+    } else {
+        "NULL".into()
+    };
+    let index = if coordinates == 2 {
+        format!("s[{}].i", base + 1)
+    } else {
+        "0".into()
+    };
+    // Equality as VarHandle defines it: bitwise for float and double.
+    let same = |a: &str, b: &str| {
+        if matches!(value_ty, 'F' | 'D') {
+            format!("memcmp(&{a}, &{b}, sizeof({c})) == 0")
+        } else {
+            format!("{a} == {b}")
+        }
+    };
+    let store_check = |v: &str| {
+        if coordinates == 2 && value_ty == 'L' {
+            format!(
+                "if (!jabs_array_store_ok((jabs_array *){object}, {v})) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_STORE); {exit} }} "
+            )
+        } else {
+            String::new()
+        }
+    };
+    let result = |expr: &str| {
+        if ret == 'V' {
+            format!("(void)({expr});")
+        } else {
+            format!("s[{handle}].{} = {expr};", field(kind_of(ret).unwrap()))
+        }
+    };
+    let body = match op {
+        VarHandleOp::Get => result("*p"),
+        VarHandleOp::Set => format!("{c} v = {}; {}*p = v;", value(0), store_check("v")),
+        VarHandleOp::CompareAndSet => format!(
+            "{c} e = {}; {c} n = {}; int32_t r = 0; if ({}) {{ {}*p = n; r = 1; }} {}",
+            value(0),
+            value(1),
+            same("(*p)", "e"),
+            store_check("n"),
+            result("r")
+        ),
+        VarHandleOp::CompareAndExchange => format!(
+            "{c} e = {}; {c} n = {}; {c} old = *p; if ({}) {{ {}*p = n; }} {}",
+            value(0),
+            value(1),
+            same("old", "e"),
+            store_check("n"),
+            result("old")
+        ),
+        VarHandleOp::GetAndSet => format!(
+            "{c} v = {}; {c} old = *p; {}*p = v; {}",
+            value(0),
+            store_check("v"),
+            result("old")
+        ),
+        VarHandleOp::GetAndAdd if !matches!(value_ty, 'L' | 'Z') => format!(
+            "{c} v = {}; {c} old = *p; *p = ({c})(old + v); {}",
+            value(0),
+            result("old")
+        ),
+        VarHandleOp::GetAndBitwise(bit) if !matches!(value_ty, 'L' | 'F' | 'D') => format!(
+            "{c} v = {}; {c} old = *p; *p = ({c})(old {bit} v); {}",
+            value(0),
+            result("old")
+        ),
+        _ => return stop("an access mode this type does not support"),
+    };
+    format!(
+        "{{ if (!s[{handle}].a) {npe} const jabs_vh *h = jabs_vh_of(s[{handle}].a); if (!h || h->shape != {coordinates} || h->kind != '{kind}') {} {c} *p = ({c} *)jabs_vh_address(h, {object}, {index}); if (!p) {exit} {body} }}",
+        stop("a handle whose shape or type differs from the call site")
     )
 }
 
@@ -3016,6 +3693,9 @@ fn emit_method(
             | Op::InvokeInterface(MemberRef { descriptor, .. }) => match resolved {
                 Some(Resolved::Call(CallKind::ObjectInit)) => {
                     "/* java/lang/Object.<init>()V has no effect */".into()
+                }
+                Some(Resolved::VarHandle(mode)) => {
+                    var_handle_access(mode, descriptor, d, exit, &npe)
                 }
                 Some(Resolved::Call(kind)) if caller_sensitive(unit, &insn.op) => format!(
                     "{{ const char *jabs_saved_caller = jabs_caller; jabs_caller = \"{}\"; {} jabs_caller = jabs_saved_caller; }}",
@@ -3703,20 +4383,36 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
 /// Emit the Class-object registry: one java.lang.Class per name, created on first use with the
 /// fields the JVM itself fills in (name, componentType, modifiers, primitive). Class loaders are
 /// not modeled: every class reports the boot loader (null).
+/// What the class registry needs from the rest of the compilation.
+struct RegistryInputs<'a> {
+    app_classes: &'a BTreeSet<String>,
+    java_home: Option<&'a str>,
+    inits: &'a BTreeSet<String>,
+    methods: &'a BTreeSet<MethodKey>,
+    interfaces: &'a BTreeSet<&'a str>,
+}
+
 fn emit_class_registry(
     out: &mut String,
     unit: &Unit,
     recorded: &[&ClassFile],
-    app_classes: &BTreeSet<String>,
-    java_home: Option<&str>,
-    inits: &BTreeSet<String>,
-    methods: &BTreeSet<MethodKey>,
+    inputs: &RegistryInputs,
 ) {
+    let RegistryInputs {
+        app_classes,
+        java_home,
+        inits,
+        methods,
+        interfaces,
+    } = *inputs;
     let class_struct = object_struct(CLASS);
     let string_struct = object_struct(STRING);
+    // Classes and interfaces: lookups by name (Class objects, forName) must find both.
     let records: Vec<String> = recorded
         .iter()
-        .map(|c| format!("&{}", class_record(&c.name)))
+        .map(|c| c.name.as_str())
+        .chain(interfaces.iter().copied())
+        .map(|name| format!("&{}", class_record(name)))
         .collect();
     let _ = writeln!(
         out,
@@ -3758,7 +4454,7 @@ static const jabs_class *jabs_record_named(const char *name) {{
 }}
 
 /* Build a String from UTF-8 text (compact Latin-1 when every char fits, else UTF-16). */
-static jabs_object *jabs_string_from_utf8(const char *text) {{
+jabs_object *jabs_string_from_utf8(const char *text) {{
     size_t n = strlen(text), count = 0;
     uint16_t *units = (uint16_t *)malloc((n + 1) * sizeof(uint16_t));
     if (!units) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
@@ -3880,7 +4576,7 @@ int32_t jabs_class_is_instance(jabs_object *c, jabs_object *o) {{
         return jabs_is_array_instance(o, e->name, component);
     }}
     if (e->record) return jabs_is_instance(o, e->record);
-    jabs_not_compiled("Class.isInstance for a class outside the unit");
+    jabs_not_compiled_class("Class.isInstance for a class without a compiled record", e->name);
 }}
 
 /* Class.isAssignableFrom(other) for non-null other. */
@@ -3891,11 +4587,11 @@ int32_t jabs_class_assignable_from(jabs_object *c, jabs_object *other) {{
     if (strcmp(a->name, "java/lang/Object") == 0) return 1;
     if (b->name[0] == '[') {{
         if (a->name[0] != '[') return strcmp(a->name, "java/lang/Cloneable") == 0 || strcmp(a->name, "java/io/Serializable") == 0;
-        jabs_not_compiled("Class.isAssignableFrom between two array types");
+        jabs_not_compiled_class("Class.isAssignableFrom between two array types", a->name);
     }}
     if (a->name[0] == '[') return 0;
     if (a->record && b->record) return jabs_class_assignable(b->record, a->record);
-    jabs_not_compiled("Class.isAssignableFrom for a class outside the unit");
+    jabs_not_compiled_class("Class.isAssignableFrom for a class without a compiled record", a->record ? b->name : a->name);
 }}
 
 /* Unsafe.arrayIndexScale0: element size of an array class. */
@@ -3927,7 +4623,7 @@ jabs_object *jabs_class_superclass(jabs_object *c) {{
     jabs_class_entry *e = jabs_class_entry_of(c);
     if (!e || jabs_is_primitive_name(e->name) || strcmp(e->name, "java/lang/Object") == 0) return NULL;
     if (e->name[0] == '[') return jabs_class_object("java/lang/Object");
-    if (!e->record) jabs_not_compiled("Class.getSuperclass for a class outside the unit");
+    if (!e->record) jabs_not_compiled_class("Class.getSuperclass for a class without a compiled record", e->name);
     if (e->record->is_interface) return NULL;
     return jabs_class_object(e->record->super ? e->record->super->name : "java/lang/Object");
 }}
@@ -3994,11 +4690,14 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
         value = instance_field("value"),
         coder = instance_field("coder"),
     ));
+    out.push_str(&io_accessor_functions(unit, recorded));
     out.push_str(&app_loader_functions(unit, recorded, app_classes));
     out.push_str(&system_properties_functions(
         unit, java_home, inits, methods,
     ));
     out.push_str(&for_name_function(unit, inits));
+    out.push_str(&var_handle_functions(unit, recorded, inits));
+    out.push_str(&stack_functions(methods));
     out.push_str(&new_instance_function(unit, recorded, methods));
     out.push_str(&main_thread_function(unit, recorded));
     out.push('\n');
@@ -4426,6 +5125,316 @@ jabs_object *jabs_class_new_instance(jabs_object *c) {{
 }}
 "#,
         count = rows.len(),
+    );
+    out
+}
+
+/// Stack walking: which compiled method each native frame belongs to. Every emitted method's
+/// function start is listed with its class; frames whose function is not listed (runtime C
+/// helpers, class initialization wrappers) are not Java frames and are skipped.
+fn stack_functions(methods: &BTreeSet<MethodKey>) -> String {
+    let mut out = String::from(
+        "typedef struct { const void *start; const char *class_name; } jabs_frame_entry;\nstatic jabs_frame_entry jabs_frames[] = {\n",
+    );
+    for (class, name, descriptor) in methods {
+        let _ = writeln!(
+            out,
+            "    {{ (const void *)&{}, \"{}\" }},",
+            symbol(class, name, descriptor),
+            c_escape(class)
+        );
+    }
+    // Runtime functions that stand in for a Java method keep that method's class.
+    out.push_str("    { (const void *)&jabs_class_new_instance, \"java/lang/Class\" },\n    { NULL, NULL }\n};\n");
+    out.push_str(
+        r#"static int jabs_compare_frames(const void *a, const void *b) {
+    uintptr_t x = (uintptr_t)((const jabs_frame_entry *)a)->start, y = (uintptr_t)((const jabs_frame_entry *)b)->start;
+    return x < y ? -1 : x > y;
+}
+
+/* The class of the compiled method whose function starts at `start`, or NULL. */
+static const char *jabs_frame_class(const void *start) {
+    static size_t count;
+    if (!count) {
+        while (jabs_frames[count].start) count++;
+        qsort(jabs_frames, count, sizeof *jabs_frames, jabs_compare_frames);
+    }
+    jabs_frame_entry key = { start, NULL };
+    const jabs_frame_entry *e = (const jabs_frame_entry *)bsearch(&key, jabs_frames, count, sizeof key, jabs_compare_frames);
+    return e ? e->class_name : NULL;
+}
+
+/* Java classes on the stack below the frame of function `from` (its callers, innermost first):
+ * SecurityManager.getClassContext. */
+jabs_object *jabs_class_context(const void *from) {
+    const void *starts[1024];
+    int n = jabs_platform_stack_functions(starts, 1024);
+    int i = 0;
+    while (i < n && starts[i] != from) i++;
+    const char *names[1024];
+    int count = 0;
+    for (i++; i < n; i++) {
+        const char *c = jabs_frame_class(starts[i]);
+        if (c) names[count++] = c;
+    }
+    jabs_object *array = jabs_new_array(count, sizeof(jabs_object *), JABS_COMPONENT_CLASS, &"#,
+    );
+    let _ = write!(out, "{}", class_record(CLASS));
+    out.push_str(
+        r#", "[Ljava/lang/Class;", NULL);
+    if (!array) return NULL;
+    for (int k = 0; k < count; k++) {
+        jabs_object *c = jabs_class_object(names[k]);
+        if (!c) return NULL;
+        ((jabs_object **)jabs_array_data((jabs_array *)array))[k] = c;
+    }
+    return array;
+}
+"#,
+    );
+    out
+}
+
+/// Runtime half of VarHandles: creating handles (instances of VarHandle's record followed by
+/// a `jabs_vh`) and turning coordinates into addresses.
+fn var_handle_functions(unit: &Unit, recorded: &[&ClassFile], inits: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    if !recorded.iter().any(|c| c.name == VAR_HANDLE) {
+        out.push_str(
+            "const jabs_vh *jabs_vh_of(jabs_object *o) { (void)o; return NULL; }\n\
+void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index) { (void)h; (void)o; (void)index; return NULL; }\n\
+jabs_object *jabs_var_handle_field(jabs_object *a, jabs_object *b, jabs_object *c, int32_t s) { (void)a; (void)b; (void)c; (void)s; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n\
+jabs_object *jabs_var_handle_array(jabs_object *a) { (void)a; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n",
+        );
+        return out;
+    }
+    // Static fields of initialized classes, by name, for findStaticVarHandle.
+    let mut rows = Vec::new();
+    for class in inits {
+        let Some(c) = unit.get(class) else { continue };
+        for f in c.fields.iter().filter(|f| f.access & ACC_STATIC != 0) {
+            if let Some(ty) = storage_type(&f.descriptor) {
+                let sym = field_symbol(class, &f.name);
+                // Indented: local to this file (declarations_for skips indented lines).
+                let _ = writeln!(out, " extern {ty} {sym};");
+                rows.push(format!(
+                    "    {{ \"{}\", \"{}\", &{sym} }},",
+                    c_escape(class),
+                    c_escape(&f.name)
+                ));
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "typedef struct {{ const char *class_name, *field_name; void *address; }} jabs_static_field;\nstatic const jabs_static_field jabs_static_fields[] = {{\n{}\n    {{ NULL, NULL, NULL }}\n}};",
+        rows.join("\n")
+    );
+    let _ = write!(
+        out,
+        r#"/* Where a handle's jabs_vh sits: after VarHandle's own (unused) fields. */
+static size_t jabs_vh_offset(void) {{ return ({record}.size + 15) & ~(size_t)15; }}
+
+static jabs_object *jabs_vh_new(char kind, uint8_t shape, int64_t offset, void *address, int32_t scale) {{
+    size_t at = jabs_vh_offset();
+    jabs_object *o = (jabs_object *)calloc(1, at + sizeof(jabs_vh));
+    if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+    jabs_heap_bytes += (int64_t)(at + sizeof(jabs_vh));
+    o->cls = &{record};
+    jabs_vh *h = (jabs_vh *)((char *)o + at);
+    h->kind = kind; h->shape = shape; h->offset = offset; h->address = address; h->scale = scale;
+    return o;
+}}
+
+const jabs_vh *jabs_vh_of(jabs_object *o) {{
+    return o->cls == &{record} ? (const jabs_vh *)((char *)o + jabs_vh_offset()) : NULL;
+}}
+
+void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index) {{
+    switch (h->shape) {{
+    case 0: return h->address;
+    case 1:
+        if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+        return (char *)o + h->offset;
+    default: {{
+        if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+        jabs_array *a = (jabs_array *)o;
+        if (index < 0 || index >= a->length) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return NULL; }}
+        return (char *)jabs_array_data(a) + (size_t)index * (size_t)h->scale;
+    }}
+    }}
+}}
+
+/* The descriptor character of a Class used as a value type: 'I' for int.class, 'L' otherwise. */
+static char jabs_value_kind(jabs_object *type) {{
+    static const char *const names[] = {{ "boolean", "Z", "byte", "B", "char", "C", "short", "S", "int", "I", "long", "J", "float", "F", "double", "D" }};
+    jabs_class_entry *e = jabs_class_entry_of(type);
+    for (size_t i = 0; e && i < 16; i += 2) if (strcmp(e->name, names[i]) == 0) return names[i + 1][0];
+    return 'L';
+}}
+
+/* findVarHandle / findStaticVarHandle. */
+jabs_object *jabs_var_handle_field(jabs_object *declaring, jabs_object *name, jabs_object *type, int32_t is_static) {{
+    if (!declaring || !name || !type) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    char kind = jabs_value_kind(type);
+    if (!is_static) {{
+        int64_t offset = jabs_field_offset(declaring, name);
+        return jabs_pending ? NULL : jabs_vh_new(kind, 1, offset, NULL, 0);
+    }}
+    char field[256];
+    jabs_class_entry *e = jabs_class_entry_of(declaring);
+    if (!e || !jabs_string_to_ascii(name, field, sizeof field)) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    const jabs_init_entry *i = (const jabs_init_entry *)bsearch(e->name, jabs_init_functions, sizeof jabs_init_functions / sizeof *jabs_init_functions - 1, sizeof *i, jabs_compare_init);
+    if (i && i->init() != 0) return NULL;
+    for (const jabs_static_field *f = jabs_static_fields; f->class_name; f++) {{
+        if (strcmp(f->class_name, e->name) == 0 && strcmp(f->field_name, field) == 0) return jabs_vh_new(kind, 0, 0, f->address, 0);
+    }}
+    jabs_not_compiled("findStaticVarHandle for a static field of a class whose initialization was not compiled");
+}}
+
+/* MethodHandles.arrayElementVarHandle. */
+jabs_object *jabs_var_handle_array(jabs_object *array_class) {{
+    jabs_class_entry *e = array_class ? jabs_class_entry_of(array_class) : NULL;
+    if (!e) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    if (e->name[0] != '[') jabs_not_compiled("arrayElementVarHandle of a non-array class (IllegalArgumentException)");
+    char kind = (e->name[1] == 'L' || e->name[1] == '[') ? 'L' : e->name[1];
+    return jabs_vh_new(kind, 2, 0, NULL, jabs_array_scale(array_class));
+}}
+"#,
+        record = class_record(VAR_HANDLE),
+    );
+    out
+}
+
+/// Object-layout accessors the java.io glue (runtime/jabs_io.c) uses, so that glue stays
+/// independent of any one JDK's field layout. Missing classes or fields give a diagnostic stop
+/// (or nothing, for optional fields) instead of a compile error.
+fn io_accessor_functions(unit: &Unit, recorded: &[&ClassFile]) -> String {
+    let has = |class: &str, field: &str, descriptor: &str| {
+        recorded.iter().any(|c| c.name == class)
+            && unit.get(class).is_some_and(|c| {
+                c.fields.iter().any(|f| {
+                    f.name == field && f.descriptor == descriptor && f.access & ACC_STATIC == 0
+                })
+            })
+    };
+    let at = |class: &str, object: &str, field: &str| {
+        format!(
+            "(({} *){object})->{}",
+            object_struct(class),
+            instance_field(field)
+        )
+    };
+    let mut out = String::from("\n/* ---- java.io glue accessors ---- */\n");
+    let file = "java/io/File";
+    if has(file, "path", "Ljava/lang/String;") {
+        let _ = writeln!(
+            out,
+            "jabs_object *jabs_file_path_of(jabs_object *f) {{ return {}; }}",
+            at(file, "f", "path")
+        );
+    } else {
+        out.push_str("jabs_object *jabs_file_path_of(jabs_object *f) { (void)f; jabs_not_compiled(\"java.io.File without a path field\"); }\n");
+    }
+    out.push_str("jabs_object **jabs_stream_fd_slot(jabs_object *s) {\n");
+    for stream in [
+        "java/io/FileInputStream",
+        "java/io/FileOutputStream",
+        "java/io/RandomAccessFile",
+    ] {
+        if has(stream, "fd", "Ljava/io/FileDescriptor;") {
+            let _ = writeln!(
+                out,
+                "    if (jabs_is_instance(s, &{})) return &{};",
+                class_record(stream),
+                at(stream, "s", "fd")
+            );
+        }
+    }
+    out.push_str("    jabs_not_compiled(\"a file stream class without a compiled FileDescriptor field\");\n}\n");
+    let fd = "java/io/FileDescriptor";
+    if has(fd, "fd", "I") {
+        let _ = writeln!(
+            out,
+            "int32_t *jabs_descriptor_fd_slot(jabs_object *d) {{ return &{}; }}",
+            at(fd, "d", "fd")
+        );
+    } else {
+        out.push_str("int32_t *jabs_descriptor_fd_slot(jabs_object *d) { (void)d; jabs_not_compiled(\"FileDescriptor without an fd field\"); }\n");
+    }
+    // Windows FileDescriptors also carry a HANDLE; JABS uses the C runtime descriptor instead.
+    if has(fd, "handle", "J") {
+        let _ = writeln!(
+            out,
+            "void jabs_descriptor_set_handle(jabs_object *d, int64_t h) {{ {} = h; }}",
+            at(fd, "d", "handle")
+        );
+    } else {
+        out.push_str(
+            "void jabs_descriptor_set_handle(jabs_object *d, int64_t h) { (void)d; (void)h; }\n",
+        );
+    }
+    if has(fd, "append", "Z") {
+        let _ = writeln!(
+            out,
+            "void jabs_descriptor_set_append(jabs_object *d, int32_t a) {{ {} = (uint8_t)a; }}",
+            at(fd, "d", "append")
+        );
+    } else {
+        out.push_str(
+            "void jabs_descriptor_set_append(jabs_object *d, int32_t a) { (void)d; (void)a; }\n",
+        );
+    }
+    let _ = writeln!(
+        out,
+        "jabs_object *jabs_new_string_array(int32_t n) {{ return jabs_new_array(n, sizeof(jabs_object *), JABS_COMPONENT_CLASS, &{}, \"[Ljava/lang/String;\", NULL); }}",
+        class_record(STRING)
+    );
+    // An exception the runtime raises, with a message (detailMessage), as the JDK's natives do.
+    if has(THROWABLE, "detailMessage", "Ljava/lang/String;") {
+        let _ = writeln!(
+            out,
+            "void jabs_raise_message(int kind, const char *utf8) {{ jabs_object *e = jabs_vm_throwable(kind); jabs_object *m = utf8 ? jabs_string_from_utf8(utf8) : NULL; if (m) {} = m; jabs_pending = e; }}",
+            at(THROWABLE, "e", "detailMessage")
+        );
+    } else {
+        out.push_str("void jabs_raise_message(int kind, const char *utf8) { (void)utf8; jabs_pending = jabs_vm_throwable(kind); }\n");
+    }
+    let _ = write!(
+        out,
+        r#"/* A String's contents as malloc'd UTF-8 (unpaired surrogates become U+FFFD). */
+char *jabs_string_to_utf8(jabs_object *s) {{
+    if (!s) return NULL;
+    jabs_array *v = (jabs_array *)(({st} *)s)->{value};
+    int utf16 = (({st} *)s)->{coder} != 0;
+    int32_t n = utf16 ? v->length / 2 : v->length;
+    const unsigned char *b = (const unsigned char *)jabs_array_data(v);
+    char *out = (char *)malloc((size_t)n * 3 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (int32_t i = 0; i < n; i++) {{
+        uint32_t c;
+        if (!utf16) c = b[i];
+        else {{
+            uint16_t u; memcpy(&u, b + 2 * i, 2); c = u;
+            if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {{
+                uint16_t lo; memcpy(&lo, b + 2 * (i + 1), 2);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {{ c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00); i++; }}
+                else c = 0xFFFD;
+            }} else if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD;
+        }}
+        if (c < 0x80) out[o++] = (char)c;
+        else if (c < 0x800) {{ out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }}
+        else if (c < 0x10000) {{ out[o++] = (char)(0xE0 | (c >> 12)); out[o++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[o++] = (char)(0x80 | (c & 0x3F)); }}
+        else {{ out[o++] = (char)(0xF0 | (c >> 18)); out[o++] = (char)(0x80 | ((c >> 12) & 0x3F)); out[o++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[o++] = (char)(0x80 | (c & 0x3F)); }}
+    }}
+    out[o] = 0;
+    return out;
+}}
+"#,
+        st = object_struct(STRING),
+        value = instance_field("value"),
+        coder = instance_field("coder"),
     );
     out
 }
@@ -4973,6 +5982,10 @@ fn reachable(
     // Rapid Type Analysis: an implementation is reachable only when its class is instantiated AND
     // some reachable code calls its (name, descriptor) virtually or through an interface.
     let mut called: BTreeSet<(String, String)> = BTreeSet::new();
+    // A whole program's VarHandles are runtime-made instances of VarHandle's record.
+    if roots.contains(APP_LOADER) && unit.get(VAR_HANDLE).is_some() {
+        add_records(VAR_HANDLE, &mut out.records);
+    }
     // Classes observed loading on the JVM may be loaded by name and created with newInstance.
     for name in loaded.iter().map(String::as_str) {
         let Some(class) = unit.get(name) else {
@@ -5102,7 +6115,14 @@ fn reachable(
                         }));
                     }
                 }
-                Op::LdcClass(_) => needs_classes = true,
+                // A class literal is what reflection works on (isAssignableFrom, isInstance,
+                // getSuperclass), so its class keeps a record.
+                Op::LdcClass(name) => {
+                    needs_classes = true;
+                    if !name.starts_with('[') && unit.get(name).is_some() {
+                        add_records(name, &mut out.records);
+                    }
+                }
                 Op::LdcString(_) => {
                     add_records(STRING, &mut out.records);
                     if out.instantiated.insert(STRING.to_string()) {
@@ -5159,6 +6179,10 @@ const VM_PREINITIALIZED: &[&str] = &[
 
 /// Host queries and standard-stream I/O (handwritten, OS-specific).
 const PLATFORM_C: &str = include_str!("../runtime/jabs_platform.c");
+/// Files and descriptors (handwritten, OS-specific).
+const FILES_C: &str = include_str!("../runtime/jabs_files.c");
+/// java.io natives' Java-side glue (handwritten, OS-neutral; needs the class registry).
+const IO_C: &str = include_str!("../runtime/jabs_io.c");
 
 /// What a program needs beyond its classes.
 #[derive(Default)]
@@ -5426,16 +6450,20 @@ pub fn compile_unit_with(
     }
     let registry =
         have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING);
+    let registry_emitted = registry;
     emit_literals(&mut source, &literals, registry);
     if registry {
         emit_class_registry(
             &mut source,
             &unit,
             &recorded,
-            &extras.app_classes,
-            extras.java_home.as_deref(),
-            &emission.inits,
-            &emission.methods,
+            &RegistryInputs {
+                app_classes: &extras.app_classes,
+                java_home: extras.java_home.as_deref(),
+                inits: &emission.inits,
+                methods: &emission.methods,
+                interfaces: &interface_records,
+            },
         );
     }
     for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
@@ -5537,6 +6565,12 @@ pub fn compile_unit_with(
             method_texts.concat(),
             resources_file(&extras.resources).replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &PLATFORM_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                + &FILES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                + &(if registry_emitted {
+                    IO_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                } else {
+                    String::new()
+                })
         ),
         c_files: {
             let header = format!(
@@ -5552,6 +6586,10 @@ pub fn compile_unit_with(
             ];
             files.push(("resources.c".to_string(), resources_file(&extras.resources)));
             files.push(("jabs_platform.c".to_string(), PLATFORM_C.to_string()));
+            files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
+            if registry_emitted {
+                files.push(("jabs_io.c".to_string(), IO_C.to_string()));
+            }
             for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
                 files.push((
                     format!("unit_{}.c", i + 1),

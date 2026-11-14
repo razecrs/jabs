@@ -57,3 +57,60 @@ pub fn read_module(home: &Path, module: &str) -> Result<(Vec<ClassFile>, usize, 
         .with_context(|| format!("read zip in {}", path.display()))?;
     crate::jar::classes_from_zip(&mut archive, "classes/", &path.display().to_string())
 }
+
+/// A jmod file seen as its zip: every position is shifted past the 4-byte header, so the zip
+/// directory can be read without loading the whole file.
+struct JmodZip(fs::File);
+
+impl std::io::Read for JmodZip {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl std::io::Seek for JmodZip {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let shifted = match pos {
+            std::io::SeekFrom::Start(n) => std::io::SeekFrom::Start(n + 4),
+            other => other,
+        };
+        Ok(self.0.seek(shifted)?.saturating_sub(4))
+    }
+}
+
+/// The JDK modules (by name) that contain at least one of `classes` (internal names), from the
+/// module files' directories alone. A JVM run's loaded classes give the modules a program uses.
+pub fn modules_containing(
+    home: &Path,
+    classes: &std::collections::BTreeSet<String>,
+) -> Result<Vec<String>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let dir = home.join("jmods");
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .with_context(|| format!("list {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "jmod"))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let mut file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let mut magic = [0u8; 4];
+        if file.read_exact(&mut magic).is_err() || magic != JMOD_MAGIC {
+            continue;
+        }
+        let Ok(archive) = zip::ZipArchive::new(JmodZip(file)) else {
+            continue;
+        };
+        let used = archive.file_names().any(|name| {
+            name.strip_prefix("classes/")
+                .and_then(|n| n.strip_suffix(".class"))
+                .is_some_and(|n| classes.contains(n))
+        });
+        if used {
+            let module = path.file_stem().unwrap().to_string_lossy().into_owned();
+            out.push(module);
+        }
+    }
+    Ok(out)
+}

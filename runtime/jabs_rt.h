@@ -85,7 +85,9 @@ enum {
     JABS_VM_CLONE_NOT_SUPPORTED,
     JABS_VM_IO,
     JABS_VM_CLASS_NOT_FOUND,
-    JABS_VM_INSTANTIATION
+    JABS_VM_INSTANTIATION,
+    JABS_VM_FILE_NOT_FOUND,
+    JABS_VM_SYNC_FAILED
 };
 jabs_object *jabs_vm_throwable(int kind);
 /* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
@@ -187,6 +189,31 @@ static inline _Noreturn void jabs_not_compiled(const char *method) {
     abort();
 }
 
+/* Every compiled Java method: not inlined and no tail calls, so each has its own native frame
+ * and stack walks (SecurityManager.getClassContext, stack traces) see every Java frame.
+ * Define JABS_INLINE_METHODS to trade that exactness for speed. */
+#ifndef JABS_METHOD
+#if defined(JABS_INLINE_METHODS)
+#define JABS_METHOD
+#elif defined(__clang__)
+#define JABS_METHOD __attribute__((noinline, disable_tail_calls))
+#elif defined(__GNUC__)
+#define JABS_METHOD __attribute__((noinline, optimize("no-optimize-sibling-calls")))
+#else
+#define JABS_METHOD
+#endif
+#endif
+
+/* Function start addresses of the current native stack frames, innermost first (jabs_platform.c). */
+int jabs_platform_stack_functions(const void **starts, int max);
+jabs_object *jabs_class_new_instance(jabs_object *c);
+
+/* jabs_not_compiled naming the class involved. */
+static inline _Noreturn void jabs_not_compiled_class(const char *what, const char *class_name) {
+    fprintf(stderr, "jabs: %s (%s) is not compiled to native code; run this profile on the JVM backend\n", what, class_name);
+    abort();
+}
+
 /* Arrays: header, length, then elements at their JVM width. The element class of a reference
  * array is recorded so covariant stores can be checked at runtime (ArrayStoreException). */
 enum {
@@ -222,7 +249,8 @@ enum {
     JABS_PLATFORM_TMPDIR, JABS_PLATFORM_OS_NAME, JABS_PLATFORM_OS_ARCH, JABS_PLATFORM_OS_VERSION,
     JABS_PLATFORM_NATIVE_ENCODING, JABS_PLATFORM_JNU_ENCODING, JABS_PLATFORM_USER_DIR,
     JABS_PLATFORM_USER_HOME, JABS_PLATFORM_USER_NAME, JABS_PLATFORM_LANGUAGE, JABS_PLATFORM_COUNTRY,
-    JABS_PLATFORM_DATA_MODEL, JABS_PLATFORM_ENDIAN, JABS_PLATFORM_UNICODE_ENCODING, JABS_PLATFORM_EXE_DIR
+    JABS_PLATFORM_DATA_MODEL, JABS_PLATFORM_ENDIAN, JABS_PLATFORM_UNICODE_ENCODING, JABS_PLATFORM_EXE_DIR,
+    JABS_PLATFORM_LIBRARY_PREFIX, JABS_PLATFORM_LIBRARY_SUFFIX
 };
 const char *jabs_platform_value(int which);
 const char *jabs_platform_common(int which);
@@ -230,6 +258,105 @@ const char *jabs_platform_common(int which);
 int64_t jabs_platform_std_handle(int32_t fd);
 /* Write all bytes to a file descriptor; -1 on failure. */
 int64_t jabs_platform_write(int32_t fd, const void *data, size_t length);
+/* A VarHandle made by the runtime: what it reaches and the value type ('I', 'J', ..., 'L').
+ * shape: 0 static field (address), 1 instance field (offset from the object), 2 array element. */
+typedef struct { char kind; uint8_t shape; int32_t scale; int64_t offset; void *address; } jabs_vh;
+/* The handle data of a runtime-made VarHandle; NULL for any other object. */
+const jabs_vh *jabs_vh_of(jabs_object *o);
+/* The accessed address; NULL with NullPointerException/ArrayIndexOutOfBounds pending. */
+void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index);
+int32_t jabs_array_scale(jabs_object *array_class);
+
+/* Generated glue the java.io natives use (see io_accessor_functions in cgen.rs). */
+jabs_object *jabs_file_path_of(jabs_object *file);
+jabs_object **jabs_stream_fd_slot(jabs_object *stream);
+int32_t *jabs_descriptor_fd_slot(jabs_object *descriptor);
+void jabs_descriptor_set_handle(jabs_object *descriptor, int64_t handle);
+void jabs_descriptor_set_append(jabs_object *descriptor, int32_t append);
+jabs_object *jabs_new_string_array(int32_t length);
+void jabs_raise_message(int kind, const char *utf8);
+char *jabs_string_to_utf8(jabs_object *s);
+jabs_object *jabs_string_from_utf8(const char *text);
+/* java.io natives' glue (jabs_io.c). */
+/* System.mapLibraryName: "name" -> "name.dll" / "libname.so" / "libname.dylib". */
+jabs_object *jabs_map_library_name(jabs_object *name);
+int32_t jabs_io_attributes(jabs_object *file, int32_t with_hidden);
+int32_t jabs_io_check_access(jabs_object *file, int32_t access);
+int64_t jabs_io_last_modified(jabs_object *file);
+int64_t jabs_io_length(jabs_object *file);
+int32_t jabs_io_set_permission(jabs_object *file, int32_t access, int32_t enable, int32_t owner_only);
+int32_t jabs_io_create_exclusively(jabs_object *path);
+jabs_object *jabs_io_list(jabs_object *file);
+int32_t jabs_io_create_directory(jabs_object *file);
+int32_t jabs_io_set_last_modified(jabs_object *file, int64_t ms);
+int32_t jabs_io_set_read_only(jabs_object *file);
+int32_t jabs_io_delete(jabs_object *file, int32_t allow_read_only);
+int32_t jabs_io_rename(jabs_object *from, jabs_object *to);
+int64_t jabs_io_space(jabs_object *file, int32_t which);
+jabs_object *jabs_io_canonicalize(jabs_object *path);
+jabs_object *jabs_io_final_path(jabs_object *path);
+jabs_object *jabs_io_drive_directory(int32_t drive);
+int32_t jabs_io_raf_flags(int32_t mode);
+void jabs_io_open(jabs_object *stream, jabs_object *name, int32_t flags);
+int32_t jabs_io_read_byte(jabs_object *stream);
+int32_t jabs_io_read_bytes(jabs_object *stream, jabs_object *bytes, int32_t off, int32_t len);
+void jabs_io_write_byte(jabs_object *stream, int32_t b);
+void jabs_io_write_bytes(jabs_object *stream, jabs_object *bytes, int32_t off, int32_t len);
+int64_t jabs_io_position(jabs_object *stream);
+void jabs_io_seek(jabs_object *stream, int64_t position);
+int64_t jabs_io_skip(jabs_object *stream, int64_t n);
+int64_t jabs_io_stream_length(jabs_object *stream);
+void jabs_io_set_length(jabs_object *stream, int64_t length);
+int32_t jabs_io_available(jabs_object *stream);
+int32_t jabs_io_is_regular(jabs_object *fdo);
+void jabs_io_close_descriptor(jabs_object *fdo);
+void jabs_io_cleanup_close(int32_t fd);
+void jabs_io_sync(jabs_object *fdo);
+
+/* Files (jabs_files.c): UTF-8 paths, one implementation per OS family. */
+enum { JABS_FS_EXISTS = 0x01, JABS_FS_REGULAR = 0x02, JABS_FS_DIRECTORY = 0x04, JABS_FS_HIDDEN = 0x08 };
+enum { JABS_FS_ACCESS_READ = 0x04, JABS_FS_ACCESS_WRITE = 0x02, JABS_FS_ACCESS_EXECUTE = 0x01 };
+enum { JABS_FS_SPACE_TOTAL = 0, JABS_FS_SPACE_FREE = 1, JABS_FS_SPACE_USABLE = 2 };
+enum {
+    JABS_OPEN_READ = 1, JABS_OPEN_WRITE = 2, JABS_OPEN_CREATE = 4, JABS_OPEN_TRUNCATE = 8,
+    JABS_OPEN_APPEND = 16, JABS_OPEN_SYNC = 32, JABS_OPEN_DSYNC = 64, JABS_OPEN_DELETE_ON_CLOSE = 128
+};
+/* Why the last failing call failed (the OS's own message). */
+const char *jabs_files_error(void);
+/* JABS_FS_* bits without HIDDEN; *hidden set separately (only Windows has the attribute). */
+int32_t jabs_fs_attributes(const char *path, int32_t *hidden);
+int32_t jabs_fs_access(const char *path, int32_t access);
+/* Milliseconds since 1970, 0 when unknown. */
+int64_t jabs_fs_mtime(const char *path);
+int64_t jabs_fs_length(const char *path);
+/* 1 created, 0 already exists, -1 error. */
+int32_t jabs_fs_create_exclusive(const char *path);
+int32_t jabs_fs_delete(const char *path, int32_t allow_read_only);
+int32_t jabs_fs_mkdir(const char *path);
+int32_t jabs_fs_rename(const char *from, const char *to);
+int32_t jabs_fs_set_mtime(const char *path, int64_t ms);
+int32_t jabs_fs_set_read_only(const char *path);
+int32_t jabs_fs_set_permission(const char *path, int32_t access, int32_t enable, int32_t owner_only);
+/* malloc'd names (each malloc'd), NULL when the path is not a readable directory. */
+char **jabs_fs_list(const char *path, int32_t *count);
+/* malloc'd results, NULL on error. */
+char *jabs_fs_canonicalize(const char *path);
+char *jabs_fs_final_path(const char *path);
+char *jabs_fs_drive_directory(int32_t drive);
+/* Bit i set when drive 'A'+i exists (Windows); 0 elsewhere. */
+int32_t jabs_fs_roots(void);
+int64_t jabs_fs_space(const char *path, int32_t which);
+/* File descriptors: -1 (or 0 for the int32 predicates) on error. jabs_fd_read returns 0 at EOF. */
+int32_t jabs_fd_open(const char *path, int32_t flags);
+int64_t jabs_fd_read(int32_t fd, void *buffer, size_t length);
+int64_t jabs_fd_seek(int32_t fd, int64_t offset, int32_t whence);
+int64_t jabs_fd_length(int32_t fd);
+int32_t jabs_fd_set_length(int32_t fd, int64_t length);
+int32_t jabs_fd_is_regular(int32_t fd);
+int64_t jabs_fd_available(int32_t fd);
+int32_t jabs_fd_close(int32_t fd);
+int32_t jabs_fd_sync(int32_t fd);
+
 /* SetErrorMode on Windows (returns the previous mode); 0 elsewhere. */
 int64_t jabs_platform_set_error_mode(int64_t mode);
 /* Sleep for at least this many nanoseconds. */

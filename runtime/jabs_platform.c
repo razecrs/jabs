@@ -75,6 +75,8 @@ const char *jabs_platform_value(int which) {
     case JABS_PLATFORM_USER_NAME: return env_utf8(L"USERNAME");
     case JABS_PLATFORM_LANGUAGE: return locale_part(0);
     case JABS_PLATFORM_COUNTRY: return locale_part(1);
+    case JABS_PLATFORM_LIBRARY_PREFIX: return "";
+    case JABS_PLATFORM_LIBRARY_SUFFIX: return ".dll";
     case JABS_PLATFORM_EXE_DIR: {
         static wchar_t path[32768];
         DWORD n = GetModuleFileNameW(NULL, path, 32768);
@@ -99,6 +101,18 @@ int64_t jabs_platform_set_error_mode(int64_t mode) {
     return (int64_t)SetErrorMode((UINT)mode);
 }
 
+int jabs_platform_stack_functions(const void **starts, int max) {
+    void *pcs[1024];
+    int n = (int)RtlCaptureStackBackTrace(0, (DWORD)(max < 1024 ? max : 1024), pcs, NULL);
+    for (int i = 0; i < n; i++) {
+        DWORD64 image = 0;
+        /* The unwind tables give the start of the function containing each return address. */
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry((DWORD64)(uintptr_t)pcs[i] - 1, &image, NULL);
+        starts[i] = f ? (const void *)(uintptr_t)(image + f->BeginAddress) : NULL;
+    }
+    return n;
+}
+
 void jabs_sleep_nanos(int64_t nanos) {
     if (nanos > 0) Sleep((DWORD)((nanos + 999999) / 1000000 > 0x7fffffff ? 0x7fffffff : (nanos + 999999) / 1000000));
 }
@@ -117,6 +131,7 @@ int64_t jabs_platform_write(int32_t fd, const void *data, size_t length) {
 #else
 #include <unistd.h>
 #include <sys/utsname.h>
+#include <unwind.h>
 
 const char *jabs_platform_value(int which) {
     static char cwd[4096];
@@ -136,6 +151,12 @@ const char *jabs_platform_value(int which) {
     case JABS_PLATFORM_LANGUAGE: return "en";
     case JABS_PLATFORM_COUNTRY: return NULL;
     case JABS_PLATFORM_EXE_DIR: return ".";
+    case JABS_PLATFORM_LIBRARY_PREFIX: return "lib";
+#ifdef __APPLE__
+    case JABS_PLATFORM_LIBRARY_SUFFIX: return ".dylib";
+#else
+    case JABS_PLATFORM_LIBRARY_SUFFIX: return ".so";
+#endif
     default: break;
     }
     return jabs_platform_common(which);
@@ -144,6 +165,23 @@ const char *jabs_platform_value(int which) {
 int64_t jabs_platform_set_error_mode(int64_t mode) {
     (void)mode;
     return 0;
+}
+
+typedef struct { const void **starts; int count, max; } jabs_unwind_state;
+
+/* One frame of _Unwind_Backtrace: record the start of its enclosing function. */
+static _Unwind_Reason_Code jabs_unwind_frame(struct _Unwind_Context *context, void *data) {
+    jabs_unwind_state *s = (jabs_unwind_state *)data;
+    if (s->count >= s->max) return _URC_END_OF_STACK;
+    uintptr_t pc = (uintptr_t)_Unwind_GetIP(context);
+    s->starts[s->count++] = pc ? _Unwind_FindEnclosingFunction((void *)(pc - 1)) : NULL;
+    return _URC_NO_REASON;
+}
+
+int jabs_platform_stack_functions(const void **starts, int max) {
+    jabs_unwind_state s = { starts, 0, max };
+    _Unwind_Backtrace(jabs_unwind_frame, &s);
+    return s.count;
 }
 
 void jabs_sleep_nanos(int64_t nanos) {

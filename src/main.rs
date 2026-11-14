@@ -160,32 +160,41 @@ fn execute(cli: Cli) -> Result<()> {
             } else {
                 root.into_iter().collect()
             };
+            let loaded_classes: std::collections::BTreeSet<String> = match loaded_classes {
+                Some(path) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(str::to_string)
+                    .collect(),
+                None => Default::default(),
+            };
             let mut java_home = None;
             if let Some(java) = jdk {
                 let home = jabs::jdk::java_home(&java)?;
                 java_home = Some(home.clone());
-                let (library, _, _) = jabs::jdk::read_module(&home, "java.base")?;
-                classes.extend(
-                    library
-                        .into_iter()
-                        .filter(|c| !inputs_named.contains(&c.name)),
-                );
+                // java.base, plus every module a JVM run of the program loaded classes from.
+                let mut modules = vec!["java.base".to_string()];
+                for m in jabs::jdk::modules_containing(&home, &loaded_classes)? {
+                    if !modules.contains(&m) {
+                        modules.push(m);
+                    }
+                }
+                eprintln!("JDK modules in the unit: {}", modules.join(", "));
+                for module in &modules {
+                    let (library, _, _) = jabs::jdk::read_module(&home, module)?;
+                    let known: std::collections::HashSet<String> =
+                        classes.iter().map(|c| c.name.clone()).collect();
+                    classes.extend(library.into_iter().filter(|c| !known.contains(&c.name)));
+                }
             }
             // Input classes belong to the app class loader; their jars' other files are its resources.
             let extras = jabs::cgen::UnitExtras {
                 app_classes: inputs_named.clone(),
                 resources: jabs::jar::load_resources(&inputs)?,
                 java_home: java_home.map(|h| h.display().to_string()),
-                loaded_classes: match loaded_classes {
-                    Some(path) => std::fs::read_to_string(&path)
-                        .with_context(|| format!("read {}", path.display()))?
-                        .lines()
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                        .map(str::to_string)
-                        .collect(),
-                    None => Default::default(),
-                },
+                loaded_classes,
             };
             let compiled = jabs::cgen::compile_unit_with(&classes, Some(&roots), &extras);
             if let Some(out) = out {
