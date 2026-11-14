@@ -79,6 +79,9 @@ pub struct Member {
     pub code: Option<Code>,
     /// Pool index of a field's ConstantValue attribute (`static final` constants).
     pub constant_value: Option<u16>,
+    /// Descriptors of the member's runtime-visible annotations, e.g.
+    /// `Ljdk/internal/reflect/CallerSensitive;`.
+    pub annotations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +192,49 @@ fn parse_attributes(
         on(name, data)?;
     }
     Ok(())
+}
+
+/// Top-level annotation type descriptors of a RuntimeVisibleAnnotations attribute (JVMS 4.7.16).
+fn parse_annotation_types(data: &[u8], pool: &[Constant]) -> Result<Vec<String>> {
+    // Skip one element_value (JVMS 4.7.16.1), recursing into nested annotations and arrays.
+    fn skip_value(c: &mut Cursor, depth: u32) -> Result<()> {
+        if depth > 64 {
+            bail!("annotation nesting too deep");
+        }
+        match c.u8()? {
+            b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' | b'c' => {
+                c.u16()?;
+            }
+            b'e' => {
+                c.u16()?;
+                c.u16()?;
+            }
+            b'@' => {
+                c.u16()?;
+                for _ in 0..c.u16()? {
+                    c.u16()?;
+                    skip_value(c, depth + 1)?;
+                }
+            }
+            b'[' => {
+                for _ in 0..c.u16()? {
+                    skip_value(c, depth + 1)?;
+                }
+            }
+            tag => bail!("unknown annotation element tag {tag}"),
+        }
+        Ok(())
+    }
+    let mut c = Cursor::new(data);
+    let mut out = Vec::new();
+    for _ in 0..c.u16()? {
+        out.push(utf8(pool, c.u16()?)?.to_owned());
+        for _ in 0..c.u16()? {
+            c.u16()?;
+            skip_value(&mut c, 0)?;
+        }
+    }
+    Ok(out)
 }
 
 /// Parse a Code attribute: limits, bytecode and exception handlers.
@@ -336,6 +382,7 @@ impl ClassFile {
                 let descriptor = utf8(&pool, c.u16()?)?.to_owned();
                 let mut code = None;
                 let mut constant_value = None;
+                let mut annotations = Vec::new();
                 parse_attributes(c, &pool, |attr, data| {
                     match attr {
                         "Code" if code.is_some() => bail!("duplicate Code attribute"),
@@ -345,6 +392,9 @@ impl ClassFile {
                                 bail!("ConstantValue attribute must be 2 bytes");
                             }
                             constant_value = Some(u16::from_be_bytes([data[0], data[1]]));
+                        }
+                        "RuntimeVisibleAnnotations" => {
+                            annotations = parse_annotation_types(data, &pool)?;
                         }
                         _ => {}
                     }
@@ -356,6 +406,7 @@ impl ClassFile {
                     descriptor,
                     code,
                     constant_value,
+                    annotations,
                 });
             }
             Ok(out)

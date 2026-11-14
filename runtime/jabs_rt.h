@@ -82,7 +82,10 @@ enum {
     JABS_VM_INITIALIZER,
     JABS_VM_OUT_OF_MEMORY,
     JABS_VM_ILLEGAL_MONITOR_STATE,
-    JABS_VM_CLONE_NOT_SUPPORTED
+    JABS_VM_CLONE_NOT_SUPPORTED,
+    JABS_VM_IO,
+    JABS_VM_CLASS_NOT_FOUND,
+    JABS_VM_INSTANTIATION
 };
 jabs_object *jabs_vm_throwable(int kind);
 /* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
@@ -94,6 +97,14 @@ jabs_object *jabs_cause_of(jabs_object *o);
 /* Allocate a zeroed object: all-zero bytes are every field's Java default (0, 0.0, false, null).
  * There is no garbage collector yet, so objects live until the process exits. */
 static inline jabs_object *jabs_new(const jabs_class *cls);
+/* The canonical String with the same contents (String.intern; literals use it too). */
+jabs_object *jabs_string_intern(jabs_object *s);
+/* Bytes of Java objects allocated so far. With no garbage collector the heap only grows, so this
+ * is Runtime.totalMemory (and freeMemory is 0). */
+extern int64_t jabs_heap_bytes;
+/* Class (internal name) that called the @CallerSensitive method now running; see
+ * Reflection.getCallerClass. Set at each call site of such a method. */
+extern _Thread_local const char *jabs_caller;
 
 /* Exception a failed static initializer reports (JVMS 5.5 step 11): Errors pass through,
  * anything else becomes ExceptionInInitializerError. */
@@ -194,6 +205,38 @@ typedef struct jabs_array {
     const char *component_descriptor; /* element array type for JABS_COMPONENT_ARRAY */
 } jabs_array;
 
+/* A file from the input jars embedded in the program (resources.c), for the app class loader. */
+typedef struct { const char *name; const unsigned char *data; size_t length; } jabs_resource;
+extern const jabs_resource jabs_resources[];
+
+/* Whether the CPU allows unaligned memory access (UnsafeConstants.UNALIGNED_ACCESS). */
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(__aarch64__)
+#define JABS_UNALIGNED_ACCESS 1
+#else
+#define JABS_UNALIGNED_ACCESS 0
+#endif
+
+/* Host facts for system properties (jabs_platform.c); UTF-8, NULL when unknown. */
+enum {
+    JABS_PLATFORM_FILE_SEPARATOR, JABS_PLATFORM_LINE_SEPARATOR, JABS_PLATFORM_PATH_SEPARATOR,
+    JABS_PLATFORM_TMPDIR, JABS_PLATFORM_OS_NAME, JABS_PLATFORM_OS_ARCH, JABS_PLATFORM_OS_VERSION,
+    JABS_PLATFORM_NATIVE_ENCODING, JABS_PLATFORM_JNU_ENCODING, JABS_PLATFORM_USER_DIR,
+    JABS_PLATFORM_USER_HOME, JABS_PLATFORM_USER_NAME, JABS_PLATFORM_LANGUAGE, JABS_PLATFORM_COUNTRY,
+    JABS_PLATFORM_DATA_MODEL, JABS_PLATFORM_ENDIAN, JABS_PLATFORM_UNICODE_ENCODING, JABS_PLATFORM_EXE_DIR
+};
+const char *jabs_platform_value(int which);
+const char *jabs_platform_common(int which);
+/* Windows HANDLE of stdin/stdout/stderr (fd 0-2), else -1. */
+int64_t jabs_platform_std_handle(int32_t fd);
+/* Write all bytes to a file descriptor; -1 on failure. */
+int64_t jabs_platform_write(int32_t fd, const void *data, size_t length);
+/* SetErrorMode on Windows (returns the previous mode); 0 elsewhere. */
+int64_t jabs_platform_set_error_mode(int64_t mode);
+/* Sleep for at least this many nanoseconds. */
+void jabs_sleep_nanos(int64_t nanos);
+/* VM.getNanoTimeAdjustment: wall-clock nanoseconds since `offset_seconds`, or -1 if too far. */
+int64_t jabs_nano_time_adjustment(int64_t offset_seconds);
+
 /* Elements start right after the header, aligned for any element type. */
 static inline void *jabs_array_data(jabs_array *a) {
     return (char *)a + ((sizeof(jabs_array) + 7) & ~(size_t)7);
@@ -228,6 +271,7 @@ static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, i
         return NULL;
     }
     jabs_array *a = (jabs_array *)calloc(1, header + (size_t)length * element_size);
+    if (a) jabs_heap_bytes += (int64_t)(header + (size_t)length * element_size);
     if (!a) {
         jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
@@ -315,6 +359,7 @@ static inline void (*jabs_itable_find(const jabs_object *o, uint64_t selector))(
 
 static inline jabs_object *jabs_new(const jabs_class *cls) {
     jabs_object *o = (jabs_object *)calloc(1, cls->size);
+    if (o) jabs_heap_bytes += (int64_t)cls->size;
     if (!o) {
         jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
@@ -403,6 +448,7 @@ static inline jabs_object *jabs_clone(jabs_object *o) {
         size = o->cls->size;
     }
     jabs_object *copy = (jabs_object *)malloc(size);
+    if (copy) jabs_heap_bytes += (int64_t)size;
     if (!copy) { jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }
     memcpy(copy, o, size);
     copy->monitor = 0;

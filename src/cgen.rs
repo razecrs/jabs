@@ -36,7 +36,7 @@ const THROWABLE: &str = "java/lang/Throwable";
 const CLASS: &str = "java/lang/Class";
 
 /// Exceptions the runtime raises itself, in the order of the JABS_VM_* constants.
-const VM_EXCEPTIONS: [(&str, &str); 13] = [
+const VM_EXCEPTIONS: [(&str, &str); 16] = [
     ("java/lang/NullPointerException", "JABS_VM_NULL_POINTER"),
     ("java/lang/ArithmeticException", "JABS_VM_ARITHMETIC"),
     (
@@ -71,6 +71,12 @@ const VM_EXCEPTIONS: [(&str, &str); 13] = [
         "java/lang/CloneNotSupportedException",
         "JABS_VM_CLONE_NOT_SUPPORTED",
     ),
+    ("java/io/IOException", "JABS_VM_IO"),
+    (
+        "java/lang/ClassNotFoundException",
+        "JABS_VM_CLASS_NOT_FOUND",
+    ),
+    ("java/lang/InstantiationException", "JABS_VM_INSTANTIATION"),
 ];
 
 /// Native methods the runtime implements: (class, name, descriptor) -> C body. `self` and
@@ -183,10 +189,248 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "return 0;",
         needs_classes: false,
     },
+    Intrinsic {
+        key: ("java/lang/String", "intern", "()Ljava/lang/String;"),
+        body: "return jabs_string_intern(self);",
+        needs_classes: true,
+    },
+    // The caller of the @CallerSensitive method, recorded at its call site.
+    Intrinsic {
+        key: (
+            "jdk/internal/reflect/Reflection",
+            "getCallerClass",
+            "()Ljava/lang/Class;",
+        ),
+        body: "return jabs_caller ? jabs_class_object(jabs_caller) : NULL;",
+        needs_classes: true,
+    },
     // The VM creates the main thread before any Java code runs; JABS does it on first request.
     Intrinsic {
         key: ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
         body: "return jabs_main_thread();",
+        needs_classes: true,
+    },
+    // System properties the VM supplies (System.initPhase1 -> SystemProps.initProperties).
+    Intrinsic {
+        key: (
+            "jdk/internal/util/SystemProps$Raw",
+            "platformProperties",
+            "()[Ljava/lang/String;",
+        ),
+        body: "return jabs_platform_properties();",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "jdk/internal/util/SystemProps$Raw",
+            "vmProperties",
+            "()[Ljava/lang/String;",
+        ),
+        body: "return jabs_vm_properties();",
+        needs_classes: true,
+    },
+    // Standard streams: FileDescriptor.in/out/err.
+    Intrinsic {
+        key: ("java/io/FileDescriptor", "initIDs", "()V"),
+        body: "/* field offsets are known at compile time */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/io/FileDescriptor", "getHandle", "(I)J"),
+        body: "return jabs_platform_std_handle(a0);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/io/FileDescriptor", "getAppend", "(I)Z"),
+        body: "(void)a0; return 0;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/io/FileInputStream", "initIDs", "()V"),
+        body: "/* field offsets are known at compile time */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/io/FileOutputStream", "initIDs", "()V"),
+        body: "/* field offsets are known at compile time */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("jdk/internal/misc/VM", "initialize", "()V"),
+        body: "/* the VM's own startup state is set up by the runtime */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("jdk/internal/misc/VM", "getNanoTimeAdjustment", "(J)J"),
+        body: "return jabs_nano_time_adjustment(a0);",
+        needs_classes: false,
+    },
+    // Signals are not wired up yet: every name is unknown, which the JDK handles (Terminator skips
+    // the handler). Consequence: Ctrl+C ends the process without running shutdown hooks.
+    Intrinsic {
+        key: (
+            "jdk/internal/misc/Signal",
+            "findSignal0",
+            "(Ljava/lang/String;)I",
+        ),
+        body: "(void)a0; return -1;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("sun/io/Win32ErrorMode", "setErrorMode", "(J)J"),
+        body: "return jabs_platform_set_error_mode(a0);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Shutdown", "beforeHalt", "()V"),
+        body: "/* nothing to flush beyond the streams Java code already flushed */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Shutdown", "halt0", "(I)V"),
+        body: "fflush(NULL); exit(a0);",
+        needs_classes: false,
+    },
+    // No heap limit: the specification's answer is Long.MAX_VALUE.
+    Intrinsic {
+        key: ("java/lang/Runtime", "maxMemory", "()J"),
+        body: "return INT64_MAX;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Runtime", "totalMemory", "()J"),
+        body: "return jabs_heap_bytes;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Runtime", "freeMemory", "()J"),
+        body: "return 0; /* nothing is ever freed without a GC */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Runtime", "gc", "()V"),
+        body: "/* no garbage collector yet */",
+        needs_classes: false,
+    },
+    // Thread natives with one thread: priorities and names have no OS thread to apply to,
+    // nothing can be interrupted while running, and yielding has no one to yield to.
+    Intrinsic {
+        key: ("java/lang/Thread", "setPriority0", "(I)V"),
+        body: "(void)a0;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Thread", "setNativeName", "(Ljava/lang/String;)V"),
+        body: "(void)a0;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Thread", "yield0", "()V"),
+        body: "/* single-threaded */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Thread", "clearInterruptEvent", "()V"),
+        body: "/* no OS interrupt event: nothing blocks interruptibly yet */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Thread", "interrupt0", "()V"),
+        body: "/* the interrupted flag is a Java field; with one thread nothing is blocked */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/Thread", "sleepNanos0", "(J)V"),
+        body: "jabs_sleep_nanos(a0);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/Thread",
+            "ensureMaterializedForStackWalk",
+            "(Ljava/lang/Object;)V",
+        ),
+        body: "(void)a0;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/Thread",
+            "currentCarrierThread",
+            "()Ljava/lang/Thread;",
+        ),
+        body: "return jabs_main_thread();",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: ("java/lang/Thread", "holdsLock", "(Ljava/lang/Object;)Z"),
+        body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } return a0->monitor != 0;",
+        needs_classes: false,
+    },
+    // ThreadIdentifiers adds to this counter with Unsafe; the main thread already has id 1.
+    Intrinsic {
+        key: ("java/lang/Thread", "getNextThreadIdOffset", "()J"),
+        body: "static int64_t next_thread_id = 2; return (int64_t)(intptr_t)&next_thread_id;",
+        needs_classes: false,
+    },
+    // The JVM's default (--finalization=enabled); with no GC no finalizer ever becomes due.
+    Intrinsic {
+        key: ("java/lang/ref/Finalizer", "isFinalizationEnabled", "()Z"),
+        body: "return 1;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/lang/ref/Reference", "hasReferencePendingList", "()Z"),
+        body: "return 0; /* no GC: nothing is ever pending */",
+        needs_classes: false,
+    },
+    // Class data sharing: a native program has no CDS archive, so nothing is shared or dumped.
+    Intrinsic {
+        key: ("jdk/internal/misc/CDS", "getCDSConfigStatus", "()I"),
+        body: "return 0; /* no archive in use, not dumping */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "jdk/internal/misc/CDS",
+            "initializeFromArchive",
+            "(Ljava/lang/Class;)V",
+        ),
+        body: "(void)a0; /* nothing archived: static fields keep their computed values */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("jdk/internal/misc/CDS", "getRandomSeedForDumping", "()J"),
+        body: "return 0;",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/Class",
+            "forName0",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;",
+        ),
+        body: "(void)a3; return jabs_class_for_name(a0, a1, a2);",
+        needs_classes: true,
+    },
+    // jabs.rt.Natives: the app class loader's view of compiled-in classes and embedded resources.
+    Intrinsic {
+        key: (
+            "jabs/rt/Natives",
+            "classNamed",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+        ),
+        body: "return jabs_class_for_binary_name(a0);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: ("jabs/rt/Natives", "resourceCount", "(Ljava/lang/String;)I"),
+        body: "return jabs_resource_count(a0);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: ("jabs/rt/Natives", "resource", "(Ljava/lang/String;I)[B"),
+        body: "return jabs_resource_bytes(a0, a1);",
         needs_classes: true,
     },
     // The registry sets `name` when it creates a Class, so the lazy initializer just returns it.
@@ -225,10 +469,97 @@ const INTRINSICS: &[Intrinsic] = &[
     },
 ];
 
+/// Java (not native) methods JABS replaces, with the reason. Each is behavior-preserving for a
+/// program JABS can run today: (class, name, descriptor) -> C body.
+const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
+    // The JDK's version goes through Constructor objects and method handles; the effect is the
+    // same: run the public no-arg constructor (its exceptions propagate unwrapped).
+    // Not yet checked: the caller's access to the class and constructor.
+    (
+        "java/lang/Class",
+        "newInstance",
+        "()Ljava/lang/Object;",
+        "return jabs_class_new_instance(self);",
+    ),
+    // No garbage collector yet: nothing is ever cleared, enqueued or finalized, so these threads
+    // would only wait forever. Revisit with the threads and GC milestones.
+    (
+        "java/lang/ref/Reference",
+        "startReferenceHandlerThread",
+        "(Ljava/lang/ThreadGroup;)V",
+        "(void)a0; /* JABS: no GC yet, so no Reference Handler thread */",
+    ),
+    (
+        "java/lang/ref/Finalizer",
+        "startFinalizerThread",
+        "(Ljava/lang/ThreadGroup;)V",
+        "(void)a0; /* JABS: no GC yet, so no Finalizer thread */",
+    ),
+];
+
+/// The C body replacing a Java method, if JABS replaces it.
+fn replacement(key: &MethodKey) -> Option<(String, bool)> {
+    REPLACEMENTS
+        .iter()
+        .find(|r| r.0 == key.0 && r.1 == key.1 && r.2 == key.2)
+        .map(|r| (r.3.to_string(), r.0 == CLASS))
+}
+
 /// The runtime's C body for a native method, if it implements one (and the unit can support it).
 fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(String, bool)> {
     if key.1 == "registerNatives" && key.2 == "()V" {
         return Some(("/* natives are linked statically */".to_string(), false));
+    }
+    if key.0 == SYSTEM {
+        let field = match (key.1.as_str(), key.2.as_str()) {
+            ("setIn0", "(Ljava/io/InputStream;)V") => Some("in"),
+            ("setOut0", "(Ljava/io/PrintStream;)V") => Some("out"),
+            ("setErr0", "(Ljava/io/PrintStream;)V") => Some("err"),
+            _ => None,
+        };
+        if let Some(field) = field {
+            return Some((format!("{} = a0;", field_symbol(SYSTEM, field)), false));
+        }
+    }
+    if matches!(
+        key.0.as_str(),
+        "java/lang/ref/Reference" | "java/lang/ref/PhantomReference"
+    ) {
+        let referent = format!(
+            "(({} *)self)->{}",
+            object_struct("java/lang/ref/Reference"),
+            instance_field("referent")
+        );
+        let body = match (key.1.as_str(), key.2.as_str()) {
+            ("refersTo0", "(Ljava/lang/Object;)Z") => format!("return {referent} == a0;"),
+            ("clear0", "()V") => format!("{referent} = NULL;"),
+            _ => String::new(),
+        };
+        if !body.is_empty() {
+            return Some((body, false));
+        }
+    }
+    if key.0 == "java/io/FileOutputStream" {
+        // this.fd.fd, the int descriptor (stdout 1, stderr 2; files are not opened yet).
+        let fd = format!(
+            "jabs_object *fdo = (({} *)self)->{}; if (!fdo) {{ jabs_pending = jabs_vm_throwable(JABS_VM_IO); return; }} int32_t fd = (({} *)fdo)->{};",
+            object_struct("java/io/FileOutputStream"),
+            instance_field("fd"),
+            object_struct("java/io/FileDescriptor"),
+            instance_field("fd")
+        );
+        let body = match (key.1.as_str(), key.2.as_str()) {
+            ("writeBytes", "([BIIZ)V") => format!(
+                "(void)a3; {fd} if (!a0) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }} jabs_array *b = (jabs_array *)a0; if (a1 < 0 || a2 < 0 || a2 > b->length - a1) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return; }} if (jabs_platform_write(fd, (const char *)jabs_array_data(b) + a1, (size_t)a2) < 0) jabs_pending = jabs_vm_throwable(JABS_VM_IO);"
+            ),
+            ("write", "(IZ)V") => format!(
+                "(void)a1; {fd} unsigned char byte = (unsigned char)a0; if (jabs_platform_write(fd, &byte, 1) < 0) jabs_pending = jabs_vm_throwable(JABS_VM_IO);"
+            ),
+            _ => String::new(),
+        };
+        if !body.is_empty() {
+            return Some((body, false));
+        }
     }
     if key.0 == UNSAFE
         && let Some((body, needs_classes)) = unsafe_intrinsic(&key.1, &key.2)
@@ -418,7 +749,9 @@ pub struct CompiledUnit {
 const RUNTIME_GLOBALS: &str = "_Thread_local jabs_object *jabs_pending;\n\
 const jabs_class jabs_array_class_record = { \"[\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 };\n\
 uint32_t jabs_hash_next = 0x9e3779b9u;\n\
-const char *jabs_where = \"\";\n\n";
+const char *jabs_where = \"\";\n\
+int64_t jabs_heap_bytes;\n\
+_Thread_local const char *jabs_caller;\n\n";
 
 /// Extern declarations for the external definitions in `code` (records, vtables, static fields
 /// and non-static functions), so other files can reference them.
@@ -2293,6 +2626,44 @@ fn prototype(class: &str, method: &Member, sig: &Signature) -> String {
     )
 }
 
+/// Whether a call targets a `@CallerSensitive` method: those ask `Reflection.getCallerClass`,
+/// which JABS answers from `jabs_caller`, set at the call site (the caller is known statically).
+fn caller_sensitive(unit: &Unit, op: &Op) -> bool {
+    let (class, name, descriptor) = match op {
+        Op::InvokeStatic {
+            class,
+            name,
+            descriptor,
+            ..
+        } => (class, name, descriptor),
+        Op::InvokeVirtual(m) | Op::InvokeSpecial(m) | Op::InvokeInterface(m) => {
+            (&m.class, &m.name, &m.descriptor)
+        }
+        _ => return false,
+    };
+    // getCallerClass is itself @CallerSensitive, but it reads the caller; it must not replace it.
+    if class == "jdk/internal/reflect/Reflection" && name == "getCallerClass" {
+        return false;
+    }
+    let declared = |c: &ClassFile| {
+        c.methods
+            .iter()
+            .find(|m| &m.name == name && &m.descriptor == descriptor)
+            .map(|m| {
+                m.annotations
+                    .iter()
+                    .any(|a| a == "Ljdk/internal/reflect/CallerSensitive;")
+            })
+    };
+    if let Some(found) = unit.get(class).and_then(declared) {
+        return found;
+    }
+    unit.chain(class)
+        .ok()
+        .and_then(|chain| chain.iter().find_map(|c| declared(c)))
+        .unwrap_or(false)
+}
+
 /// `if (init() != 0) return` guarding first use of another class; nothing when `target` is
 /// necessarily initialized whenever this code runs (the current class or one of its superclasses).
 fn init_guard(unit: &Unit, current: &str, target: &str, ret_default: &str) -> String {
@@ -2646,6 +3017,11 @@ fn emit_method(
                 Some(Resolved::Call(CallKind::ObjectInit)) => {
                     "/* java/lang/Object.<init>()V has no effect */".into()
                 }
+                Some(Resolved::Call(kind)) if caller_sensitive(unit, &insn.op) => format!(
+                    "{{ const char *jabs_saved_caller = jabs_caller; jabs_caller = \"{}\"; {} jabs_caller = jabs_saved_caller; }}",
+                    c_escape(&class.name),
+                    call(kind, descriptor, d, exit)
+                ),
                 Some(Resolved::Call(kind)) => call(kind, descriptor, d, exit),
                 _ => unreachable!("calls are resolved during verification"),
             },
@@ -2933,7 +3309,7 @@ fn literal_symbol(units: &[u16]) -> String {
 /// Emit one function per distinct string literal. Each builds its String once (Latin-1 when every
 /// char fits in a byte, else UTF-16 in the target's byte order, as the JDK's compact strings do)
 /// and returns the same object afterwards, so equal literals are the same object everywhere.
-fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>) {
+fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>, intern_table: bool) {
     if literals.is_empty() {
         return;
     }
@@ -3010,8 +3386,13 @@ fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>) {
             instance_field("coder"),
             if latin1 { 0 } else { 1 }
         );
-        let _ = writeln!(out, "    interned = s;");
-        let _ = writeln!(out, "    return s;\n}}");
+        // Literals and String.intern share one table, so equal contents give the same object.
+        if intern_table {
+            let _ = writeln!(out, "    interned = jabs_string_intern(s);");
+        } else {
+            let _ = writeln!(out, "    interned = s;");
+        }
+        let _ = writeln!(out, "    return interned;\n}}");
     }
     out.push('\n');
 }
@@ -3322,7 +3703,15 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
 /// Emit the Class-object registry: one java.lang.Class per name, created on first use with the
 /// fields the JVM itself fills in (name, componentType, modifiers, primitive). Class loaders are
 /// not modeled: every class reports the boot loader (null).
-fn emit_class_registry(out: &mut String, unit: &Unit, recorded: &[&ClassFile]) {
+fn emit_class_registry(
+    out: &mut String,
+    unit: &Unit,
+    recorded: &[&ClassFile],
+    app_classes: &BTreeSet<String>,
+    java_home: Option<&str>,
+    inits: &BTreeSet<String>,
+    methods: &BTreeSet<MethodKey>,
+) {
     let class_struct = object_struct(CLASS);
     let string_struct = object_struct(STRING);
     let records: Vec<String> = recorded
@@ -3360,6 +3749,7 @@ fn emit_class_registry(out: &mut String, unit: &Unit, recorded: &[&ClassFile]) {
 typedef struct {{ char *name; const jabs_class *record; jabs_object *object; }} jabs_class_entry;
 static jabs_class_entry *jabs_class_entries;
 static size_t jabs_class_count, jabs_class_capacity;
+static void jabs_set_defining_loader(jabs_object *c, const char *name);
 
 /* Record for an internal class name, if the unit compiled one. */
 static const jabs_class *jabs_record_named(const char *name) {{
@@ -3449,6 +3839,7 @@ jabs_object *jabs_class_object(const char *name) {{
     if (!copy) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
     strcpy(copy, name);
     jabs_class_entries[jabs_class_count++] = (jabs_class_entry){{ copy, record, c }};
+    jabs_set_defining_loader(c, name);
     if (name[0] == '[') {{
         /* componentType: "[I" -> int, "[Ljava/lang/String;" -> java/lang/String, "[[I" -> [I. */
         char element[512];
@@ -3552,8 +3943,521 @@ jabs_object *jabs_class_superclass(jabs_object *c) {{
         modifiers = instance_field("modifiers"),
         component = instance_field("componentType"),
     ));
+    out.push_str(&format!(
+        r#"
+/* The String intern table (String.intern and every literal): open addressing on contents. */
+static jabs_object **jabs_interned;
+static size_t jabs_interned_count, jabs_interned_capacity;
+
+static uint64_t jabs_string_contents_hash(jabs_object *s) {{
+    jabs_array *v = (jabs_array *)(({string_struct} *)s)->{value};
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)(({string_struct} *)s)->{coder};
+    const unsigned char *b = (const unsigned char *)jabs_array_data(v);
+    for (int32_t i = 0; i < v->length; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}}
+
+static int jabs_string_contents_equal(jabs_object *a, jabs_object *b) {{
+    jabs_array *x = (jabs_array *)(({string_struct} *)a)->{value}, *y = (jabs_array *)(({string_struct} *)b)->{value};
+    return (({string_struct} *)a)->{coder} == (({string_struct} *)b)->{coder} && x->length == y->length
+        && memcmp(jabs_array_data(x), jabs_array_data(y), (size_t)x->length) == 0;
+}}
+
+/* The canonical String with these contents: `s` itself if none was interned yet. */
+jabs_object *jabs_string_intern(jabs_object *s) {{
+    if (!s) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    if (2 * (jabs_interned_count + 1) > jabs_interned_capacity) {{
+        size_t grown = jabs_interned_capacity ? jabs_interned_capacity * 2 : 1024;
+        jabs_object **table = (jabs_object **)calloc(grown, sizeof *table);
+        if (!table) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+        for (size_t i = 0; i < jabs_interned_capacity; i++) {{
+            jabs_object *e = jabs_interned[i];
+            if (!e) continue;
+            size_t j = (size_t)jabs_string_contents_hash(e) & (grown - 1);
+            while (table[j]) j = (j + 1) & (grown - 1);
+            table[j] = e;
+        }}
+        free(jabs_interned);
+        jabs_interned = table;
+        jabs_interned_capacity = grown;
+    }}
+    size_t j = (size_t)jabs_string_contents_hash(s) & (jabs_interned_capacity - 1);
+    for (; jabs_interned[j]; j = (j + 1) & (jabs_interned_capacity - 1)) {{
+        if (jabs_string_contents_equal(jabs_interned[j], s)) return jabs_interned[j];
+    }}
+    jabs_interned[j] = s;
+    jabs_interned_count++;
+    return s;
+}}
+"#,
+        string_struct = object_struct(STRING),
+        value = instance_field("value"),
+        coder = instance_field("coder"),
+    ));
+    out.push_str(&app_loader_functions(unit, recorded, app_classes));
+    out.push_str(&system_properties_functions(
+        unit, java_home, inits, methods,
+    ));
+    out.push_str(&for_name_function(unit, inits));
+    out.push_str(&new_instance_function(unit, recorded, methods));
     out.push_str(&main_thread_function(unit, recorded));
     out.push('\n');
+}
+
+/// The app class loader's runtime side: which classes it defines, creating it, class lookup by
+/// name and the embedded resources. Without jabs.rt.AppLoader in the unit, every class belongs to
+/// the boot loader (null), as before.
+fn app_loader_functions(
+    unit: &Unit,
+    recorded: &[&ClassFile],
+    app_classes: &BTreeSet<String>,
+) -> String {
+    let mut out = String::new();
+    let class_loader_field = unit.get(CLASS).is_some_and(|c| {
+        c.fields.iter().any(|f| {
+            f.name == "classLoader"
+                && f.descriptor == "Ljava/lang/ClassLoader;"
+                && f.access & ACC_STATIC == 0
+        })
+    });
+    let have_loader = recorded.iter().any(|c| c.name == APP_LOADER)
+        && unit.get(APP_LOADER).is_some_and(|c| {
+            c.fields
+                .iter()
+                .any(|f| f.name == "INSTANCE" && f.access & ACC_STATIC != 0)
+        });
+    // Sorted names, for bsearch.
+    let names: Vec<&String> = app_classes
+        .iter()
+        .filter(|n| recorded.iter().any(|r| &r.name == *n))
+        .collect();
+    let _ = writeln!(out, "static const char *const jabs_app_class_names[] = {{");
+    for n in &names {
+        let _ = writeln!(out, "    \"{}\",", c_escape(n));
+    }
+    let _ = writeln!(out, "    NULL\n}};");
+    out.push_str(
+        "/* Whether the app class loader defines this class. */\n\
+static int jabs_compare_names(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }\n",
+    );
+    let _ = writeln!(
+        out,
+        "static int jabs_is_app_class(const char *name) {{ return bsearch(&name, jabs_app_class_names, {}, sizeof(char *), jabs_compare_names) != NULL; }}",
+        names.len()
+    );
+    if have_loader && class_loader_field {
+        let instance = field_symbol(APP_LOADER, "INSTANCE");
+        let _ = write!(
+            out,
+            r#"static jabs_object *jabs_app_loader_object;
+extern jabs_object *{instance};
+
+/* The app class loader (jabs.rt.AppLoader.INSTANCE), created on first use. Classes created
+ * before it existed get it as their loader once it does. NULL while it is being created. */
+jabs_object *jabs_app_loader(void) {{
+    static int state; /* 0 = not created, 1 = creating, 2 = created */
+    if (state == 2) return jabs_app_loader_object;
+    if (state == 1) return NULL;
+    state = 1;
+    if ({init}() != 0) {{ state = 0; return NULL; }}
+    jabs_app_loader_object = {instance};
+    state = 2;
+    for (size_t i = 0; i < jabs_class_count; i++) jabs_set_defining_loader(jabs_class_entries[i].object, jabs_class_entries[i].name);
+    return jabs_app_loader_object;
+}}
+
+/* Class.getClassLoader: the app loader for classes from the inputs, null (boot) for the rest. */
+static void jabs_set_defining_loader(jabs_object *c, const char *name) {{
+    if (jabs_app_loader_object && name[0] != '[' && jabs_is_app_class(name)) (({class_struct} *)c)->{field} = jabs_app_loader_object;
+}}
+"#,
+            init = init_symbol(APP_LOADER),
+            class_struct = object_struct(CLASS),
+            field = instance_field("classLoader"),
+        );
+    } else {
+        out.push_str(
+            "/* No jabs.rt.AppLoader in the unit: every class belongs to the boot loader. */\n\
+jabs_object *jabs_app_loader(void) { return NULL; }\n\
+static void jabs_set_defining_loader(jabs_object *c, const char *name) { (void)c; (void)name; }\n",
+        );
+    }
+    out.push_str(
+        r#"
+/* AppLoader.loadClass: the Class for a binary name if the unit compiled that class, else NULL. */
+jabs_object *jabs_class_for_binary_name(jabs_object *binary) {
+    char name[1024];
+    if (!binary) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }
+    if (!jabs_string_to_ascii(binary, name, sizeof name)) return NULL;
+    for (char *p = name; *p; p++) if (*p == '.') *p = '/';
+    if (name[0] != '[' && !jabs_record_named(name)) return NULL;
+    return jabs_class_object(name);
+}
+
+/* How many embedded resources have this name. */
+int32_t jabs_resource_count(jabs_object *resource) {
+    char name[1024];
+    if (!resource) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; }
+    if (!jabs_string_to_ascii(resource, name, sizeof name)) return 0;
+    int32_t count = 0;
+    for (const jabs_resource *r = jabs_resources; r->name; r++) count += strcmp(r->name, name) == 0;
+    return count;
+}
+
+/* A new byte[] with the index-th embedded resource of this name, or NULL. */
+jabs_object *jabs_resource_bytes(jabs_object *resource, int32_t index) {
+    char name[1024];
+    if (!resource) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }
+    if (!jabs_string_to_ascii(resource, name, sizeof name)) return NULL;
+    for (const jabs_resource *r = jabs_resources; r->name; r++) {
+        if (strcmp(r->name, name) != 0 || index-- != 0) continue;
+        jabs_object *bytes = jabs_new_array((int32_t)r->length, 1, JABS_COMPONENT_PRIMITIVE, NULL, "[B", NULL);
+        if (bytes) memcpy(jabs_array_data((jabs_array *)bytes), r->data, r->length);
+        return bytes;
+    }
+    return NULL;
+}
+"#,
+    );
+    out
+}
+
+/// The values the VM hands `SystemProps` (`Raw.platformProperties` / `Raw.vmProperties`), and
+/// `jabs_vm_startup()`, which runs `System.initPhase1` as the JVM does before `main`. Platform
+/// indexes come from `Raw`'s own constants, so they follow the compiled JDK.
+fn system_properties_functions(
+    unit: &Unit,
+    java_home: Option<&str>,
+    inits: &BTreeSet<String>,
+    methods: &BTreeSet<MethodKey>,
+) -> String {
+    let mut out = String::new();
+    let raw = unit.get("jdk/internal/util/SystemProps$Raw");
+    let constant = |name: &str| -> Option<i32> {
+        let raw = raw?;
+        let f = raw.fields.iter().find(|f| f.name == name)?;
+        match raw.pool.get(f.constant_value? as usize)? {
+            Constant::Integer(v) => Some(*v),
+            _ => None,
+        }
+    };
+    let string_array = format!(
+        "jabs_new_array({{n}}, sizeof(jabs_object *), JABS_COMPONENT_CLASS, &{}, \"[Ljava/lang/String;\", NULL)",
+        class_record(STRING)
+    );
+    out.push_str(
+        "/* Store a UTF-8 string into a String[] slot; 0 when out of memory. */\n\
+static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {\n\
+    jabs_object *s = jabs_string_from_utf8(value);\n\
+    if (!s) return 0;\n\
+    ((jabs_object **)jabs_array_data((jabs_array *)array))[index] = s;\n\
+    return 1;\n\
+}\n",
+    );
+    match constant("FIXED_LENGTH") {
+        Some(length) => {
+            // (Raw index constant, host value) pairs; format and display locale share the host locale.
+            let pairs = [
+                ("_display_country_NDX", "JABS_PLATFORM_COUNTRY"),
+                ("_display_language_NDX", "JABS_PLATFORM_LANGUAGE"),
+                ("_format_country_NDX", "JABS_PLATFORM_COUNTRY"),
+                ("_format_language_NDX", "JABS_PLATFORM_LANGUAGE"),
+                ("_file_separator_NDX", "JABS_PLATFORM_FILE_SEPARATOR"),
+                ("_java_io_tmpdir_NDX", "JABS_PLATFORM_TMPDIR"),
+                ("_line_separator_NDX", "JABS_PLATFORM_LINE_SEPARATOR"),
+                ("_native_encoding_NDX", "JABS_PLATFORM_NATIVE_ENCODING"),
+                ("_os_arch_NDX", "JABS_PLATFORM_OS_ARCH"),
+                ("_os_name_NDX", "JABS_PLATFORM_OS_NAME"),
+                ("_os_version_NDX", "JABS_PLATFORM_OS_VERSION"),
+                ("_path_separator_NDX", "JABS_PLATFORM_PATH_SEPARATOR"),
+                ("_sun_arch_data_model_NDX", "JABS_PLATFORM_DATA_MODEL"),
+                ("_sun_cpu_endian_NDX", "JABS_PLATFORM_ENDIAN"),
+                ("_sun_io_unicode_encoding_NDX", "JABS_PLATFORM_UNICODE_ENCODING"),
+                ("_sun_jnu_encoding_NDX", "JABS_PLATFORM_JNU_ENCODING"),
+                ("_user_dir_NDX", "JABS_PLATFORM_USER_DIR"),
+                ("_user_home_NDX", "JABS_PLATFORM_USER_HOME"),
+                ("_user_name_NDX", "JABS_PLATFORM_USER_NAME"),
+            ];
+            let _ = writeln!(
+                out,
+                "\n/* Raw.platformProperties: host values at the indexes SystemProps$Raw defines. */\njabs_object *jabs_platform_properties(void) {{"
+            );
+            let _ = writeln!(out, "    jabs_object *a = {};", string_array.replace("{n}", &length.to_string()));
+            let _ = writeln!(out, "    if (!a) return NULL;");
+            let _ = writeln!(out, "    const char *v;");
+            for (name, which) in pairs {
+                if let Some(index) = constant(name).filter(|i| (0..length).contains(i)) {
+                    let _ = writeln!(
+                        out,
+                        "    if ((v = jabs_platform_value({which})) && !jabs_put_utf8(a, {index}, v)) return NULL;"
+                    );
+                }
+            }
+            let _ = writeln!(out, "    return a;\n}}");
+        }
+        None => out.push_str(
+            "jabs_object *jabs_platform_properties(void) { jabs_not_compiled(\"SystemProps$Raw has no FIXED_LENGTH\"); }\n",
+        ),
+    }
+    // The class file version of Object gives the Java feature release of the compiled JDK.
+    let feature = unit.get(OBJECT).map_or(0, |o| o.major.saturating_sub(44));
+    let home = match java_home {
+        Some(h) => format!("\"{}\"", c_escape(h)),
+        None => "jabs_platform_value(JABS_PLATFORM_EXE_DIR)".to_string(),
+    };
+    let vm: Vec<(&str, String)> = vec![
+        ("java.home", home),
+        (
+            "java.vm.specification.name",
+            "\"Java Virtual Machine Specification\"".into(),
+        ),
+        (
+            "java.vm.specification.vendor",
+            "\"Oracle Corporation\"".into(),
+        ),
+        ("java.vm.specification.version", format!("\"{feature}\"")),
+        ("java.vm.name", "\"JABS native\"".into()),
+        ("java.vm.vendor", "\"JABS\"".into()),
+        (
+            "java.vm.version",
+            format!("\"{}\"", env!("CARGO_PKG_VERSION")),
+        ),
+        ("java.vm.info", "\"compiled to native code\"".into()),
+        ("jdk.debug", "\"release\"".into()),
+        ("java.class.path", "\"\"".into()),
+        ("java.library.path", "\"\"".into()),
+        ("sun.boot.library.path", "\"\"".into()),
+        ("sun.java.launcher", "\"JABS\"".into()),
+    ];
+    let _ = writeln!(
+        out,
+        "\n/* Raw.vmProperties: key, value pairs the VM defines. */\njabs_object *jabs_vm_properties(void) {{"
+    );
+    let _ = writeln!(
+        out,
+        "    jabs_object *a = {};",
+        string_array.replace("{n}", &(vm.len() * 2).to_string())
+    );
+    let _ = writeln!(out, "    if (!a) return NULL;");
+    let _ = writeln!(out, "    const char *v;");
+    for (i, (key, value)) in vm.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "    if (!jabs_put_utf8(a, {}, \"{key}\") || ((v = {value}) && !jabs_put_utf8(a, {}, v))) return NULL;",
+            2 * i,
+            2 * i + 1
+        );
+    }
+    let _ = writeln!(out, "    return a;\n}}");
+    // Startup, when the unit has it.
+    // Only whole programs (with the app loader) compile the startup in.
+    let has_startup = methods.contains(&(
+        SYSTEM.to_string(),
+        "initPhase1".to_string(),
+        "()V".to_string(),
+    ));
+    out.push_str("\n/* What the JVM does before main: System.initPhase1 (properties, standard streams). */\n");
+    if has_startup {
+        let _ = writeln!(out, "int jabs_vm_startup(void) {{");
+        for class in VM_PREINITIALIZED.iter().filter(|c| inits.contains(**c)) {
+            let _ = writeln!(out, "    if ({}() != 0) return -1;", init_symbol(class));
+            if *class == "jdk/internal/misc/UnsafeConstants" {
+                // Values HotSpot injects after <clinit> set its placeholders.
+                for (field, value) in [
+                    ("ADDRESS_SIZE0", "(int32_t)sizeof(void *)"),
+                    ("PAGE_SIZE", "4096"),
+                    (
+                        "BIG_ENDIAN",
+                        "(*(const uint8_t *)&(const uint16_t){ 1 } == 0)",
+                    ),
+                    ("UNALIGNED_ACCESS", "JABS_UNALIGNED_ACCESS"),
+                    ("DATA_CACHE_LINE_FLUSH_SIZE", "0"),
+                ] {
+                    if unit
+                        .get(class)
+                        .is_some_and(|c| c.fields.iter().any(|f| f.name == field))
+                    {
+                        let _ = writeln!(out, "    {} = {value};", field_symbol(class, field));
+                    }
+                }
+            }
+        }
+        let _ = writeln!(
+            out,
+            "    {}();
+    return jabs_pending ? -1 : 0;
+}}",
+            symbol(SYSTEM, "initPhase1", "()V")
+        );
+    } else {
+        out.push_str("int jabs_vm_startup(void) { return 0; }\n");
+    }
+    out
+}
+
+/// `Class.forName`: compiled classes by name, initialized on request. Every class of the unit is
+/// listed, so a class that exists but was not compiled into the program stops with a diagnostic
+/// instead of a false ClassNotFoundException.
+fn for_name_function(unit: &Unit, inits: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    let mut known: Vec<&str> = unit.classes.keys().copied().collect();
+    known.sort_unstable();
+    let _ = writeln!(out, "static const char *const jabs_unit_class_names[] = {{");
+    for n in &known {
+        let _ = writeln!(out, "    \"{}\",", c_escape(n));
+    }
+    let _ = writeln!(out, "    NULL\n}};");
+    for n in inits {
+        let _ = writeln!(out, "int {}(void);", init_symbol(n));
+    }
+    let _ = writeln!(
+        out,
+        "typedef struct {{ const char *name; int (*init)(void); }} jabs_init_entry;\nstatic const jabs_init_entry jabs_init_functions[] = {{"
+    );
+    for n in inits {
+        let _ = writeln!(out, "    {{ \"{}\", {} }},", c_escape(n), init_symbol(n));
+    }
+    let _ = writeln!(out, "    {{ NULL, NULL }}\n}};");
+    let _ = write!(
+        out,
+        r#"static int jabs_compare_init(const void *key, const void *entry) {{ return strcmp((const char *)key, ((const jabs_init_entry *)entry)->name); }}
+
+/* Class.forName0(name, initialize, loader, caller). */
+jabs_object *jabs_class_for_name(jabs_object *binary, int32_t initialize, jabs_object *loader) {{
+    char name[1024];
+    if (!binary) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    if (!jabs_string_to_ascii(binary, name, sizeof name)) {{ jabs_pending = jabs_vm_throwable(JABS_VM_CLASS_NOT_FOUND); return NULL; }}
+    for (char *p = name; *p; p++) if (*p == '.') *p = '/';
+    if (name[0] == '[') return jabs_class_object(name);
+    const char *key = name;
+    int known = bsearch(&key, jabs_unit_class_names, {known_count}, sizeof(char *), jabs_compare_names) != NULL;
+    /* The boot loader (null) does not see application classes. */
+    if (!known || (!loader && jabs_is_app_class(name))) {{ jabs_pending = jabs_vm_throwable(JABS_VM_CLASS_NOT_FOUND); return NULL; }}
+    if (!jabs_record_named(name)) {{
+        static char message[1100];
+        snprintf(message, sizeof message, "Class.forName(\"%s\") (the class was not compiled into this program)", name);
+        jabs_not_compiled(message);
+    }}
+    if (initialize) {{
+        const jabs_init_entry *e = (const jabs_init_entry *)bsearch(name, jabs_init_functions, {init_count}, sizeof *e, jabs_compare_init);
+        if (!e) {{
+            static char message[1100];
+            snprintf(message, sizeof message, "Class.forName(\"%s\", true, ...) (its initialization was not compiled)", name);
+            jabs_not_compiled(message);
+        }}
+        if (e->init() != 0) return NULL;
+    }}
+    return jabs_class_object(name);
+}}
+"#,
+        known_count = known.len(),
+        init_count = inits.len(),
+    );
+    out
+}
+
+/// `Class.newInstance`: allocate and run the no-arg constructor of a compiled concrete class.
+fn new_instance_function(
+    unit: &Unit,
+    recorded: &[&ClassFile],
+    methods: &BTreeSet<MethodKey>,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "typedef struct {{ const char *name; const jabs_class *record; void (*ctor)(jabs_object *); }} jabs_ctor_entry;\nstatic const jabs_ctor_entry jabs_ctors[] = {{"
+    );
+    let mut rows: Vec<&ClassFile> = recorded
+        .iter()
+        .copied()
+        .filter(|c| c.access & (ACC_INTERFACE | ACC_ABSTRACT) == 0)
+        .filter(|c| {
+            c.methods
+                .iter()
+                .any(|m| m.name == "<init>" && m.descriptor == "()V")
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    for c in &rows {
+        let key = (c.name.clone(), "<init>".to_string(), "()V".to_string());
+        let ctor = if methods.contains(&key) {
+            format!(
+                "(void (*)(jabs_object *)){}",
+                symbol(&c.name, "<init>", "()V")
+            )
+        } else {
+            "NULL".to_string()
+        };
+        let _ = writeln!(
+            out,
+            "    {{ \"{}\", &{}, {ctor} }},",
+            c_escape(&c.name),
+            class_record(&c.name)
+        );
+    }
+    let _ = writeln!(out, "    {{ NULL, NULL, NULL }}\n}};");
+    let _ = unit;
+    let _ = write!(
+        out,
+        r#"static int jabs_compare_ctor(const void *key, const void *entry) {{ return strcmp((const char *)key, ((const jabs_ctor_entry *)entry)->name); }}
+
+/* Class.newInstance (replacement): InstantiationException for primitives, arrays, interfaces,
+ * abstract classes and classes without a no-arg constructor, as on the JVM. */
+jabs_object *jabs_class_new_instance(jabs_object *c) {{
+    jabs_class_entry *e = jabs_class_entry_of(c);
+    if (!e || e->name[0] == '[' || jabs_is_primitive_name(e->name)) {{ jabs_pending = jabs_vm_throwable(JABS_VM_INSTANTIATION); return NULL; }}
+    const jabs_ctor_entry *k = (const jabs_ctor_entry *)bsearch(e->name, jabs_ctors, {count}, sizeof *k, jabs_compare_ctor);
+    if (!k) {{
+        if (!e->record) jabs_not_compiled("Class.newInstance for a class outside the unit");
+        jabs_pending = jabs_vm_throwable(JABS_VM_INSTANTIATION);
+        return NULL;
+    }}
+    if (!k->ctor) {{
+        static char message[1100];
+        snprintf(message, sizeof message, "Class.newInstance of %s (its constructor was not compiled into this program)", e->name);
+        jabs_not_compiled(message);
+    }}
+    const jabs_init_entry *i = (const jabs_init_entry *)bsearch(e->name, jabs_init_functions, sizeof jabs_init_functions / sizeof *jabs_init_functions - 1, sizeof *i, jabs_compare_init);
+    if (i && i->init() != 0) return NULL;
+    jabs_object *o = jabs_new(k->record);
+    if (!o) return NULL;
+    k->ctor(o);
+    return jabs_pending ? NULL : o;
+}}
+"#,
+        count = rows.len(),
+    );
+    out
+}
+
+/// `resources.c`: the embedded resource table (`jabs_resources`, ended by a NULL name).
+pub fn resources_file(resources: &[(String, Vec<u8>)]) -> String {
+    let mut out = String::from("#include \"jabs_unit.h\"\n");
+    for (i, (_, data)) in resources.iter().enumerate() {
+        let _ = write!(
+            out,
+            "static const unsigned char jabs_resource_{i}[{}] = \"",
+            data.len() + 1
+        );
+        for (j, b) in data.iter().enumerate() {
+            if j > 0 && j % 4096 == 0 {
+                out.push_str("\"\n\"");
+            }
+            let _ = write!(out, "\\{b:03o}");
+        }
+        out.push_str("\";\n");
+    }
+    out.push_str("const jabs_resource jabs_resources[] = {\n");
+    for (i, (name, data)) in resources.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "    {{ \"{}\", jabs_resource_{i}, {} }},",
+            c_escape(name),
+            data.len()
+        );
+    }
+    out.push_str("    { NULL, NULL, 0 }\n};\n");
+    out
 }
 
 /// `jabs_main_thread()`: the main Thread the VM would create at startup (thread groups "system"
@@ -3655,7 +4559,19 @@ fn main_thread_function(unit: &Unit, recorded: &[&ClassFile]) -> String {
         "Ljava/lang/Object;",
         "lock",
     ));
-    body.push_str("    main_thread = t;\n    return t;\n}\n");
+    body.push_str("    main_thread = t;\n");
+    // The context class loader of the main thread is the application class loader.
+    body.push_str(
+        "    jabs_object *loader = jabs_app_loader();\n    if (jabs_pending) return NULL;\n",
+    );
+    body.push_str(&set(
+        thread,
+        "t",
+        "contextClassLoader",
+        "Ljava/lang/ClassLoader;",
+        "loader",
+    ));
+    body.push_str("    return t;\n}\n");
     body
 }
 
@@ -3992,6 +4908,7 @@ fn reachable(
     intrinsics: &HashMap<MethodKey, (String, bool)>,
     initializable: &BTreeSet<String>,
     roots: &BTreeSet<String>,
+    loaded: &BTreeSet<String>,
 ) -> Emission {
     let compiled = |k: &MethodKey| matches!(results.get(k), Some(Ok(_)));
     let mut out = Emission {
@@ -4002,6 +4919,18 @@ fn reachable(
     };
     let mut work: Vec<MethodKey> = Vec::new();
     let mut pending_inits: Vec<String> = Vec::new();
+    if roots.contains(APP_LOADER) {
+        let startup = (
+            SYSTEM.to_string(),
+            "initPhase1".to_string(),
+            "()V".to_string(),
+        );
+        if compiled(&startup) {
+            work.push(startup);
+            pending_inits.push(SYSTEM.to_string());
+            pending_inits.extend(VM_PREINITIALIZED.iter().map(|c| c.to_string()));
+        }
+    }
     for class in classes.iter().filter(|c| roots.contains(&c.name)) {
         pending_inits.push(class.name.clone());
         for m in &class.methods {
@@ -4044,6 +4973,30 @@ fn reachable(
     // Rapid Type Analysis: an implementation is reachable only when its class is instantiated AND
     // some reachable code calls its (name, descriptor) virtually or through an interface.
     let mut called: BTreeSet<(String, String)> = BTreeSet::new();
+    // Classes observed loading on the JVM may be loaded by name and created with newInstance.
+    for name in loaded.iter().map(String::as_str) {
+        let Some(class) = unit.get(name) else {
+            continue;
+        };
+        if unit.chain(name).is_err() {
+            continue;
+        }
+        add_records(name, &mut out.records);
+        pending_inits.push(name.to_string());
+        if class.access & (ACC_INTERFACE | ACC_ABSTRACT) == 0 {
+            let ctor = (name.to_string(), "<init>".to_string(), "()V".to_string());
+            if compiled(&ctor) {
+                work.push(ctor);
+            }
+            if out.instantiated.insert(name.to_string()) {
+                work.extend(
+                    implementations(name)
+                        .into_iter()
+                        .filter(|k| compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))),
+                );
+            }
+        }
+    }
     // The runtime may raise any VM exception, so those classes have instances.
     for (name, _) in VM_EXCEPTIONS {
         if unit.get(name).is_some() && unit.chain(name).is_ok() {
@@ -4177,13 +5130,75 @@ fn reachable(
     out
 }
 
+/// The JABS runtime's application class loader (runtime/java/jabs/rt/AppLoader.java).
+const APP_LOADER: &str = "jabs/rt/AppLoader";
+const SYSTEM: &str = "java/lang/System";
+
+/// Classes HotSpot initializes itself before `System.initPhase1`, in its order
+/// (`Threads::initialize_java_lang_classes`). Finalizer's initialization registers the
+/// JavaLangRefAccess that initPhase1 uses; UnsafeConstants receives VM-injected values.
+const VM_PREINITIALIZED: &[&str] = &[
+    "java/lang/String",
+    "java/lang/System",
+    "java/lang/Class",
+    "java/lang/ThreadGroup",
+    "java/lang/Thread",
+    "java/lang/Module",
+    "jdk/internal/misc/UnsafeConstants",
+    "java/lang/reflect/Method",
+    "java/lang/ref/Finalizer",
+    "java/lang/OutOfMemoryError",
+    "java/lang/NullPointerException",
+    "java/lang/ClassCastException",
+    "java/lang/ArrayStoreException",
+    "java/lang/ArithmeticException",
+    "java/lang/StackOverflowError",
+    "java/lang/IllegalMonitorStateException",
+    "java/lang/IllegalArgumentException",
+];
+
+/// Host queries and standard-stream I/O (handwritten, OS-specific).
+const PLATFORM_C: &str = include_str!("../runtime/jabs_platform.c");
+
+/// What a program needs beyond its classes.
+#[derive(Default)]
+pub struct UnitExtras {
+    /// Classes the application class loader defines (the rest belong to the boot loader).
+    pub app_classes: BTreeSet<String>,
+    /// Non-class files from the input jars, embedded for the app class loader: (name, contents).
+    pub resources: Vec<(String, Vec<u8>)>,
+    /// `java.home` for the program: the JDK whose java.base was compiled in (its lib/ files are
+    /// still read from there). None means the executable's directory.
+    pub java_home: Option<String>,
+    /// Classes a real JVM run of this program loaded (`-Xlog:class+load`). Each may be loaded by
+    /// name, so its record, initializer and no-arg constructor are kept and it may be instantiated.
+    pub loaded_classes: BTreeSet<String>,
+}
+
 /// Compile a set of classes together into one C unit, emitting only what is reachable from
 /// `roots` (all classes when None). Every method's status is reported either way.
 pub fn compile_unit_rooted(
     classes: &[ClassFile],
     roots: Option<&BTreeSet<String>>,
 ) -> CompiledUnit {
+    compile_unit_with(classes, roots, &UnitExtras::default())
+}
+
+/// `compile_unit_rooted` plus class-loader identity and embedded resources.
+pub fn compile_unit_with(
+    classes: &[ClassFile],
+    roots: Option<&BTreeSet<String>>,
+    extras: &UnitExtras,
+) -> CompiledUnit {
     let unit = Unit::new(classes);
+    // The app class loader is created by the runtime itself, so it is always reachable.
+    let mut roots = roots.cloned();
+    if let Some(roots) = roots.as_mut()
+        && unit.get(APP_LOADER).is_some()
+    {
+        roots.insert(APP_LOADER.to_string());
+    }
+    let roots = roots.as_ref();
     let have_classes = classes_available(&unit);
     let mut intrinsics: HashMap<MethodKey, (String, bool)> = HashMap::new();
     let mut results: BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>> =
@@ -4202,6 +5217,10 @@ pub fn compile_unit_rooted(
                 }
 
                 let sig = parse_signature(&method.descriptor).map_err(|e| e.to_string())?;
+                if let Some(body) = replacement(&key) {
+                    intrinsics.insert(key.clone(), body);
+                    return Ok((sig, Analyzed::empty()));
+                }
                 if method.access & ACC_NATIVE != 0 {
                     let Some(body) = intrinsic(&key, have_classes) else {
                         return Err("native method without a JABS implementation".to_string());
@@ -4277,7 +5296,15 @@ pub fn compile_unit_rooted(
         .filter(|c| c.access & ACC_INTERFACE == 0 && unit.chain(&c.name).is_ok())
         .collect();
     let emission = match roots {
-        Some(roots) => reachable(&unit, classes, &results, &intrinsics, &initializable, roots),
+        Some(roots) => reachable(
+            &unit,
+            classes,
+            &results,
+            &intrinsics,
+            &initializable,
+            roots,
+            &extras.loaded_classes,
+        ),
         None => Emission {
             methods: compiled.clone(),
             records: laid_out_all
@@ -4397,9 +5424,19 @@ pub fn compile_unit_rooted(
                 .filter_map(|f| constant_string(class, f)),
         );
     }
-    emit_literals(&mut source, &literals);
-    if have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING) {
-        emit_class_registry(&mut source, &unit, &recorded);
+    let registry =
+        have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING);
+    emit_literals(&mut source, &literals, registry);
+    if registry {
+        emit_class_registry(
+            &mut source,
+            &unit,
+            &recorded,
+            &extras.app_classes,
+            extras.java_home.as_deref(),
+            &emission.inits,
+            &emission.methods,
+        );
     }
     for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
         emit_statics_and_init(&mut source, &unit, class);
@@ -4496,8 +5533,10 @@ pub fn compile_unit_rooted(
         self_contained: self_contained_count,
         methods,
         c_source: format!(
-            "{shared}{RUNTIME_GLOBALS}{support}{}",
-            method_texts.concat()
+            "{shared}{RUNTIME_GLOBALS}{support}{}{}",
+            method_texts.concat(),
+            resources_file(&extras.resources).replacen("#include \"jabs_unit.h\"\n", "", 1)
+                + &PLATFORM_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
         ),
         c_files: {
             let header = format!(
@@ -4511,6 +5550,8 @@ pub fn compile_unit_rooted(
                     format!("#include \"jabs_unit.h\"\n{RUNTIME_GLOBALS}{support}"),
                 ),
             ];
+            files.push(("resources.c".to_string(), resources_file(&extras.resources)));
+            files.push(("jabs_platform.c".to_string(), PLATFORM_C.to_string()));
             for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
                 files.push((
                     format!("unit_{}.c", i + 1),

@@ -357,6 +357,36 @@ pub fn classes_from_zip<R: Read + std::io::Seek>(
 }
 
 /// Load classes from `.class` files and jars, failing on anything unparsable.
+/// Every non-class file in the input jars, in input order: what the app class loader serves.
+/// Directories and signature files (`META-INF/*.SF`, `.RSA`, `.DSA`, `.EC`) are left out.
+pub fn load_resources(inputs: &[std::path::PathBuf]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for input in inputs.iter().filter(|i| {
+        !i.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("class"))
+    }) {
+        let mut zip = zip::ZipArchive::new(
+            std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?,
+        )?;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i)?;
+            let name = entry.name().to_string();
+            let upper = name.to_ascii_uppercase();
+            let signature = upper.starts_with("META-INF/")
+                && [".SF", ".RSA", ".DSA", ".EC"]
+                    .iter()
+                    .any(|x| upper.ends_with(x));
+            if entry.is_dir() || name.ends_with(".class") || signature {
+                continue;
+            }
+            let mut data = Vec::with_capacity(entry.size().min(1 << 26) as usize);
+            entry.read_to_end(&mut data)?;
+            out.push((name, data));
+        }
+    }
+    Ok(out)
+}
+
 pub fn load_classes(inputs: &[std::path::PathBuf]) -> Result<Vec<ClassFile>> {
     let mut classes = Vec::new();
     for input in inputs {

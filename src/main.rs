@@ -62,6 +62,10 @@ enum Action {
         /// Emit only code reachable from these classes (internal names; default: every input class).
         #[arg(long)]
         root: Vec<String>,
+        /// Classes a JVM run loaded (one internal name per line, from `-Xlog:class+load`): they
+        /// may be loaded by name, so they are kept with their initializers and no-arg constructors.
+        #[arg(long)]
+        loaded_classes: Option<PathBuf>,
     },
     /// Download (verified against Mojang's hashes) and launch a vanilla client on the JVM, offline sign-in.
     Client {
@@ -145,6 +149,7 @@ fn execute(cli: Cli) -> Result<()> {
             out,
             out_dir,
             root,
+            loaded_classes,
         } => {
             let mut classes = jabs::jar::load_classes(&inputs)?;
             let roots: std::collections::BTreeSet<String> =
@@ -155,8 +160,10 @@ fn execute(cli: Cli) -> Result<()> {
             } else {
                 root.into_iter().collect()
             };
+            let mut java_home = None;
             if let Some(java) = jdk {
                 let home = jabs::jdk::java_home(&java)?;
+                java_home = Some(home.clone());
                 let (library, _, _) = jabs::jdk::read_module(&home, "java.base")?;
                 classes.extend(
                     library
@@ -164,7 +171,23 @@ fn execute(cli: Cli) -> Result<()> {
                         .filter(|c| !inputs_named.contains(&c.name)),
                 );
             }
-            let compiled = jabs::cgen::compile_unit_rooted(&classes, Some(&roots));
+            // Input classes belong to the app class loader; their jars' other files are its resources.
+            let extras = jabs::cgen::UnitExtras {
+                app_classes: inputs_named.clone(),
+                resources: jabs::jar::load_resources(&inputs)?,
+                java_home: java_home.map(|h| h.display().to_string()),
+                loaded_classes: match loaded_classes {
+                    Some(path) => std::fs::read_to_string(&path)
+                        .with_context(|| format!("read {}", path.display()))?
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(str::to_string)
+                        .collect(),
+                    None => Default::default(),
+                },
+            };
+            let compiled = jabs::cgen::compile_unit_with(&classes, Some(&roots), &extras);
             if let Some(out) = out {
                 std::fs::write(&out, &compiled.c_source)
                     .with_context(|| format!("write {}", out.display()))?;
