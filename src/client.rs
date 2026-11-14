@@ -207,8 +207,8 @@ fn version_json(root: &Path, version: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
-/// Libraries that apply to this host: (classpath jar, download).
-fn libraries(root: &Path, meta: &Value) -> Result<Vec<Download>> {
+/// Libraries that apply to this host, each with its identity `group:artifact[:classifier]`.
+fn libraries(root: &Path, meta: &Value) -> Result<Vec<(String, Download)>> {
     let none = HashMap::new();
     let mut out = Vec::new();
     for lib in meta["libraries"]
@@ -221,13 +221,25 @@ fn libraries(root: &Path, meta: &Value) -> Result<Vec<Download>> {
         let Some(artifact) = lib.pointer("/downloads/artifact") else {
             bail!("library {} has no artifact download", lib["name"]);
         };
-        out.push(Download {
-            url: artifact["url"].as_str().context("library url")?.into(),
-            sha1: sha1_field(&artifact["sha1"])?,
-            path: root.join("libraries").join(safe_relative(
-                artifact["path"].as_str().context("library path")?,
-            )?),
-        });
+        let name = lib["name"].as_str().context("library name")?;
+        let parts: Vec<&str> = name.split(':').collect();
+        let key = match parts.as_slice() {
+            [group, artifact, _version] => format!("{group}:{artifact}"),
+            [group, artifact, _version, classifier, ..] => {
+                format!("{group}:{artifact}:{classifier}")
+            }
+            _ => bail!("malformed library name {name:?}"),
+        };
+        out.push((
+            key,
+            Download {
+                url: artifact["url"].as_str().context("library url")?.into(),
+                sha1: sha1_field(&artifact["sha1"])?,
+                path: root.join("libraries").join(safe_relative(
+                    artifact["path"].as_str().context("library path")?,
+                )?),
+            },
+        ));
     }
     Ok(out)
 }
@@ -252,7 +264,13 @@ pub fn install(root: &Path, version: &str) -> Result<InstallReport> {
             .join(format!("{version}.jar")),
     };
     downloaded += ensure_all(vec![jar], "client jar")?;
-    downloaded += ensure_all(libraries(root, &meta)?, "libraries")?;
+    downloaded += ensure_all(
+        libraries(root, &meta)?
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect(),
+        "libraries",
+    )?;
 
     let index = &meta["assetIndex"];
     let index_id = index["id"].as_str().context("asset index id")?;
@@ -292,6 +310,49 @@ pub fn install(root: &Path, version: &str) -> Result<InstallReport> {
             .and_then(Value::as_u64)
             .unwrap_or(8) as u32,
         downloaded,
+    })
+}
+
+/// A mod loader version installed by another launcher, used read-only.
+struct LoaderVersion {
+    meta: Value,
+    root: PathBuf,
+    libraries: Vec<(String, Download)>,
+}
+
+/// Read a loader version (e.g. `neoforge-21.1.265`) from another launcher's install root and check
+/// every library it lists against its recorded SHA-1. Nothing in that root is written.
+fn foreign_loader(loader_root: &Path, id: &str) -> Result<LoaderVersion> {
+    let path = loader_root
+        .join("versions")
+        .join(safe_relative(id)?)
+        .join(format!("{id}.json"));
+    let meta: Value = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if meta["inheritsFrom"].as_str().is_none() || meta.get("arguments").is_none() {
+        bail!("{id} is not a modern loader version (needs inheritsFrom and arguments)");
+    }
+    let libraries = libraries(loader_root, &meta)?;
+    if let Some((_, d)) = libraries.iter().find(|(_, d)| !verified(&d.path, &d.sha1)) {
+        bail!(
+            "{} is missing or does not match its recorded SHA-1; repair the instance in its own launcher",
+            d.path.display()
+        );
+    }
+    eprintln!(
+        "{id}: {} loader libraries verified (read-only, in {})",
+        libraries.len(),
+        loader_root.display()
+    );
+    eprintln!(
+        "{id}: the game jars its installer generated (patched Minecraft) have no published hash and are used as found"
+    );
+    Ok(LoaderVersion {
+        meta,
+        root: loader_root.into(),
+        libraries,
     })
 }
 
@@ -346,6 +407,8 @@ pub struct ClientOptions<'a> {
     pub server: Option<&'a str>,
     pub java: Option<&'a Path>,
     pub max_memory: &'a str,
+    /// Another launcher's install root holding `version` as a mod loader version (read-only).
+    pub loader_root: Option<&'a Path>,
 }
 
 /// Install (if needed) and launch the client, waiting for it to exit; returns its exit code.
@@ -359,11 +422,19 @@ pub fn run(o: &ClientOptions) -> Result<i32> {
         bail!("username must be 3-16 letters, digits or underscores");
     }
     let root = std::path::absolute(o.root)?;
-    let installed = install(&root, o.version)?;
+    let loader = o
+        .loader_root
+        .map(|r| foreign_loader(r, o.version))
+        .transpose()?;
+    let base = match &loader {
+        Some(l) => l.meta["inheritsFrom"].as_str().unwrap().to_string(),
+        None => o.version.to_string(),
+    };
+    let installed = install(&root, &base)?;
     let meta: Value = serde_json::from_slice(&fs::read(
         root.join("versions")
-            .join(o.version)
-            .join(format!("{}.json", o.version)),
+            .join(&base)
+            .join(format!("{base}.json")),
     )?)?;
     if meta.get("arguments").is_none() {
         bail!(
@@ -381,17 +452,34 @@ pub fn run(o: &ClientOptions) -> Result<i32> {
     let natives = game_dir.join(".jabs/natives");
     fs::create_dir_all(&natives)?;
     let sep = if cfg!(windows) { ";" } else { ":" };
-    let mut classpath: Vec<String> = libraries(&root, &meta)?
+    // Loader libraries first; a vanilla library the loader also ships (same identity) is dropped.
+    let loader_libraries = loader
+        .as_ref()
+        .map(|l| l.libraries.as_slice())
+        .unwrap_or(&[]);
+    let mut classpath: Vec<String> = loader_libraries
         .iter()
-        .map(|d| d.path.display().to_string())
+        .map(|(_, d)| d.path.display().to_string())
         .collect();
-    classpath.push(
-        root.join("versions")
-            .join(o.version)
-            .join(format!("{}.jar", o.version))
-            .display()
-            .to_string(),
-    );
+    for (key, d) in libraries(&root, &meta)? {
+        if !loader_libraries.iter().any(|(k, _)| *k == key) {
+            classpath.push(d.path.display().to_string());
+        }
+    }
+    // A loader provides the game itself (patched); only vanilla runs the plain client jar.
+    if loader.is_none() {
+        classpath.push(
+            root.join("versions")
+                .join(o.version)
+                .join(format!("{}.jar", o.version))
+                .display()
+                .to_string(),
+        );
+    }
+    let library_directory = match &loader {
+        Some(l) => l.root.join("libraries"),
+        None => root.join("libraries"),
+    };
 
     let mut features = HashMap::new();
     features.insert("is_quick_play_multiplayer", o.server.is_some());
@@ -418,10 +506,7 @@ pub fn run(o: &ClientOptions) -> Result<i32> {
         ("launcher_version", env!("CARGO_PKG_VERSION").into()),
         ("classpath", classpath.join(sep)),
         ("classpath_separator", sep.into()),
-        (
-            "library_directory",
-            root.join("libraries").display().to_string(),
-        ),
+        ("library_directory", library_directory.display().to_string()),
         ("quickPlayMultiplayer", o.server.unwrap_or("").to_string()),
     ]);
     let substitute = |s: &str| {
@@ -456,13 +541,21 @@ pub fn run(o: &ClientOptions) -> Result<i32> {
         .current_dir(&game_dir)
         .arg(format!("-Xmx{}", o.max_memory));
     // Mojang's logging config (XML events for the official launcher) is not used; the game's own text logging is.
+    // Inherited arguments come first, then the loader's own (the official launcher's merge order).
+    let loader_meta = loader.as_ref().map(|l| &l.meta);
     command.args(expand(&meta["arguments"]["jvm"]));
+    if let Some(l) = loader_meta {
+        command.args(expand(&l["arguments"]["jvm"]));
+    }
     command.arg(
-        meta["mainClass"]
+        loader_meta.unwrap_or(&meta)["mainClass"]
             .as_str()
             .context("version has no mainClass")?,
     );
     command.args(expand(&meta["arguments"]["game"]));
+    if let Some(l) = loader_meta {
+        command.args(expand(&l["arguments"]["game"]));
+    }
     eprintln!(
         "launching Minecraft {} as {} ({}) with {}{}",
         o.version,
@@ -477,6 +570,60 @@ pub fn run(o: &ClientOptions) -> Result<i32> {
         .status()
         .with_context(|| format!("start {}", java.display()))?;
     Ok(status.code().unwrap_or(-1))
+}
+
+/// What JABS uses from a CurseForge instance folder.
+pub struct CurseForgeInstance {
+    /// Version to launch: the mod loader's version id, or the game version when vanilla.
+    pub version: String,
+    pub game_version: String,
+    /// CurseForge's install root holding the loader (`<instances>/../Install`, else the default).
+    pub loader_root: Option<PathBuf>,
+    pub max_memory: String,
+}
+
+/// Read `minecraftinstance.json` from a CurseForge instance folder.
+pub fn curseforge_instance(dir: &Path) -> Result<CurseForgeInstance> {
+    let path = dir.join("minecraftinstance.json");
+    let meta: Value = serde_json::from_slice(
+        &fs::read(&path)
+            .with_context(|| format!("{} is not a CurseForge instance", dir.display()))?,
+    )?;
+    let game_version = meta["gameVersion"]
+        .as_str()
+        .context("instance has no gameVersion")?
+        .to_string();
+    let loader = meta["baseModLoader"]["name"].as_str().map(str::to_string);
+    let loader_root = loader.as_ref().and_then(|id| {
+        let mut candidates = Vec::new();
+        if let Some(parent) = std::path::absolute(dir)
+            .ok()
+            .and_then(|d| d.parent().and_then(Path::parent).map(Path::to_path_buf))
+        {
+            candidates.push(parent.join("Install"));
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            candidates.push(PathBuf::from(home).join("curseforge/minecraft/Install"));
+        }
+        candidates.into_iter().find(|c| {
+            c.join("versions")
+                .join(id)
+                .join(format!("{id}.json"))
+                .is_file()
+        })
+    });
+    if loader.is_some() && loader_root.is_none() {
+        bail!(
+            "could not find CurseForge's install folder for this instance's loader; pass --loader-root"
+        );
+    }
+    let memory_mb = meta["allocatedMemory"].as_u64().unwrap_or(4096);
+    Ok(CurseForgeInstance {
+        version: loader.unwrap_or_else(|| game_version.clone()),
+        game_version,
+        loader_root,
+        max_memory: format!("{memory_mb}M"),
+    })
 }
 
 #[cfg(test)]

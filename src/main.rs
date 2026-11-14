@@ -65,8 +65,14 @@ enum Action {
     },
     /// Download (verified against Mojang's hashes) and launch a vanilla client on the JVM, offline sign-in.
     Client {
-        /// Minecraft version id, e.g. `1.21.1`.
-        version: String,
+        /// Minecraft version id, e.g. `1.21.1` (or omit and pass --instance).
+        version: Option<String>,
+        /// A CurseForge instance folder: its version, mod loader, memory and game directory are used.
+        #[arg(long)]
+        instance: Option<PathBuf>,
+        /// The install root that holds the instance's mod loader (default: CurseForge's, found automatically).
+        #[arg(long)]
+        loader_root: Option<PathBuf>,
         /// Offline player name (servers must run with `online-mode=false`).
         #[arg(long)]
         username: String,
@@ -82,8 +88,9 @@ enum Action {
         /// Java executable; default: the first installed Java matching the version's requirement.
         #[arg(long)]
         java: Option<PathBuf>,
-        #[arg(long, default_value = "4G")]
-        max_memory: String,
+        /// Maximum heap, e.g. `4G` (default: the instance's setting, else 4G).
+        #[arg(long)]
+        max_memory: Option<String>,
         /// Only download and verify; do not launch.
         #[arg(long)]
         install_only: bool,
@@ -205,9 +212,29 @@ fn execute(cli: Cli) -> Result<()> {
             java,
             max_memory,
             install_only,
+            instance,
+            loader_root,
         } => {
+            let cf = instance
+                .as_deref()
+                .map(jabs::client::curseforge_instance)
+                .transpose()?;
+            let version = match (&cf, version) {
+                (Some(cf), None) => cf.version.clone(),
+                (None, Some(v)) => v,
+                _ => anyhow::bail!("pass either a version or --instance"),
+            };
+            let loader_root =
+                loader_root.or_else(|| cf.as_ref().and_then(|c| c.loader_root.clone()));
+            let game_dir = game_dir.or_else(|| instance.clone());
+            let max_memory = max_memory
+                .or_else(|| cf.as_ref().map(|c| c.max_memory.clone()))
+                .unwrap_or_else(|| "4G".into());
             if install_only {
-                let report = jabs::client::install(&root, &version)?;
+                let base = cf
+                    .as_ref()
+                    .map_or(version.as_str(), |c| c.game_version.as_str());
+                let report = jabs::client::install(&root, base)?;
                 eprintln!(
                     "{} installed ({} files downloaded); needs Java {}",
                     report.version, report.downloaded, report.java_major
@@ -222,6 +249,7 @@ fn execute(cli: Cli) -> Result<()> {
                 server: server.as_deref(),
                 java: java.as_deref(),
                 max_memory: &max_memory,
+                loader_root: loader_root.as_deref(),
             })?;
             eprintln!("Minecraft exited with code {code}");
             Ok(())
