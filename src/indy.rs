@@ -36,6 +36,9 @@ pub struct Report {
     pub others: usize,
     /// (class, method, reason) for call sites left as invokedynamic.
     pub skipped: Vec<(String, String, String)>,
+    /// (generated class, call-site class) for every class this pass generated. The JVM defines
+    /// a spun class in its call site's loader, so the generated class takes that class's loader.
+    pub defined_by: Vec<(String, String)>,
 }
 
 /// Translate every supported invokedynamic in `classes`, appending the generated classes.
@@ -70,6 +73,9 @@ pub fn desugar(classes: &mut Vec<ClassFile>) -> Report {
                         let code = class.methods[m].code.as_mut().unwrap();
                         let [hi, lo] = target.to_be_bytes();
                         code.bytecode[pc..pc + 5].copy_from_slice(&[0xb8, hi, lo, 0x00, 0x00]);
+                        report
+                            .defined_by
+                            .push((synthetic.name.clone(), class.name.clone()));
                         generated.push(synthetic);
                     }
                     Err(reason) => report.skipped.push((
@@ -1123,8 +1129,7 @@ fn object_method(
         let f = pool.field(&g.0, &g.1, &g.2);
         asm.load("L", local).op(0xb4).u16(f);
     };
-    let locals;
-    match method {
+    let locals = match method {
         "hashCode" => {
             // result = 0; for each component: result = result * 31 + hash(component)
             asm.op(0x03);
@@ -1148,7 +1153,7 @@ fn object_method(
                 asm.invoke(0xb8, m, slots(&g.2)).op(0x60);
             }
             asm.op(0xac);
-            locals = 1;
+            1
         }
         "equals" => {
             // Same object: true. Not an instance: false. Then components, last first.
@@ -1192,7 +1197,7 @@ fn object_method(
                 asm.land(at);
             }
             asm.op(0x03).op(0xac);
-            locals = 3;
+            3
         }
         "toString" => {
             // Name[a=1, b=x]
@@ -1236,10 +1241,10 @@ fn object_method(
             text(&mut pool, &mut asm, "]");
             let m = pool.method(sb, "toString", "()Ljava/lang/String;", false);
             asm.invoke(0xb6, m, 0).op(0xb0);
-            locals = 1;
+            1
         }
         _ => return Err(bad("unknown record method")),
-    }
+    };
     let methods = vec![member(
         ACC_PUBLIC | ACC_STATIC,
         "invoke",
@@ -1382,4 +1387,102 @@ fn enum_desc(class: &ClassFile, index: u16) -> Option<(String, String)> {
         return None;
     }
     Some((string(class_args[0])?.replace('.', "/"), string(args[1])?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `public class Host` with `static String f(int)`, whose body is one `makeConcat` call site.
+    fn host_with_concat_site(name: &str) -> ClassFile {
+        let pool = vec![
+            Constant::Unusable,
+            Constant::Utf8(name.into()),
+            Constant::Class(1),
+            Constant::Utf8("java/lang/invoke/StringConcatFactory".into()),
+            Constant::Class(3),
+            Constant::Utf8("makeConcat".into()),
+            Constant::Utf8(
+                "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;\
+                 Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;"
+                    .into(),
+            ),
+            Constant::NameAndType {
+                name: 5,
+                descriptor: 6,
+            },
+            Constant::MethodRef {
+                class: 4,
+                name_and_type: 7,
+            },
+            Constant::MethodHandle {
+                kind: 6,
+                reference: 8,
+            },
+            Constant::Utf8("concat".into()),
+            Constant::Utf8("(I)Ljava/lang/String;".into()),
+            Constant::NameAndType {
+                name: 10,
+                descriptor: 11,
+            },
+            Constant::InvokeDynamic {
+                bootstrap: 0,
+                name_and_type: 12,
+            },
+        ];
+        // iload_0; invokedynamic #13; areturn
+        let code = Code {
+            max_stack: 1,
+            max_locals: 1,
+            bytecode: vec![0x1a, 0xba, 0x00, 0x0d, 0x00, 0x00, 0xb0],
+            handlers: Vec::new(),
+        };
+        let method = Member {
+            access: ACC_STATIC,
+            name: "f".into(),
+            descriptor: "(I)Ljava/lang/String;".into(),
+            code: Some(code),
+            constant_value: None,
+            annotations: Vec::new(),
+        };
+        ClassFile {
+            minor: 0,
+            major: 61,
+            pool,
+            access: ACC_PUBLIC | ACC_SUPER,
+            name: name.into(),
+            super_name: Some(OBJECT.into()),
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![method],
+            string_units: HashMap::new(),
+            bootstrap_methods: vec![(9, Vec::new())],
+        }
+    }
+
+    #[test]
+    fn every_generated_class_records_its_call_site() {
+        let mut classes = vec![host_with_concat_site("Host")];
+        let report = desugar(&mut classes);
+        assert_eq!(report.concats, 1, "skipped: {:?}", report.skipped);
+        assert_eq!(classes.len(), 2);
+        let generated = classes[1].name.clone();
+        assert_eq!(report.defined_by, vec![(generated, "Host".to_string())]);
+        // The call site now calls the generated factory: invokestatic plus two nops.
+        let bytecode = &classes[0].methods[0].code.as_ref().unwrap().bytecode;
+        assert_eq!(bytecode[1], 0xb8);
+        assert_eq!(&bytecode[4..6], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn a_class_that_only_looks_generated_is_not_recorded() {
+        // An input class may carry a spun-class name (obfuscators do this); it has no call
+        // sites, so desugar generates nothing for it and records nothing.
+        let mut lookalike = host_with_concat_site("Host$$Lambda$1");
+        lookalike.methods.clear();
+        let mut classes = vec![lookalike];
+        let report = desugar(&mut classes);
+        assert!(report.defined_by.is_empty());
+        assert_eq!(classes.len(), 1);
+    }
 }

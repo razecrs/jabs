@@ -235,7 +235,11 @@ const INTRINSICS: &[Intrinsic] = &[
         needs_classes: true,
     },
     Intrinsic {
-        key: ("java/lang/reflect/Array", "getLength", "(Ljava/lang/Object;)I"),
+        key: (
+            "java/lang/reflect/Array",
+            "getLength",
+            "(Ljava/lang/Object;)I",
+        ),
         body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } if (a0->cls != jabs_array_class()) jabs_not_compiled(\"Array.getLength of a non-array (IllegalArgumentException)\"); return ((jabs_array *)a0)->length;",
         needs_classes: false,
     },
@@ -5673,17 +5677,23 @@ int32_t jabs_class_access_flags(jabs_object *c) {{
     return (int32_t)(e->record->access & 0x7FFF);
 }}
 
-/* Class.getModule. */
+/* Class.getModule. Only an array's name is a descriptor: `[...Lpkg/Name;` names its element
+   class, `[...I` a primitive (java.base). A plain name is the class itself, even one that starts
+   with 'L', such as a default-package `Launcher`. */
 jabs_object *jabs_class_module(jabs_object *c) {{
     jabs_class_entry *e = jabs_class_entry_of(c);
     const char *name = e ? e->name : "";
-    while (name[0] == '[') name++;
-    if (name[0] == 'L') {{
-        char element[1024];
-        size_t n = strlen(name) - 2;
-        if (n < sizeof element) {{ memcpy(element, name + 1, n); element[n] = 0; if (jabs_is_app_class(element)) {{ {app} }} }}
-    }} else if (jabs_is_app_class(name)) {{
-        {app}
+    int array = 0;
+    while (name[0] == '[') {{ name++; array = 1; }}
+    if (!array) {{
+        if (jabs_is_app_class(name)) {{ {app} }}
+    }} else {{
+        size_t len = strlen(name);
+        if (len >= 3 && name[0] == 'L' && name[len - 1] == ';') {{
+            char element[1024];
+            size_t n = len - 2;
+            if (n < sizeof element) {{ memcpy(element, name + 1, n); element[n] = 0; if (jabs_is_app_class(element)) {{ {app} }} }}
+        }}
     }}
     {boot}
 }}
@@ -6169,9 +6179,10 @@ fn reachable(
     intrinsics: &HashMap<MethodKey, (String, bool)>,
     initializable: &BTreeSet<String>,
     roots: &BTreeSet<String>,
-    loaded: &BTreeSet<String>,
-    startup: bool,
+    extras: &UnitExtras,
 ) -> Emission {
+    let loaded = &extras.loaded_classes;
+    let startup = extras.startup;
     let compiled = |k: &MethodKey| matches!(results.get(k), Some(Ok(_)));
     let mut out = Emission {
         methods: BTreeSet::new(),
@@ -6488,16 +6499,13 @@ pub fn compile_unit_with(
     let mut owned = classes.to_vec();
     let indy = crate::indy::desugar(&mut owned);
     let classes: &[ClassFile] = &owned;
-    // A lambda or concatenation class is defined by its call site's class loader.
+    // A generated class is defined by its call site's class loader. desugar records the call
+    // site of each one; the class name is not parsed, so no kind can be missed and no input
+    // class that merely contains `$$Lambda$` can be mistaken for one.
     let mut app_classes = extras.app_classes.clone();
-    for c in classes {
-        if let Some((owner, _)) = c
-            .name
-            .split_once("$$Lambda$")
-            .or_else(|| c.name.split_once("$$Concat$"))
-            && extras.app_classes.contains(owner)
-        {
-            app_classes.insert(c.name.clone());
+    for (generated, call_site) in &indy.defined_by {
+        if extras.app_classes.contains(call_site) {
+            app_classes.insert(generated.clone());
         }
     }
     let unit = Unit::new(classes);
@@ -6613,8 +6621,7 @@ pub fn compile_unit_with(
             &intrinsics,
             &initializable,
             roots,
-            &extras.loaded_classes,
-            extras.startup,
+            extras,
         ),
         None => Emission {
             methods: compiled.clone(),

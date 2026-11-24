@@ -410,6 +410,7 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         "patterns",
         "sealedSwitch",
         "enumPatterns",
+        "moduleOfLNamedClass",
     ] {
         out.push(("Indy", name, vec![]));
     }

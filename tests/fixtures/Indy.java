@@ -126,4 +126,13 @@ public class Indy {
         };
     }
     static int enumPatterns() { return color(Color.RED) * 100 + color(Color.GREEN) * 10 + color(Color.BLUE); }
+    // A default-package class whose name starts with 'L' is a class, not an `L...;` descriptor.
+    static int moduleOfLNamedClass() {
+        Module here = Indy.class.getModule();
+        return (Launcher.class.getModule() == here ? 1 : 0)
+                + (Launcher[].class.getModule() == here ? 10 : 0)
+                + (Launcher[][].class.getModule() == here ? 100 : 0);
+    }
 }
+
+class Launcher {}
