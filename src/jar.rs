@@ -252,66 +252,10 @@ pub struct Coverage {
     pub self_contained_methods: usize,
     /// Normalized unsupported reason -> method count, most common first.
     pub blockers: Vec<(String, usize)>,
+    /// What each blocker category costs beyond its own methods, most unlocked first.
+    pub blast_radius: Vec<BlastRadius>,
     /// The JDK classes compiled in the same unit, when requested.
     pub jdk: Option<PartCoverage>,
-}
-
-/// Collapse per-method details (pcs, names, descriptors) so reasons group into categories.
-fn blocker_category(reason: &str) -> String {
-    let reason = reason
-        .split_once(": ")
-        .filter(|(pc, _)| pc.starts_with("pc "))
-        .map_or(reason, |(_, r)| r);
-    let rules: [(&str, &str); 17] = [
-        (
-            "class hierarchy incomplete",
-            "superclass/interface outside the unit (JDK or other jars)",
-        ),
-        (
-            "is inherited from outside the unit",
-            "call inherited from outside the unit (e.g. Object methods)",
-        ),
-        (
-            "is not in the compilation unit",
-            "uses a class outside the unit (JDK or other jars)",
-        ),
-        (
-            "or its hierarchy is outside the unit",
-            "type relationship outside the unit",
-        ),
-        (
-            "which cannot be initialized",
-            "initializes a class that cannot be initialized",
-        ),
-        ("static initializer of", "static initializer not compiled"),
-        (
-            "type test against",
-            "instanceof/checkcast against an interface or outside class",
-        ),
-        ("arrays in", "arrays"),
-        ("interface instance methods", "interface instance methods"),
-        ("synchronized", "synchronized methods"),
-        ("exception handlers", "exception handlers (try/catch)"),
-        ("no bytecode", "abstract or native methods"),
-        (
-            "native method without",
-            "native method without a JABS implementation",
-        ),
-        ("calls ", "calls a method that is not compiled"),
-        (
-            "not declared in the unit",
-            "field declared outside the unit",
-        ),
-        ("super calls", "super calls"),
-        ("constructor", "constructor call shape"),
-    ];
-    if let Some((_, category)) = rules.iter().find(|(needle, _)| reason.contains(needle)) {
-        return category.to_string();
-    }
-    if let Some(op) = reason.strip_prefix("opcode ") {
-        return format!("opcode {}", op.split(" (").next().unwrap_or(op));
-    }
-    reason.to_string()
 }
 
 /// Parse every class in a JAR (multi-release overlays skipped); returns (classes, entries tried, unparsable).
@@ -427,6 +371,21 @@ pub struct PartCoverage {
     pub self_contained_methods: usize,
     /// Normalized unsupported reason -> method count, most common first.
     pub blockers: Vec<(String, usize)>,
+    /// What each blocker category costs beyond its own methods, most unlocked first.
+    pub blast_radius: Vec<BlastRadius>,
+}
+
+/// One blocker category's reach through the dependency graph, within one part.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct BlastRadius {
+    pub category: String,
+    /// Methods of this part that are unsupported for this reason.
+    pub direct: usize,
+    /// Compiled methods of this part that can reach this category's not-compiled code.
+    pub reaches: usize,
+    /// Of those, the ones nothing else blocks: fixing this category alone makes them
+    /// self-contained.
+    pub unlocks: usize,
 }
 
 /// Count compiled/unsupported methods of the unit's classes in `names`, with ranked blockers.
@@ -434,7 +393,8 @@ fn part_coverage(
     unit: &crate::cgen::CompiledUnit,
     names: &std::collections::HashSet<&str>,
 ) -> PartCoverage {
-    let mut blockers: BTreeMap<String, usize> = BTreeMap::new();
+    // category -> (direct, reaches, unlocks)
+    let mut tally: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
     let (mut methods, mut compiled, mut self_contained) = (0, 0, 0);
     for method in unit
         .methods
@@ -444,27 +404,58 @@ fn part_coverage(
         match &method.status {
             crate::cgen::MethodStatus::Compiled {
                 self_contained: whole,
+                blocked_by,
                 ..
             } => {
                 methods += 1;
                 compiled += 1;
-                self_contained += *whole as usize;
+                self_contained += usize::from(*whole);
+                for category in blocked_by {
+                    let entry = tally.entry(category.clone()).or_default();
+                    entry.1 += 1;
+                    if blocked_by.len() == 1 {
+                        entry.2 += 1;
+                    }
+                }
             }
             crate::cgen::MethodStatus::Unsupported { reason } => {
                 methods += 1;
-                *blockers.entry(blocker_category(reason)).or_default() += 1;
+                tally
+                    .entry(crate::cgen::blocker_category(reason))
+                    .or_default()
+                    .0 += 1;
             }
             crate::cgen::MethodStatus::Abstract => {}
         }
     }
-    let mut blockers: Vec<_> = blockers.into_iter().collect();
+    let mut blockers: Vec<(String, usize)> = Vec::new();
+    let mut blast_radius: Vec<BlastRadius> = Vec::new();
+    for (category, (direct, reaches, unlocks)) in tally {
+        if direct > 0 {
+            blockers.push((category.clone(), direct));
+        }
+        blast_radius.push(BlastRadius {
+            category,
+            direct,
+            reaches,
+            unlocks,
+        });
+    }
     blockers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    blast_radius.sort_by(|a, b| {
+        b.unlocks
+            .cmp(&a.unlocks)
+            .then_with(|| b.reaches.cmp(&a.reaches))
+            .then_with(|| b.direct.cmp(&a.direct))
+            .then_with(|| a.category.cmp(&b.category))
+    });
     PartCoverage {
         classes: names.len(),
         methods,
         compiled_methods: compiled,
         self_contained_methods: self_contained,
         blockers,
+        blast_radius,
     }
 }
 
@@ -495,13 +486,14 @@ pub fn coverage(path: &Path, jdk: Option<&Path>) -> Result<Coverage> {
     let jdk_part = (!jdk_names.is_empty())
         .then(|| part_coverage(&unit, &jdk_names.iter().map(String::as_str).collect()));
     Ok(Coverage {
-        schema_version: 2,
+        schema_version: 3,
         classes: tried,
         unparsable_classes: unparsable,
         methods: jar.methods,
         compiled_methods: jar.compiled_methods,
         self_contained_methods: jar.self_contained_methods,
         blockers: jar.blockers,
+        blast_radius: jar.blast_radius,
         jdk: jdk_part,
     })
 }

@@ -81,7 +81,11 @@ impl Builder {
         m.extend(0u16.to_be_bytes()); // attributes
         self.methods.push(m);
     }
-    fn build(mut self, name: &str) -> ClassFile {
+    fn build(self, name: &str) -> ClassFile {
+        ClassFile::parse(&self.bytes(name)).unwrap()
+    }
+    /// The class file's bytes, as `build` parses them.
+    fn bytes(mut self, name: &str) -> Vec<u8> {
         let this = self.class(name);
         let parent = self.class("java/lang/Object");
         let mut b = vec![0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52];
@@ -105,7 +109,7 @@ impl Builder {
             b.extend(m);
         }
         b.extend(0u16.to_be_bytes());
-        ClassFile::parse(&b).unwrap()
+        b
     }
 }
 
@@ -300,4 +304,105 @@ fn constructor_must_call_super() {
         ),
         other => panic!("constructor without super() accepted: {other:?}"),
     }
+}
+
+/// A static `()V` method that calls each of `targets` in `Blast`, then returns.
+fn calls(b: &mut Builder, name: &str, targets: &[&str]) {
+    let mut code = Vec::new();
+    for target in targets {
+        let m = b.member(10, "Blast", target, "()V");
+        code.push(0xb8);
+        code.extend(be(m));
+    }
+    code.push(0xb1);
+    b.method(STATIC, name, "()V", 0, 0, &code);
+}
+
+#[test]
+fn blast_radius_credits_each_category_with_what_it_poisons() {
+    // Two seeds with different reasons, and compiled methods depending on them:
+    // a -> jsrBad, b -> a -> jsrBad, d -> jsrBad and multiBad, c depends on nothing.
+    let mut b = Builder::default();
+    b.method(STATIC, "jsrBad", "()V", 1, 0, &[0xa8, 0x00, 0x03, 0xb1]);
+    b.method(
+        STATIC,
+        "multiBad",
+        "()V",
+        1,
+        0,
+        &[0xc5, 0x00, 0x01, 0x01, 0xb1],
+    );
+    calls(&mut b, "a", &["jsrBad"]);
+    calls(&mut b, "b", &["a"]);
+    calls(&mut b, "c", &[]);
+    calls(&mut b, "d", &["jsrBad", "multiBad"]);
+    let bytes = b.bytes("Blast");
+
+    let unit = cgen::compile_unit(&[ClassFile::parse(&bytes).unwrap()]);
+    let status = |name: &str| {
+        unit.methods
+            .iter()
+            .find(|m| m.class == "Blast" && m.name == name)
+            .unwrap_or_else(|| panic!("no method {name}"))
+            .status
+            .clone()
+    };
+    // The categories come from the seeds' own reasons, so the test checks the propagation,
+    // not the wording of a reason.
+    let category = |name: &str| match status(name) {
+        cgen::MethodStatus::Unsupported { reason } => cgen::blocker_category(&reason),
+        other => panic!("{name} should be unsupported: {other:?}"),
+    };
+    let (jsr, multi) = (category("jsrBad"), category("multiBad"));
+    assert_ne!(jsr, multi);
+    let blocked = |name: &str| match status(name) {
+        cgen::MethodStatus::Compiled {
+            self_contained,
+            blocked_by,
+            ..
+        } => {
+            assert_eq!(self_contained, blocked_by.is_empty(), "{name}");
+            blocked_by
+        }
+        other => panic!("{name} should compile: {other:?}"),
+    };
+    assert_eq!(blocked("a"), vec![jsr.clone()]);
+    assert_eq!(blocked("b"), vec![jsr.clone()], "flows through a");
+    assert!(blocked("c").is_empty());
+    let mut both = vec![jsr.clone(), multi.clone()];
+    both.sort();
+    assert_eq!(blocked("d"), both);
+
+    // The coverage report ranks by what fixing a category alone would unlock.
+    let dir = tempfile::tempdir().unwrap();
+    let jar_path = dir.path().join("blast.jar");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&jar_path).unwrap());
+    zip.start_file("Blast.class", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut zip, &bytes).unwrap();
+    zip.finish().unwrap();
+    let report = jabs::jar::coverage(&jar_path, None).unwrap();
+    assert_eq!(
+        (report.compiled_methods, report.self_contained_methods),
+        (4, 1)
+    );
+    let radius = |category: &str| {
+        let r = report
+            .blast_radius
+            .iter()
+            .find(|r| r.category == category)
+            .unwrap_or_else(|| panic!("no blast radius for {category}"));
+        (r.direct, r.reaches, r.unlocks)
+    };
+    assert_eq!(
+        radius(&jsr),
+        (1, 3, 2),
+        "a, b, d reach it; a and b need only it"
+    );
+    assert_eq!(
+        radius(&multi),
+        (1, 1, 0),
+        "only d reaches it, and d also needs jsr"
+    );
+    assert_eq!(report.blast_radius[0].category, jsr, "most unlocked first");
 }

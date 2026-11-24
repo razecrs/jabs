@@ -1237,9 +1237,13 @@ const STRING_FIELDS: [(&str, &str); 4] = [
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MethodStatus {
     /// The body is native. `self_contained`: nothing reachable from it hits a not-compiled stub.
+    /// `blocked_by`: the blocker categories (see [`blocker_category`]) whose not-compiled code it
+    /// can reach; empty exactly when it is self-contained.
     Compiled {
         symbol: String,
         self_contained: bool,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        blocked_by: Vec<String>,
     },
     Unsupported {
         reason: String,
@@ -6081,78 +6085,216 @@ fn emit_reached_stubs(
     out.push('\n');
 }
 
-/// Compiled methods that never reach a stub: every method they may call directly and every class
-/// they may initialize (with its whole initializer) is native too. Greatest fixpoint: start from
-/// everything compiled and remove methods with a missing dependency until nothing changes.
-fn self_contained_methods(
+/// Collapse per-method details (pcs, names, descriptors) so reasons group into categories.
+pub fn blocker_category(reason: &str) -> String {
+    let reason = reason
+        .split_once(": ")
+        .filter(|(pc, _)| pc.starts_with("pc "))
+        .map_or(reason, |(_, r)| r);
+    let rules: [(&str, &str); 17] = [
+        (
+            "class hierarchy incomplete",
+            "superclass/interface outside the unit (JDK or other jars)",
+        ),
+        (
+            "is inherited from outside the unit",
+            "call inherited from outside the unit (e.g. Object methods)",
+        ),
+        (
+            "is not in the compilation unit",
+            "uses a class outside the unit (JDK or other jars)",
+        ),
+        (
+            "or its hierarchy is outside the unit",
+            "type relationship outside the unit",
+        ),
+        (
+            "which cannot be initialized",
+            "initializes a class that cannot be initialized",
+        ),
+        ("static initializer of", "static initializer not compiled"),
+        (
+            "type test against",
+            "instanceof/checkcast against an interface or outside class",
+        ),
+        ("arrays in", "arrays"),
+        ("interface instance methods", "interface instance methods"),
+        ("synchronized", "synchronized methods"),
+        ("exception handlers", "exception handlers (try/catch)"),
+        ("no bytecode", "abstract or native methods"),
+        (
+            "native method without",
+            "native method without a JABS implementation",
+        ),
+        ("calls ", "calls a method that is not compiled"),
+        (
+            "not declared in the unit",
+            "field declared outside the unit",
+        ),
+        ("super calls", "super calls"),
+        ("constructor", "constructor call shape"),
+    ];
+    if let Some((_, category)) = rules.iter().find(|(needle, _)| reason.contains(needle)) {
+        return category.to_string();
+    }
+    if let Some(op) = reason.strip_prefix("opcode ") {
+        return format!("opcode {}", op.split(" (").next().unwrap_or(op));
+    }
+    reason.to_string()
+}
+
+/// Blocker category of a seed that is not a method with its own reason.
+const MISSING_METHOD: &str = "calls a method outside the unit or missing";
+const OUTSIDE_CLASS: &str = "initializes a class outside the unit";
+
+/// A node of the dependency graph: a method, or a class's initialization.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Node {
+    Method(MethodKey),
+    Class(String),
+}
+
+/// The node's index, adding it on first sight.
+fn intern_node(
+    node: Node,
+    index: &mut HashMap<Node, usize>,
+    nodes: &mut Vec<Node>,
+    dependents: &mut Vec<Vec<usize>>,
+) -> usize {
+    if let Some(&at) = index.get(&node) {
+        return at;
+    }
+    let at = nodes.len();
+    nodes.push(node.clone());
+    dependents.push(Vec::new());
+    index.insert(node, at);
+    at
+}
+
+/// For every compiled method, the blocker categories whose not-compiled code it can reach,
+/// sorted. Empty means self-contained: every method it may call directly and every class it may
+/// initialize (with its whole initializer) is native too.
+///
+/// Nodes are methods and class initializations; an edge points from a dependency to what
+/// depends on it. Seeds are methods that did not compile, called methods that do not exist, and
+/// classes that cannot be initialized (including ones outside the unit). Each seed gets the
+/// category of its reason, and each category is flooded through the dependents on its own, so a
+/// method learns every category that poisons it, not just that something does. That is one
+/// linear pass per category: a few dozen, never one per seed.
+fn poisoned_by(
     unit: &Unit,
     classes: &[ClassFile],
     results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
     initializable: &BTreeSet<String>,
-) -> BTreeSet<MethodKey> {
-    // Nodes are methods and class initializations; an edge points from a dependency to what
-    // depends on it. Everything not compiled (or not initializable) is bad, and badness flows to
-    // dependents. One pass over the reverse graph: linear in the number of dependencies.
-    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-    enum Node {
-        Method(MethodKey),
-        Class(String),
-    }
-    let mut dependents: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
-    let mut edge = |from: Node, to: Node| dependents.entry(from).or_default().push(to);
+    init_ok: &HashMap<String, std::result::Result<(), String>>,
+) -> BTreeMap<MethodKey, Vec<String>> {
+    let mut index: HashMap<Node, usize> = HashMap::new();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut dependents: Vec<Vec<usize>> = Vec::new();
     for (key, result) in results {
         let Ok((_, a)) = result else { continue };
-        let me = Node::Method(key.clone());
+        let me = intern_node(
+            Node::Method(key.clone()),
+            &mut index,
+            &mut nodes,
+            &mut dependents,
+        );
         if key.1 != "<clinit>" {
-            edge(Node::Class(key.0.clone()), me.clone());
+            let class = intern_node(
+                Node::Class(key.0.clone()),
+                &mut index,
+                &mut nodes,
+                &mut dependents,
+            );
+            dependents[class].push(me);
         }
         for dep in &a.deps {
-            match dep {
-                Dep::Method(m) => edge(Node::Method(m.clone()), me.clone()),
-                Dep::Init(c) => edge(Node::Class(c.clone()), me.clone()),
-            }
+            let from = match dep {
+                Dep::Method(m) => Node::Method(m.clone()),
+                Dep::Init(c) => Node::Class(c.clone()),
+            };
+            let from = intern_node(from, &mut index, &mut nodes, &mut dependents);
+            dependents[from].push(me);
         }
     }
     for class in classes {
-        let me = Node::Class(class.name.clone());
+        let me = intern_node(
+            Node::Class(class.name.clone()),
+            &mut index,
+            &mut nodes,
+            &mut dependents,
+        );
         let clinit = (
             class.name.clone(),
             "<clinit>".to_string(),
             "()V".to_string(),
         );
         if results.contains_key(&clinit) {
-            edge(Node::Method(clinit), me.clone());
+            let from = intern_node(
+                Node::Method(clinit),
+                &mut index,
+                &mut nodes,
+                &mut dependents,
+            );
+            dependents[from].push(me);
         }
         for p in init_prerequisites(unit, class) {
-            edge(Node::Class(p), me.clone());
+            let from = intern_node(Node::Class(p), &mut index, &mut nodes, &mut dependents);
+            dependents[from].push(me);
         }
     }
-    let mut bad: BTreeSet<Node> = BTreeSet::new();
-    let mut work: Vec<Node> = Vec::new();
-    // Seeds: methods that did not compile, called methods that do not exist, classes that
-    // cannot be initialized (including ones outside the unit).
-    for node in dependents.keys() {
-        let seed = match node {
-            Node::Method(m) => !matches!(results.get(m), Some(Ok(_))),
-            Node::Class(c) => !initializable.contains(c),
+
+    let mut seeds: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (at, node) in nodes.iter().enumerate() {
+        let category = match node {
+            Node::Method(m) => match results.get(m) {
+                Some(Ok(_)) => continue,
+                Some(Err(reason)) => blocker_category(reason),
+                None => MISSING_METHOD.to_string(),
+            },
+            Node::Class(c) => {
+                if initializable.contains(c) {
+                    continue;
+                }
+                match init_ok.get(c) {
+                    Some(Err(reason)) => blocker_category(reason),
+                    _ => OUTSIDE_CLASS.to_string(),
+                }
+            }
         };
-        if seed {
-            work.push(node.clone());
+        seeds.entry(category).or_default().push(at);
+    }
+
+    let mut out: BTreeMap<MethodKey, Vec<String>> = BTreeMap::new();
+    for (key, result) in results {
+        if result.is_ok() {
+            out.insert(key.clone(), Vec::new());
         }
     }
-    while let Some(node) = work.pop() {
-        if !bad.insert(node.clone()) {
-            continue;
-        }
-        if let Some(next) = dependents.get(&node) {
-            work.extend(next.iter().filter(|n| !bad.contains(n)).cloned());
+    let mut seen = vec![false; nodes.len()];
+    let mut work: Vec<usize> = Vec::new();
+    for (category, starts) in &seeds {
+        seen.fill(false);
+        work.clear();
+        work.extend(starts);
+        while let Some(at) = work.pop() {
+            if seen[at] {
+                continue;
+            }
+            seen[at] = true;
+            if let Node::Method(key) = &nodes[at]
+                && let Some(categories) = out.get_mut(key)
+            {
+                categories.push(category.clone());
+            }
+            for &next in &dependents[at] {
+                if !seen[next] {
+                    work.push(next);
+                }
+            }
         }
     }
-    results
-        .iter()
-        .filter(|(k, r)| r.is_ok() && !bad.contains(&Node::Method((*k).clone())))
-        .map(|(k, _)| k.clone())
-        .collect()
+    out
 }
 
 /// Compile a set of classes together into one C unit.
@@ -6608,7 +6750,13 @@ pub fn compile_unit_with(
         .filter(|c| init_ok[&c.name].is_ok())
         .map(|c| c.name.clone())
         .collect();
-    let self_contained = self_contained_methods(&unit, classes, &results, &initializable);
+    let poisoned = poisoned_by(&unit, classes, &results, &initializable, &init_ok);
+    let mut self_contained: BTreeSet<MethodKey> = BTreeSet::new();
+    for (key, categories) in &poisoned {
+        if categories.is_empty() {
+            self_contained.insert(key.clone());
+        }
+    }
     let laid_out_all: Vec<&ClassFile> = classes
         .iter()
         .filter(|c| c.access & ACC_INTERFACE == 0 && unit.chain(&c.name).is_ok())
@@ -6812,6 +6960,7 @@ pub fn compile_unit_with(
                     MethodStatus::Compiled {
                         symbol: symbol(&key.0, &key.1, &key.2),
                         self_contained: self_contained.contains(&key),
+                        blocked_by: poisoned.get(&key).cloned().unwrap_or_default(),
                     }
                 }
                 Err(reason) => MethodStatus::Unsupported {
