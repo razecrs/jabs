@@ -195,6 +195,7 @@ fn execute(cli: Cli) -> Result<()> {
                 resources: jabs::jar::load_resources(&inputs)?,
                 java_home: java_home.map(|h| h.display().to_string()),
                 loaded_classes,
+                startup: false,
             };
             let compiled = jabs::cgen::compile_unit_with(&classes, Some(&roots), &extras);
             if let Some(out) = out {

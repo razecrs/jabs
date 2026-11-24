@@ -97,6 +97,8 @@ pub struct ClassFile {
     pub methods: Vec<Member>,
     /// Exact UTF-16 text of each Utf8 constant that a String constant refers to.
     pub string_units: std::collections::HashMap<u16, Vec<u16>>,
+    /// The BootstrapMethods attribute: (MethodHandle constant, static argument constants).
+    pub bootstrap_methods: Vec<(u16, Vec<u16>)>,
 }
 
 pub(crate) struct Cursor<'a> {
@@ -413,7 +415,21 @@ impl ClassFile {
         };
         let fields = members(&mut c)?;
         let methods = members(&mut c)?;
-        parse_attributes(&mut c, &pool, |_, _| Ok(()))?;
+        let mut bootstrap_methods = Vec::new();
+        parse_attributes(&mut c, &pool, |attr, data| {
+            if attr == "BootstrapMethods" {
+                let mut b = Cursor::new(data);
+                for _ in 0..b.u16()? {
+                    let handle = b.u16()?;
+                    let mut args = Vec::new();
+                    for _ in 0..b.u16()? {
+                        args.push(b.u16()?);
+                    }
+                    bootstrap_methods.push((handle, args));
+                }
+            }
+            Ok(())
+        })?;
         if c.remaining() != 0 {
             bail!("{} trailing bytes after class file", c.remaining());
         }
@@ -432,6 +448,7 @@ impl ClassFile {
             fields,
             methods,
             string_units,
+            bootstrap_methods,
         })
     }
 

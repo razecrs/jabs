@@ -206,6 +206,39 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "return jabs_caller ? jabs_class_object(jabs_caller) : NULL;",
         needs_classes: true,
     },
+    // A class's access flags as its class file writes them (HotSpot masks to the written flags).
+    Intrinsic {
+        key: (
+            "jdk/internal/reflect/Reflection",
+            "getClassAccessFlags",
+            "(Ljava/lang/Class;)I",
+        ),
+        body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } return jabs_class_access_flags(a0);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "jdk/internal/misc/Unsafe",
+            "ensureClassInitialized0",
+            "(Ljava/lang/Class;)V",
+        ),
+        body: "jabs_ensure_initialized(a0);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/reflect/Array",
+            "newArray",
+            "(Ljava/lang/Class;I)Ljava/lang/Object;",
+        ),
+        body: "return jabs_reflect_new_array(a0, a1);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: ("java/lang/reflect/Array", "getLength", "(Ljava/lang/Object;)I"),
+        body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } if (a0->cls != jabs_array_class()) jabs_not_compiled(\"Array.getLength of a non-array (IllegalArgumentException)\"); return ((jabs_array *)a0)->length;",
+        needs_classes: false,
+    },
     // The VM creates the main thread before any Java code runs; JABS does it on first request.
     Intrinsic {
         key: ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
@@ -524,6 +557,15 @@ const INTRINSICS: &[Intrinsic] = &[
 /// Java (not native) methods JABS replaces, with the reason. Each is behavior-preserving for a
 /// program JABS can run today: (class, name, descriptor) -> C body.
 const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
+    // The VM sets Class.module. Named modules need the module system's boot (initPhase2), which
+    // JABS does not run yet: input classes are in the app loader's unnamed module (as on the
+    // JVM's class path); JDK classes report the boot loader's unnamed module, not java.base etc.
+    (
+        "java/lang/Class",
+        "getModule",
+        "()Ljava/lang/Module;",
+        "return jabs_class_module(self);",
+    ),
     // VarHandles are made by the runtime: a field offset (or static address, or array layout)
     // plus the value type; accesses compile to memory operations at each call site. Not yet
     // checked: the lookup's access rights. Static handles initialize the class when created.
@@ -1215,6 +1257,14 @@ pub struct MethodReport {
 pub struct CompiledUnit {
     pub schema_version: u32,
     pub classes: usize,
+    /// invokedynamic call sites translated at compile time, and those left untranslated.
+    pub lambda_sites: usize,
+    pub string_concat_sites: usize,
+    /// Record methods and pattern switches translated.
+    pub other_indy_sites: usize,
+    pub invokedynamic_unsupported: usize,
+    /// Why call sites were left as invokedynamic, with counts.
+    pub invokedynamic_reasons: BTreeMap<String, usize>,
     pub compiled: usize,
     pub unsupported: usize,
     /// Abstract methods (counted in neither `compiled` nor `unsupported`).
@@ -2342,6 +2392,20 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             let b = frame.pop_cat1(pc)?;
             frame.stack.extend([a, b]);
         }
+        Op::DupX2 | Op::Dup2X1 | Op::Dup2X2 => {
+            let categories: Vec<u16> = frame
+                .stack
+                .iter()
+                .rev()
+                .take(4)
+                .map(|v| v.category())
+                .collect();
+            let (take, order) = stack_shuffle(&insn.op, &categories)
+                .ok_or_else(|| anyhow!("pc {pc}: operand stack does not fit this dup form"))?;
+            let at = frame.stack.len() - take;
+            let taken: Vec<VType> = frame.stack.drain(at..).collect();
+            frame.stack.extend(order.iter().map(|&i| taken[i]));
+        }
         Op::Binary(k, op) => {
             let shift = matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr);
             frame.pop_prim(if shift { Kind::I } else { *k }, pc)?;
@@ -2730,8 +2794,42 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                     m.class
                 );
             }
-            let (declaring, _) = unit.resolve_interface_method(&m.class, &m.name, &m.descriptor)?;
+            let resolved = unit.resolve_interface_method(&m.class, &m.name, &m.descriptor);
+            // JVMS 5.4.3.4: otherwise a public instance method of Object (getClass, hashCode...).
+            let object_method = resolved.is_err().then(|| {
+                unit.get(OBJECT).and_then(|o| {
+                    o.methods.iter().find(|x| {
+                        x.name == m.name
+                            && x.descriptor == m.descriptor
+                            && x.access & 0x0001 != 0 // ACC_PUBLIC
+                            && x.access & ACC_STATIC == 0
+                    })
+                })
+            });
             let s = parse_signature(&m.descriptor)?;
+            if let Some(Some(target)) = object_method {
+                for p in s.params.iter().rev() {
+                    frame.pop_ty(cx, p, pc)?;
+                }
+                frame.pop_ref(cx, &m.class, pc)?;
+                if s.ret.code != 'V' {
+                    frame.stack.push(cx.of_ty(&s.ret));
+                }
+                let key = (OBJECT.to_string(), m.name.clone(), m.descriptor.clone());
+                if target.access & ACC_FINAL != 0 {
+                    out.deps.push(Dep::Method(key.clone()));
+                    out.resolved = Some(Resolved::Call(CallKind::Direct(key)));
+                } else {
+                    let slot = unit
+                        .vtable(OBJECT)?
+                        .iter()
+                        .position(|x| x.name == m.name && x.descriptor == m.descriptor)
+                        .ok_or_else(|| anyhow!("pc {pc}: Object.{} has no vtable slot", m.name))?;
+                    out.resolved = Some(Resolved::Call(CallKind::Virtual { slot, target: key }));
+                }
+                return Ok(out);
+            }
+            let (declaring, _) = resolved?;
             for p in s.params.iter().rev() {
                 frame.pop_ty(cx, p, pc)?;
             }
@@ -3341,6 +3439,39 @@ fn caller_sensitive(unit: &Unit, op: &Op) -> bool {
         .unwrap_or(false)
 }
 
+/// The forms of dup_x2, dup2_x1 and dup2_x2 (JVMS 6.5). `categories` are the top stack entries
+/// computational categories, top first (a long or double is one entry of category 2). Returns how
+/// many entries the instruction takes and the new order of those entries (indexes, deepest first).
+fn stack_shuffle(op: &Op, categories: &[u16]) -> Option<(usize, Vec<usize>)> {
+    let c = |i: usize| categories.get(i).copied();
+    Some(match op {
+        // ..., v3, v2, v1 -> ..., v1, v3, v2, v1  |  ..., v2(long), v1 -> ..., v1, v2, v1
+        Op::DupX2 => match (c(0), c(1), c(2)) {
+            (Some(1), Some(1), Some(1)) => (3, vec![2, 0, 1, 2]),
+            (Some(1), Some(2), _) => (2, vec![1, 0, 1]),
+            _ => return None,
+        },
+        // ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1  |  ..., v2, v1(long) -> ..., v1, v2, v1
+        Op::Dup2X1 => match (c(0), c(1), c(2)) {
+            (Some(1), Some(1), Some(1)) => (3, vec![1, 2, 0, 1, 2]),
+            (Some(2), Some(1), _) => (2, vec![1, 0, 1]),
+            _ => return None,
+        },
+        Op::Dup2X2 => match (c(0), c(1), c(2), c(3)) {
+            // ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1
+            (Some(1), Some(1), Some(1), Some(1)) => (4, vec![2, 3, 0, 1, 2, 3]),
+            // ..., v3, v2, v1(long) -> ..., v1, v3, v2, v1
+            (Some(2), Some(1), Some(1), _) => (3, vec![2, 0, 1, 2]),
+            // ..., v3(long), v2, v1 -> ..., v2, v1, v3, v2, v1
+            (Some(1), Some(1), Some(2), _) => (3, vec![1, 2, 0, 1, 2]),
+            // ..., v2(long), v1(long) -> ..., v1, v2, v1
+            (Some(2), Some(2), _, _) => (2, vec![1, 0, 1]),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 /// `if (init() != 0) return` guarding first use of another class; nothing when `target` is
 /// necessarily initialized whenever this code runs (the current class or one of its superclasses).
 fn init_guard(unit: &Unit, current: &str, target: &str, ret_default: &str) -> String {
@@ -3507,6 +3638,21 @@ fn emit_method(
                 d - 2,
                 d - 2
             ),
+            Op::DupX2 | Op::Dup2X1 | Op::Dup2X2 => {
+                let categories: Vec<u16> =
+                    stack.iter().rev().take(4).map(|v| v.category()).collect();
+                let (take, order) = stack_shuffle(&insn.op, &categories).expect("verified");
+                let base = d - take;
+                let mut text = format!("{{ jabs_value t[{take}];");
+                for k in 0..take {
+                    let _ = write!(text, " t[{k}] = s[{}];", base + k);
+                }
+                for (j, i) in order.iter().enumerate() {
+                    let _ = write!(text, " s[{}] = t[{i}];", base + j);
+                }
+                text.push_str(" }");
+                text
+            }
             Op::Dup2 if stack[d - 1].category() == 2 => format!("s[{d}] = s[{}];", d - 1),
             Op::Dup2 => format!("s[{d}] = s[{}]; s[{}] = s[{}];", d - 2, d + 1, d - 1),
             Op::Swap => format!(
@@ -4692,6 +4838,7 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
     ));
     out.push_str(&io_accessor_functions(unit, recorded));
     out.push_str(&app_loader_functions(unit, recorded, app_classes));
+    out.push_str(&module_function(unit, inits));
     out.push_str(&system_properties_functions(
         unit, java_home, inits, methods,
     ));
@@ -5020,6 +5167,48 @@ fn for_name_function(unit: &Unit, inits: &BTreeSet<String>) -> String {
     let _ = write!(
         out,
         r#"static int jabs_compare_init(const void *key, const void *entry) {{ return strcmp((const char *)key, ((const jabs_init_entry *)entry)->name); }}
+
+/* Unsafe.ensureClassInitialized0: run the class's initialization (JVMS 5.5) if it has not run. */
+void jabs_ensure_initialized(jabs_object *c) {{
+    jabs_class_entry *e = c ? jabs_class_entry_of(c) : NULL;
+    if (!e) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }}
+    if (e->name[0] == '[' || jabs_is_primitive_name(e->name)) return;
+    const jabs_init_entry *i = (const jabs_init_entry *)bsearch(e->name, jabs_init_functions, {init_count}, sizeof *i, jabs_compare_init);
+    if (!i) jabs_not_compiled_class("class initialization requested through Unsafe", e->name);
+    i->init();
+}}
+
+/* java.lang.reflect.Array.newArray(component, length). */
+jabs_object *jabs_reflect_new_array(jabs_object *component, int32_t length) {{
+    jabs_class_entry *e = component ? jabs_class_entry_of(component) : NULL;
+    if (!e) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    if (length < 0) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NEGATIVE_ARRAY_SIZE); return NULL; }}
+    static const char *const prims[] = {{ "boolean", "Z", "byte", "B", "char", "C", "short", "S", "int", "I", "long", "J", "float", "F", "double", "D" }};
+    static const size_t sizes[] = {{ 1, 1, 2, 2, 4, 8, 4, 8 }};
+    char descriptor[1100];
+    for (size_t i = 0; i < 16; i += 2) {{
+        if (strcmp(e->name, prims[i]) == 0) {{
+            snprintf(descriptor, sizeof descriptor, "[%s", prims[i + 1]);
+            jabs_object *c = jabs_class_object(descriptor);
+            if (!c) return NULL;
+            return jabs_new_array(length, sizes[i / 2], JABS_COMPONENT_PRIMITIVE, NULL, jabs_class_entry_of(c)->name, NULL);
+        }}
+    }}
+    if (strcmp(e->name, "void") == 0) jabs_not_compiled("Array.newArray(void.class) (IllegalArgumentException)");
+    if (e->name[0] == '[') snprintf(descriptor, sizeof descriptor, "[%s", e->name);
+    else snprintf(descriptor, sizeof descriptor, "[L%s;", e->name);
+    jabs_object *c = jabs_class_object(descriptor);
+    if (!c) return NULL;
+    const char *stable = jabs_class_entry_of(c)->name;
+    /* The element checks compiled anewarray uses: any for Object, the class, or the array type. */
+    if (strcmp(e->name, "java/lang/Object") == 0)
+        return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ANY, NULL, stable, NULL);
+    if (e->name[0] == '[')
+        return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ARRAY, NULL, stable, jabs_class_entry_of(component)->name);
+    if (e->record && !e->record->is_interface)
+        return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_CLASS, e->record, stable, NULL);
+    return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_UNCHECKED, NULL, stable, NULL);
+}}
 
 /* Class.forName0(name, initialize, loader, caller). */
 jabs_object *jabs_class_for_name(jabs_object *binary, int32_t initialize, jabs_object *loader) {{
@@ -5437,6 +5626,69 @@ char *jabs_string_to_utf8(jabs_object *s) {{
         coder = instance_field("coder"),
     );
     out
+}
+
+/// `Class.getModule` (replacement): the app loader's unnamed module for input classes, the boot
+/// loader's for the rest (arrays and primitives follow their element type / java.base).
+fn module_function(unit: &Unit, inits: &BTreeSet<String>) -> String {
+    let has_static = |class: &str, field: &str| {
+        inits.contains(class)
+            && unit.get(class).is_some_and(|c| {
+                c.fields
+                    .iter()
+                    .any(|f| f.name == field && f.access & ACC_STATIC != 0)
+            })
+    };
+    let has_field = |class: &str, field: &str| {
+        unit.get(class).is_some_and(|c| {
+            c.fields
+                .iter()
+                .any(|f| f.name == field && f.access & ACC_STATIC == 0)
+        })
+    };
+    let boot = if has_static(BOOT_LOADER, "UNNAMED_MODULE") {
+        format!(
+            "if ({}() != 0) return NULL; return {};",
+            init_symbol(BOOT_LOADER),
+            field_symbol(BOOT_LOADER, "UNNAMED_MODULE")
+        )
+    } else {
+        "jabs_not_compiled(\"Class.getModule (BootLoader is not in the program)\");".to_string()
+    };
+    let app = if has_field("java/lang/ClassLoader", "unnamedModule") {
+        format!(
+            "jabs_object *loader = jabs_app_loader(); if (loader) return (({} *)loader)->{};",
+            object_struct("java/lang/ClassLoader"),
+            instance_field("unnamedModule")
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"
+/* Reflection.getClassAccessFlags: the class file's flags; public final abstract for arrays and primitives. */
+int32_t jabs_class_access_flags(jabs_object *c) {{
+    jabs_class_entry *e = jabs_class_entry_of(c);
+    if (!e || !e->record) return 0x411;
+    return (int32_t)(e->record->access & 0x7FFF);
+}}
+
+/* Class.getModule. */
+jabs_object *jabs_class_module(jabs_object *c) {{
+    jabs_class_entry *e = jabs_class_entry_of(c);
+    const char *name = e ? e->name : "";
+    while (name[0] == '[') name++;
+    if (name[0] == 'L') {{
+        char element[1024];
+        size_t n = strlen(name) - 2;
+        if (n < sizeof element) {{ memcpy(element, name + 1, n); element[n] = 0; if (jabs_is_app_class(element)) {{ {app} }} }}
+    }} else if (jabs_is_app_class(name)) {{
+        {app}
+    }}
+    {boot}
+}}
+"#
+    )
 }
 
 /// `resources.c`: the embedded resource table (`jabs_resources`, ended by a NULL name).
@@ -5918,6 +6170,7 @@ fn reachable(
     initializable: &BTreeSet<String>,
     roots: &BTreeSet<String>,
     loaded: &BTreeSet<String>,
+    startup: bool,
 ) -> Emission {
     let compiled = |k: &MethodKey| matches!(results.get(k), Some(Ok(_)));
     let mut out = Emission {
@@ -5928,7 +6181,7 @@ fn reachable(
     };
     let mut work: Vec<MethodKey> = Vec::new();
     let mut pending_inits: Vec<String> = Vec::new();
-    if roots.contains(APP_LOADER) {
+    if startup || roots.contains(APP_LOADER) {
         let startup = (
             SYSTEM.to_string(),
             "initPhase1".to_string(),
@@ -5938,6 +6191,7 @@ fn reachable(
             work.push(startup);
             pending_inits.push(SYSTEM.to_string());
             pending_inits.extend(VM_PREINITIALIZED.iter().map(|c| c.to_string()));
+            pending_inits.push(BOOT_LOADER.to_string());
         }
     }
     for class in classes.iter().filter(|c| roots.contains(&c.name)) {
@@ -5985,6 +6239,18 @@ fn reachable(
     // A whole program's VarHandles are runtime-made instances of VarHandle's record.
     if roots.contains(APP_LOADER) && unit.get(VAR_HANDLE).is_some() {
         add_records(VAR_HANDLE, &mut out.records);
+    }
+    // The JDK's startup picks the console charset by name from the host it runs on (MS1252,
+    // UTF-8, ...), so with startup compiled in every standard charset stays loadable by name.
+    let mut loaded = loaded.clone();
+    if startup || roots.contains(APP_LOADER) {
+        loaded.extend(
+            classes
+                .iter()
+                .filter(|c| c.name.starts_with("sun/nio/cs/") && !c.name[11..].contains('/'))
+                .filter(|c| unit.is_subclass(&c.name, "java/nio/charset/Charset") == Some(true))
+                .map(|c| c.name.clone()),
+        );
     }
     // Classes observed loading on the JVM may be loaded by name and created with newInstance.
     for name in loaded.iter().map(String::as_str) {
@@ -6153,6 +6419,7 @@ fn reachable(
 /// The JABS runtime's application class loader (runtime/java/jabs/rt/AppLoader.java).
 const APP_LOADER: &str = "jabs/rt/AppLoader";
 const SYSTEM: &str = "java/lang/System";
+const BOOT_LOADER: &str = "jdk/internal/loader/BootLoader";
 
 /// Classes HotSpot initializes itself before `System.initPhase1`, in its order
 /// (`Threads::initialize_java_lang_classes`). Finalizer's initialization registers the
@@ -6197,6 +6464,9 @@ pub struct UnitExtras {
     /// Classes a real JVM run of this program loaded (`-Xlog:class+load`). Each may be loaded by
     /// name, so its record, initializer and no-arg constructor are kept and it may be instantiated.
     pub loaded_classes: BTreeSet<String>,
+    /// Compile in the JVM's startup (System.initPhase1, run by `jabs_vm_startup()`). Implied by
+    /// a whole program (one with the app class loader).
+    pub startup: bool,
 }
 
 /// Compile a set of classes together into one C unit, emitting only what is reachable from
@@ -6214,6 +6484,22 @@ pub fn compile_unit_with(
     roots: Option<&BTreeSet<String>>,
     extras: &UnitExtras,
 ) -> CompiledUnit {
+    // invokedynamic call sites become calls into generated classes (see indy.rs).
+    let mut owned = classes.to_vec();
+    let indy = crate::indy::desugar(&mut owned);
+    let classes: &[ClassFile] = &owned;
+    // A lambda or concatenation class is defined by its call site's class loader.
+    let mut app_classes = extras.app_classes.clone();
+    for c in classes {
+        if let Some((owner, _)) = c
+            .name
+            .split_once("$$Lambda$")
+            .or_else(|| c.name.split_once("$$Concat$"))
+            && extras.app_classes.contains(owner)
+        {
+            app_classes.insert(c.name.clone());
+        }
+    }
     let unit = Unit::new(classes);
     // The app class loader is created by the runtime itself, so it is always reachable.
     let mut roots = roots.cloned();
@@ -6328,6 +6614,7 @@ pub fn compile_unit_with(
             &initializable,
             roots,
             &extras.loaded_classes,
+            extras.startup,
         ),
         None => Emission {
             methods: compiled.clone(),
@@ -6458,7 +6745,7 @@ pub fn compile_unit_with(
             &unit,
             &recorded,
             &RegistryInputs {
-                app_classes: &extras.app_classes,
+                app_classes: &app_classes,
                 java_home: extras.java_home.as_deref(),
                 inits: &emission.inits,
                 methods: &emission.methods,
@@ -6554,6 +6841,17 @@ pub fn compile_unit_with(
         .count();
     CompiledUnit {
         schema_version: 1,
+        lambda_sites: indy.lambdas,
+        string_concat_sites: indy.concats,
+        other_indy_sites: indy.others,
+        invokedynamic_unsupported: indy.skipped.len(),
+        invokedynamic_reasons: indy
+            .skipped
+            .iter()
+            .fold(BTreeMap::new(), |mut m, (_, _, why)| {
+                *m.entry(why.clone()).or_insert(0) += 1;
+                m
+            }),
         classes: classes.len(),
         compiled,
         unsupported: methods.len() - compiled - abstract_methods,

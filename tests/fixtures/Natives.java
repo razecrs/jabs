@@ -35,6 +35,17 @@ public class Natives {
         return (Shape.class.isInstance(new Circle(2)) ? 1 : 0) + (Rect.class.isInstance(new Circle(2)) ? 10 : 0)
                 + (Shape.class.isAssignableFrom(Square.class) ? 100 : 0) + (Rect.class.getSuperclass() == Shape.class ? 1000 : 0);
     }
+    static int reflectArray() {
+        int[] x = (int[]) java.lang.reflect.Array.newInstance(int.class, 3);
+        String[] s = (String[]) java.lang.reflect.Array.newInstance(String.class, 2);
+        int[][] m = (int[][]) java.lang.reflect.Array.newInstance(int[].class, 4);
+        Object[] o = (Object[]) java.lang.reflect.Array.newInstance(Number.class, 1);
+        int stored = 0;
+        try { o[0] = "x"; stored = 1; } catch (ArrayStoreException e) { stored = 2; }
+        o[0] = Integer.valueOf(5);
+        return x.length * 10000 + s.length * 1000 + m.length * 100 + java.lang.reflect.Array.getLength(o) * 10 + stored
+                + (o.getClass() == Number[].class ? 100000 : 0);
+    }
     static int cloneArray() { int[] a = {5, 6, 7}; int[] b = a.clone(); b[0] = 9; return a[0] * 100 + b[0] * 10 + (a != b ? 1 : 0); }
     static long doubleBits(double d) { return Double.doubleToRawLongBits(d) ^ Double.doubleToRawLongBits(Double.longBitsToDouble(Double.doubleToRawLongBits(d))); }
     static int floatBits(float f) { return Float.floatToRawIntBits(Float.intBitsToFloat(Float.floatToRawIntBits(f))); }

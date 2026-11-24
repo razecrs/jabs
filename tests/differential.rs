@@ -178,7 +178,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 11] = [
+const FIXTURE_SOURCES: [&str; 12] = [
     "Arith",
     "Statics",
     "BadInit",
@@ -190,7 +190,11 @@ const FIXTURE_SOURCES: [&str; 11] = [
     "Exceptions",
     "Sync",
     "Natives",
+    "StackOps",
 ];
+
+/// Fixtures that need a newer language level (records, pattern switches, indy string concat).
+const MODERN_FIXTURE_SOURCES: [&str; 1] = ["Indy"];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
@@ -375,6 +379,7 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         "className",
         "classQueries",
         "cloneArray",
+        "reflectArray",
         "clocks",
     ] {
         out.push(("Natives", name, vec![]));
@@ -386,6 +391,44 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     }
     for f in [0.0f32, -2.5, f32::NAN] {
         out.push(("Natives", "floatBits", vec![F(f)]));
+    }
+    for name in [
+        "sameInstance",
+        "boxing",
+        "staticRef",
+        "boundRef",
+        "unboundRef",
+        "constructorRef",
+        "widening",
+        "serializable",
+        "sort",
+        "concat",
+        "recordToString",
+        "recordToStringLength",
+        "recordHash",
+        "recordEquals",
+        "patterns",
+        "sealedSwitch",
+        "enumPatterns",
+    ] {
+        out.push(("Indy", name, vec![]));
+    }
+    for x in [0, 7, -5, i32::MIN] {
+        out.push(("StackOps", "intIntoArray", vec![I(x)]));
+    }
+    for v in [0i64, 1 << 40, -3, i64::MAX] {
+        out.push(("StackOps", "longIntoField", vec![J(v)]));
+        out.push(("StackOps", "longIntoArray", vec![J(v)]));
+        out.push(("StackOps", "increments", vec![J(v)]));
+    }
+    for v in [0.5f64, -0.0, f64::NAN] {
+        out.push(("StackOps", "doubleIntoArray", vec![D(v)]));
+    }
+    for k in [0, 3, -2] {
+        out.push(("Indy", "capture", vec![I(k)]));
+    }
+    for x in [0, 7, -123] {
+        out.push(("Indy", "concatConstants", vec![I(x)]));
     }
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
@@ -487,6 +530,14 @@ fn native_matches_reference_jvm() {
                 .iter()
                 .map(|c| fixtures.join(format!("{c}.java"))),
         ));
+    run(Command::new("javac")
+        .args(["--release", "21", "-nowarn", "-d"])
+        .arg(root)
+        .args(
+            MODERN_FIXTURE_SOURCES
+                .iter()
+                .map(|c| fixtures.join(format!("{c}.java"))),
+        ));
 
     let mut java = String::from("public class Runner {\n");
     java.push_str(JAVA_PRINTERS);
@@ -506,7 +557,12 @@ fn native_matches_reference_jvm() {
     assert_eq!(unparsable, 0);
     classes.extend(library);
     let phase = std::time::Instant::now();
-    let compiled = cgen::compile_unit_rooted(&classes, Some(&roots));
+    // Like a JVM, the program runs the JDK's startup (System.initPhase1) before any case.
+    let extras = cgen::UnitExtras {
+        startup: true,
+        ..Default::default()
+    };
+    let compiled = cgen::compile_unit_with(&classes, Some(&roots), &extras);
     eprintln!("compile_unit: {:.1?}", phase.elapsed());
     // Every fixture method must compile: unsupported is a test failure here.
     let unsupported: Vec<_> = compiled
@@ -565,6 +621,7 @@ fn native_matches_reference_jvm() {
     java.push_str("    }\n}\n");
     c.push_str(&case_functions);
     c.push_str("int main(void) {\n");
+    c.push_str("    if (jabs_vm_startup() != 0) { printf(\"JVM startup failed: %s\\n\", jabs_pending->cls->name); return 1; }\n");
     c.push_str(&case_calls);
     c.push_str("    return 0;\n}\n");
 

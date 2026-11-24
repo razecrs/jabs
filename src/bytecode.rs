@@ -135,6 +135,10 @@ pub enum Op {
     Pop2,
     Dup,
     DupX1,
+    /// dup_x2, dup2_x1, dup2_x2: see `cgen::stack_shuffle` for their forms.
+    DupX2,
+    Dup2X1,
+    Dup2X2,
     Dup2,
     Swap,
     Binary(Kind, BinOp),
@@ -353,7 +357,10 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
         0x58 => Pop2,
         0x59 => Dup,
         0x5a => DupX1,
+        0x5b => DupX2,
         0x5c => Dup2,
+        0x5d => Dup2X1,
+        0x5e => Dup2X2,
         0x5f => Swap,
         0x60..=0x73 => {
             let ops = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Rem];
