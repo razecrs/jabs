@@ -444,16 +444,7 @@ fn loaded_coverage_counts_only_the_classes_a_run_loaded() {
         ],
     );
     let list = dir.path().join("loaded.txt");
-    std::fs::write(
-        &list,
-        "# from -Xlog:class+load
-Blast
-
-Blast
-net/Gone
-",
-    )
-    .unwrap();
+    std::fs::write(&list, "# from -Xlog:class+load\nBlast\n\nBlast\nnet/Gone\n").unwrap();
     let loaded = jabs::jar::read_class_list(&list).unwrap();
     assert_eq!(
         loaded.len(),
@@ -490,15 +481,7 @@ fn a_class_list_refuses_names_that_are_not_internal_names() {
     let dir = tempfile::tempdir().unwrap();
     let list = dir.path().join("loaded.txt");
     for bad in ["java.lang.String", "/a", "a/", "a//b", "a b", "[La;"] {
-        std::fs::write(
-            &list,
-            format!(
-                "ok/Fine
-{bad}
-"
-            ),
-        )
-        .unwrap();
+        std::fs::write(&list, format!("ok/Fine\n{bad}\n")).unwrap();
         let error = jabs::jar::read_class_list(&list).unwrap_err().to_string();
         assert!(error.contains(":2:"), "{bad}: {error}");
     }
