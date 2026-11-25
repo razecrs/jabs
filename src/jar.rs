@@ -256,6 +256,63 @@ pub struct Coverage {
     pub blast_radius: Vec<BlastRadius>,
     /// The JDK classes compiled in the same unit, when requested.
     pub jdk: Option<PartCoverage>,
+    /// The same counts restricted to the classes a JVM run loaded, when a list is given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded: Option<LoadedCoverage>,
+}
+
+/// Coverage of only the classes a real JVM run loaded (`-Xlog:class+load`). This is class
+/// granularity: every method of a loaded class counts, whether or not the run called it.
+#[derive(Debug, Serialize)]
+pub struct LoadedCoverage {
+    /// Distinct class names in the list.
+    pub classes_listed: usize,
+    /// Listed classes that are not in the unit (other JDK modules, generated at run time, or
+    /// from other jars); their methods are not counted anywhere.
+    pub classes_not_in_unit: usize,
+    pub jar: PartCoverage,
+    pub jdk: Option<PartCoverage>,
+}
+
+/// Longest line accepted in a class list; internal names are far shorter.
+const MAX_CLASS_NAME: usize = 4096;
+/// Most names accepted in a class list; a full modded client loads well under this.
+const MAX_LISTED_CLASSES: usize = 1 << 20;
+
+/// Read a class list: one internal name (`a/b/C`) per line, blank lines and `#` comments
+/// skipped. A name that is not an internal name (dots, spaces, a leading or trailing `/`,
+/// empty segments) is refused with its line number rather than silently matching nothing.
+/// Repeats are allowed: a JVM log lists a class once per loader that defined it.
+pub fn read_class_list(path: &Path) -> Result<std::collections::BTreeSet<String>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut names = std::collections::BTreeSet::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let number = index + 1;
+        if line.len() > MAX_CLASS_NAME {
+            bail!(
+                "{}:{number}: name longer than {MAX_CLASS_NAME} bytes",
+                path.display()
+            );
+        }
+        let bad_char = line
+            .chars()
+            .any(|c| c == '.' || c == ';' || c == '[' || c.is_whitespace());
+        if bad_char || line.split('/').any(str::is_empty) {
+            bail!(
+                "{}:{number}: `{line}` is not an internal class name (a/b/C)",
+                path.display()
+            );
+        }
+        names.insert(line.to_owned());
+        if names.len() > MAX_LISTED_CLASSES {
+            bail!("{}: more than {MAX_LISTED_CLASSES} classes", path.display());
+        }
+    }
+    Ok(names)
 }
 
 /// Parse every class in a JAR (multi-release overlays skipped); returns (classes, entries tried, unparsable).
@@ -462,6 +519,15 @@ fn part_coverage(
 /// Compile every class in a JAR (plus, optionally, the JDK's java.base) as one unit, without
 /// writing C, and tally what blocks the rest.
 pub fn coverage(path: &Path, jdk: Option<&Path>) -> Result<Coverage> {
+    coverage_with(path, jdk, None)
+}
+
+/// [`coverage`], plus the same counts over only the classes in `loaded` when it is given.
+pub fn coverage_with(
+    path: &Path,
+    jdk: Option<&Path>,
+    loaded: Option<&std::collections::BTreeSet<String>>,
+) -> Result<Coverage> {
     let (mut classes, tried, unparsable) = read_jar_classes(path)?;
     let jar_names: Vec<String> = classes.iter().map(|c| c.name.clone()).collect();
     let mut jdk_names = Vec::new();
@@ -481,12 +547,32 @@ pub fn coverage(path: &Path, jdk: Option<&Path>) -> Result<Coverage> {
         }
     }
     let unit = crate::cgen::compile_unit(&classes);
-    let jar_set = jar_names.iter().map(String::as_str).collect();
+    let jar_set: std::collections::HashSet<&str> = jar_names.iter().map(String::as_str).collect();
     let jar = part_coverage(&unit, &jar_set);
-    let jdk_part = (!jdk_names.is_empty())
-        .then(|| part_coverage(&unit, &jdk_names.iter().map(String::as_str).collect()));
+    let jdk_set: std::collections::HashSet<&str> = jdk_names.iter().map(String::as_str).collect();
+    let jdk_part = (!jdk_names.is_empty()).then(|| part_coverage(&unit, &jdk_set));
+    let loaded_part = loaded.map(|listed| {
+        let mut jar_loaded = std::collections::HashSet::new();
+        let mut jdk_loaded = std::collections::HashSet::new();
+        let mut not_in_unit = 0;
+        for name in listed {
+            if let Some(found) = jar_set.get(name.as_str()) {
+                jar_loaded.insert(*found);
+            } else if let Some(found) = jdk_set.get(name.as_str()) {
+                jdk_loaded.insert(*found);
+            } else {
+                not_in_unit += 1;
+            }
+        }
+        LoadedCoverage {
+            classes_listed: listed.len(),
+            classes_not_in_unit: not_in_unit,
+            jar: part_coverage(&unit, &jar_loaded),
+            jdk: (!jdk_names.is_empty()).then(|| part_coverage(&unit, &jdk_loaded)),
+        }
+    });
     Ok(Coverage {
-        schema_version: 3,
+        schema_version: 4,
         classes: tried,
         unparsable_classes: unparsable,
         methods: jar.methods,
@@ -495,5 +581,6 @@ pub fn coverage(path: &Path, jdk: Option<&Path>) -> Result<Coverage> {
         blockers: jar.blockers,
         blast_radius: jar.blast_radius,
         jdk: jdk_part,
+        loaded: loaded_part,
     })
 }

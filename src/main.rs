@@ -45,6 +45,10 @@ enum Action {
         /// Also compile this Java installation's java.base in the same unit (e.g. `java`).
         #[arg(long)]
         jdk: Option<PathBuf>,
+        /// Classes a JVM run loaded (one internal name per line, from `-Xlog:class+load`): also
+        /// report the counts over only those classes.
+        #[arg(long)]
+        loaded_classes: Option<PathBuf>,
     },
     /// Compile class files (or every class in jars) together as one unit; reports every unsupported method.
     Compile {
@@ -142,7 +146,21 @@ fn execute(cli: Cli) -> Result<()> {
             print_json(preparation::prepare(&profile, &cache, true)?)
         }
         Action::InspectJar { jar } => print_json(jabs::jar::inspect_jar(&jar)?),
-        Action::Coverage { jar, jdk } => print_json(jabs::jar::coverage(&jar, jdk.as_deref())?),
+        Action::Coverage {
+            jar,
+            jdk,
+            loaded_classes,
+        } => {
+            let loaded = match loaded_classes {
+                Some(path) => Some(jabs::jar::read_class_list(&path)?),
+                None => None,
+            };
+            print_json(jabs::jar::coverage_with(
+                &jar,
+                jdk.as_deref(),
+                loaded.as_ref(),
+            )?)
+        }
         Action::Compile {
             inputs,
             jdk,
@@ -160,15 +178,9 @@ fn execute(cli: Cli) -> Result<()> {
             } else {
                 root.into_iter().collect()
             };
-            let loaded_classes: std::collections::BTreeSet<String> = match loaded_classes {
-                Some(path) => std::fs::read_to_string(&path)
-                    .with_context(|| format!("read {}", path.display()))?
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(str::to_string)
-                    .collect(),
-                None => Default::default(),
+            let loaded_classes = match loaded_classes {
+                Some(path) => jabs::jar::read_class_list(&path)?,
+                None => std::collections::BTreeSet::new(),
             };
             let mut java_home = None;
             if let Some(java) = jdk {

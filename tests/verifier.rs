@@ -308,9 +308,14 @@ fn constructor_must_call_super() {
 
 /// A static `()V` method that calls each of `targets` in `Blast`, then returns.
 fn calls(b: &mut Builder, name: &str, targets: &[&str]) {
+    calls_in(b, "Blast", name, targets);
+}
+
+/// A static method of `owner` that calls each of its static `targets` in turn.
+fn calls_in(b: &mut Builder, owner: &str, name: &str, targets: &[&str]) {
     let mut code = Vec::new();
     for target in targets {
-        let m = b.member(10, "Blast", target, "()V");
+        let m = b.member(10, owner, target, "()V");
         code.push(0xb8);
         code.extend(be(m));
     }
@@ -405,4 +410,96 @@ fn blast_radius_credits_each_category_with_what_it_poisons() {
         "only d reaches it, and d also needs jsr"
     );
     assert_eq!(report.blast_radius[0].category, jsr, "most unlocked first");
+}
+
+/// A jar holding each (entry name, class bytes) pair.
+fn write_jar(path: &std::path::Path, classes: &[(&str, &[u8])]) {
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    for (name, bytes) in classes {
+        zip.start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+#[test]
+fn loaded_coverage_counts_only_the_classes_a_run_loaded() {
+    // Blast as above; Cold has its own jsr seed and one caller, and the run never loaded it.
+    let mut hot = Builder::default();
+    hot.method(STATIC, "jsrBad", "()V", 1, 0, &[0xa8, 0x00, 0x03, 0xb1]);
+    calls(&mut hot, "a", &["jsrBad"]);
+    calls(&mut hot, "b", &["a"]);
+    calls(&mut hot, "c", &[]);
+    let mut cold = Builder::default();
+    cold.method(STATIC, "jsrCold", "()V", 1, 0, &[0xa8, 0x00, 0x03, 0xb1]);
+    calls_in(&mut cold, "Cold", "e", &["jsrCold"]);
+    let dir = tempfile::tempdir().unwrap();
+    let jar = dir.path().join("two.jar");
+    write_jar(
+        &jar,
+        &[
+            ("Blast.class", &hot.bytes("Blast")),
+            ("Cold.class", &cold.bytes("Cold")),
+        ],
+    );
+    let list = dir.path().join("loaded.txt");
+    std::fs::write(
+        &list,
+        "# from -Xlog:class+load
+Blast
+
+Blast
+net/Gone
+",
+    )
+    .unwrap();
+    let loaded = jabs::jar::read_class_list(&list).unwrap();
+    assert_eq!(
+        loaded.len(),
+        2,
+        "comments and blank lines skipped, repeats merged"
+    );
+
+    let report = jabs::jar::coverage_with(&jar, None, Some(&loaded)).unwrap();
+    let jsr = &report.blast_radius[0];
+    assert_eq!(
+        (jsr.direct, jsr.reaches, jsr.unlocks),
+        (2, 3, 3),
+        "whole jar"
+    );
+    let part = report.loaded.expect("a loaded section");
+    assert_eq!((part.classes_listed, part.classes_not_in_unit), (2, 1));
+    assert_eq!(part.jar.classes, 1);
+    assert_eq!(
+        (part.jar.compiled_methods, part.jar.self_contained_methods),
+        (3, 1)
+    );
+    let jsr = &part.jar.blast_radius[0];
+    assert_eq!(
+        (jsr.direct, jsr.reaches, jsr.unlocks),
+        (1, 2, 2),
+        "Cold's seed and caller are not counted"
+    );
+    assert!(part.jdk.is_none());
+    assert!(jabs::jar::coverage(&jar, None).unwrap().loaded.is_none());
+}
+
+#[test]
+fn a_class_list_refuses_names_that_are_not_internal_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("loaded.txt");
+    for bad in ["java.lang.String", "/a", "a/", "a//b", "a b", "[La;"] {
+        std::fs::write(
+            &list,
+            format!(
+                "ok/Fine
+{bad}
+"
+            ),
+        )
+        .unwrap();
+        let error = jabs::jar::read_class_list(&list).unwrap_err().to_string();
+        assert!(error.contains(":2:"), "{bad}: {error}");
+    }
 }
