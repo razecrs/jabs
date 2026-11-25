@@ -256,6 +256,10 @@ pub struct Coverage {
     pub blast_radius: Vec<BlastRadius>,
     /// The JDK classes compiled in the same unit, when requested.
     pub jdk: Option<PartCoverage>,
+    /// The JDK modules in the unit: java.base, plus every module holding a class the loaded list
+    /// or the method trace names, as `compile` adds them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jdk_modules: Vec<String>,
     /// The same counts restricted to the classes a JVM run loaded, when a list is given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loaded: Option<LoadedCoverage>,
@@ -742,16 +746,39 @@ pub fn coverage_with(
     let (mut classes, tried, unparsable) = read_jar_classes(path)?;
     let jar_names: Vec<String> = classes.iter().map(|c| c.name.clone()).collect();
     let mut jdk_names = Vec::new();
+    let mut jdk_modules = Vec::new();
     if let Some(java) = jdk {
         let home = crate::jdk::java_home(java)?;
-        let (library, _, library_unparsable) = crate::jdk::read_module(&home, "java.base")?;
-        if library_unparsable > 0 {
-            bail!("{library_unparsable} java.base classes could not be parsed");
+        // java.base, plus the modules of every class a run is known to have used, so their
+        // natives and blockers are counted too.
+        let mut used = std::collections::BTreeSet::new();
+        if let Some(listed) = loaded {
+            used.extend(listed.iter().cloned());
+        }
+        if let Some(trace) = executed {
+            used.extend(trace.methods.iter().map(|(class, _, _)| class.clone()));
+        }
+        jdk_modules.push("java.base".to_owned());
+        for module in crate::jdk::modules_containing(&home, &used)? {
+            if !jdk_modules.contains(&module) {
+                jdk_modules.push(module);
+            }
         }
         // A jar class with the same name as a JDK class would be shadowed by the boot loader.
-        let mine: std::collections::HashSet<&str> = jar_names.iter().map(String::as_str).collect();
-        for class in library {
-            if !mine.contains(class.name.as_str()) {
+        let mine: std::collections::HashSet<String> = jar_names.iter().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for module in &jdk_modules {
+            let (library, _, library_unparsable) = crate::jdk::read_module(&home, module)?;
+            if library_unparsable > 0 {
+                bail!("{library_unparsable} {module} classes could not be parsed");
+            }
+            for class in library {
+                if mine.contains(&class.name) {
+                    continue;
+                }
+                if !seen.insert(class.name.clone()) {
+                    bail!("JDK class {} appears in two modules", class.name);
+                }
                 jdk_names.push(class.name.clone());
                 classes.push(class);
             }
@@ -794,6 +821,7 @@ pub fn coverage_with(
         blockers: jar.blockers,
         blast_radius: jar.blast_radius,
         jdk: jdk_part,
+        jdk_modules,
         loaded: loaded_part,
         executed: executed_part,
     })
