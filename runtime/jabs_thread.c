@@ -407,6 +407,11 @@ static void jabs_thread_main(void *arg) {
     if (!jabs_thread_exit_java(thread)) jabs_not_compiled("Thread.exit (the end of a started thread)");
     jabs_pending = NULL;
     jabs_thread_terminate(record);
+    /* Last: the thread holds no monitor level now (terminate released the Thread's), so its lock
+     * id can go to a new thread. Without this, ids are never reused and about a million threads
+     * over a program's life would exhaust them. The sync record itself stays allocated, so a late
+     * interrupt through record->sync still finds valid memory. */
+    jabs_sync_thread_end();
 }
 
 void jabs_thread_start(jabs_object *thread) {
