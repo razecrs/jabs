@@ -140,3 +140,7 @@ is skipped without them; set `JABS_REQUIRE_TOOLS` to make a missing tool an erro
 
 Next: typed IR from method bytecode, wiring `inspect-jar` into profile
 inspection, then baseline capture.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
