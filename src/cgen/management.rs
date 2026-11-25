@@ -18,6 +18,49 @@ use super::*;
 
 const VM_MANAGEMENT: &str = "sun/management/VMManagementImpl";
 const THREAD_IMPL: &str = "sun/management/ThreadImpl";
+const MEMORY_IMPL: &str = "sun/management/MemoryImpl";
+const MEMORY_USAGE_DESCRIPTOR: &str = "(Z)Ljava/lang/management/MemoryUsage;";
+const MEMORY_USAGE: &str = "java/lang/management/MemoryUsage";
+const MEMORY_USAGE_INIT: &str = "(JJJJ)V";
+
+/// An object a management native constructs from C (no Java instruction names it), so
+/// reachable() keeps its class and constructor: (class, constructor descriptor).
+pub(super) fn constructed_by(key: &MethodKey) -> Option<(&'static str, &'static str)> {
+    let memory = key.0 == MEMORY_IMPL && key.1 == "getMemoryUsage0";
+    (memory && key.2 == MEMORY_USAGE_DESCRIPTOR).then_some((MEMORY_USAGE, MEMORY_USAGE_INIT))
+}
+
+/// C glue the management natives call: jabs_management_memory_usage builds a MemoryUsage with
+/// its own constructor (which checks the four values as on the JVM). Without the class, its
+/// constructor or its initialization in the program, it stops when called.
+pub(super) fn glue(
+    unit: &Unit,
+    methods: &BTreeSet<MethodKey>,
+    records: &BTreeSet<String>,
+    inits: &BTreeSet<String>,
+) -> String {
+    let signature = "jabs_object *jabs_management_memory_usage(int64_t init, int64_t used, int64_t committed, int64_t max)";
+    let ctor = (
+        MEMORY_USAGE.to_string(),
+        "<init>".to_string(),
+        MEMORY_USAGE_INIT.to_string(),
+    );
+    let complete = unit.get(MEMORY_USAGE).is_some()
+        && records.contains(MEMORY_USAGE)
+        && inits.contains(MEMORY_USAGE)
+        && methods.contains(&ctor);
+    if !complete {
+        return format!(
+            "\n{signature} {{ (void)init; (void)used; (void)committed; (void)max; jabs_not_compiled(\"MemoryUsage (its class or constructor is not in the program)\"); }}\n"
+        );
+    }
+    format!(
+        "\n/* MemoryImpl.getMemoryUsage0's result (see src/cgen/management.rs). */\n{signature} {{\n    if ({init}() != 0) return NULL;\n    jabs_object *usage = jabs_new(&{record});\n    if (!usage) return NULL;\n    {ctor}(usage, init, used, committed, max);\n    return jabs_pending ? NULL : usage;\n}}\n",
+        init = init_symbol(MEMORY_USAGE),
+        record = class_record(MEMORY_USAGE),
+        ctor = symbol(MEMORY_USAGE, "<init>", MEMORY_USAGE_INIT),
+    )
+}
 
 /// The JVM management interface version HotSpot reports: JDK 25.0.4's VMManagementImpl.version
 /// is "4.0" (read on the reference JVM; tests/management.rs compares it on every run).
@@ -96,6 +139,37 @@ pub(super) fn intrinsic(
             ("resetPeakThreadCount0", "()V") => Some(("jabs_thread_reset_peak();".into(), false)),
             _ => None,
         };
+    }
+    // MemoryMXBean's heap usage. JABS's heap is every object malloc'd so far (jabs_heap_bytes);
+    // with no GC nothing is returned, so all of it is both used and committed. There is no
+    // initial size and no limit: both are undefined (-1), as MemoryUsage allows. Non-heap memory
+    // (code and class data) is the executable itself, which JABS does not measure: it stops.
+    if key.0 == MEMORY_IMPL && key.1 == "getMemoryUsage0" && key.2 == MEMORY_USAGE_DESCRIPTOR {
+        return Some((
+            "if (!a0) jabs_not_compiled(\"MemoryImpl.getMemoryUsage0(false): non-heap memory usage is not measured\"); int64_t used = atomic_load_explicit(&jabs_heap_bytes, memory_order_relaxed); return jabs_management_memory_usage(-1, used, used, -1);".into(),
+            false,
+        ));
+    }
+    // OperatingSystemMXBean (jdk.management): initialize0 prepares the host queries of the
+    // natives behind getProcessCpuLoad, getTotalMemorySize and so on. JABS implements none of
+    // those (each stops when called), so there is nothing to prepare.
+    if key.0 == "com/sun/management/internal/OperatingSystemImpl"
+        && key.1 == "initialize0"
+        && key.2 == "()V"
+    {
+        return Some((
+            "/* nothing: the host queries it prepares are not implemented */".into(),
+            false,
+        ));
+    }
+    // OperatingSystemMXBean.getSystemLoadAverage, through Unsafe.getLoadAverage (which checked
+    // 1 <= a1 <= 3 and the array's length): the host's load averages, or -1 where the host has
+    // none (Windows, as the reference JVM reports there).
+    if key.0 == "jdk/internal/misc/Unsafe" && key.1 == "getLoadAverage0" && key.2 == "([DI)I" {
+        return Some((
+            "if (!a0 || a1 < 1 || a1 > 3 || ((jabs_array *)a0)->length < a1) jabs_not_compiled(\"Unsafe.getLoadAverage0 with arguments Unsafe.getLoadAverage rejects\"); return jabs_platform_load_average((double *)jabs_array_data((jabs_array *)a0), a1);".into(),
+            false,
+        ));
     }
     if key.0 != VM_MANAGEMENT {
         return None;

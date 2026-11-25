@@ -7207,6 +7207,29 @@ fn reachable(
                 }
             }
         }
+        // A management native that builds an object from C (management::glue).
+        if let Some((class, descriptor)) = management::constructed_by(&key)
+            && unit.get(class).is_some()
+            && unit.chain(class).is_ok()
+        {
+            add_records(class, &mut out.records);
+            pending_inits.push(class.to_string());
+            let ctor = (
+                class.to_string(),
+                "<init>".to_string(),
+                descriptor.to_string(),
+            );
+            if compiled(&ctor) {
+                work.push(ctor);
+            }
+            if out.instantiated.insert(class.to_string()) {
+                work.extend(
+                    implementations(class)
+                        .into_iter()
+                        .filter(|k| compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))),
+                );
+            }
+        }
         let Some(Ok((_, analyzed))) = results.get(&key) else {
             continue;
         };
@@ -7660,6 +7683,12 @@ pub fn compile_unit_with(
     }
     emit_reached_stubs(&mut source, &unit, &results, &emission, &init_ok);
     source.push_str(&thread_glue_functions(&unit, registry, &emission.methods));
+    source.push_str(&management::glue(
+        &unit,
+        &emission.methods,
+        &emission.records,
+        &emission.inits,
+    ));
     // Everything above the methods: shared declarations, then data and support definitions.
     let header_end = source
         .find(&format!("\n{}", "/* @@definitions@@ */"))

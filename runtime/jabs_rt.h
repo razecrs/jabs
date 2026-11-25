@@ -184,6 +184,9 @@ int64_t jabs_platform_start_millis(void);
 int64_t jabs_platform_uptime_millis(void);
 /* The operating system's id of this process. */
 int64_t jabs_platform_process_id(void);
+/* The host's 1, 5 and 15 minute load averages, the first `count` (1..3) into `out`: how many
+ * were stored, or -1 when the host has none (Windows). */
+int32_t jabs_platform_load_average(double *out, int32_t count);
 /* Generated glue the thread runtime uses (thread_glue_functions in cgen.rs): the main Thread, and
  * where Thread.eetop lives (the JVM's "alive" marker: non-zero exactly while the thread runs). */
 jabs_object *jabs_main_thread(void);
@@ -450,6 +453,8 @@ char *jabs_string_to_utf8(jabs_object *s);
 jabs_object *jabs_string_from_utf8(const char *text);
 /* java.lang.management natives' glue (jabs_management.c): VMManagementImpl.getVmArguments0. */
 jabs_object *jabs_management_vm_arguments(void);
+/* A MemoryUsage built with its constructor (generated: management::glue in src/cgen/management.rs). */
+jabs_object *jabs_management_memory_usage(int64_t init, int64_t used, int64_t committed, int64_t max);
 /* java.io natives' glue (jabs_io.c). */
 /* System.mapLibraryName: "name" -> "name.dll" / "libname.so" / "libname.dylib". */
 jabs_object *jabs_map_library_name(jabs_object *name);

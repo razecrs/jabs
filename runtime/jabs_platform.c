@@ -117,6 +117,12 @@ int64_t jabs_platform_process_id(void) {
     return (int64_t)GetCurrentProcessId(); /* cannot fail */
 }
 
+int32_t jabs_platform_load_average(double *out, int32_t count) {
+    (void)out;
+    (void)count;
+    return -1; /* Windows keeps no load average */
+}
+
 int jabs_platform_stack_functions(const void **starts, int max) {
     void *pcs[1024];
     int n = (int)RtlCaptureStackBackTrace(0, (DWORD)(max < 1024 ? max : 1024), pcs, NULL);
@@ -220,6 +226,19 @@ int64_t jabs_platform_set_error_mode(int64_t mode) {
 
 int64_t jabs_platform_process_id(void) {
     return (int64_t)getpid(); /* cannot fail */
+}
+
+/* glibc and the BSDs have it in <stdlib.h>, but only outside strict POSIX mode, which this file
+ * asks for (_POSIX_C_SOURCE); the signature is the same on every host that has it. */
+extern int getloadavg(double loadavg[], int nelem);
+
+int32_t jabs_platform_load_average(double *out, int32_t count) {
+    if (!out || count < 1 || count > 3) {
+        fprintf(stderr, "jabs: jabs_platform_load_average(%p, %d): bad arguments\n", (void *)out, (int)count);
+        abort();
+    }
+    int got = getloadavg(out, count);
+    return got < 1 ? -1 : (int32_t)got;
 }
 
 typedef struct { const void **starts; int count, max; } jabs_unwind_state;

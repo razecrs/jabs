@@ -5,6 +5,8 @@
 // JABS compiles in only code something calls, so reflection could not find it.
 import java.lang.management.ClassLoadingMXBean;
 import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryUsage;
+import java.lang.management.OperatingSystemMXBean;
 import java.lang.management.RuntimeMXBean;
 import java.lang.management.ThreadMXBean;
 import java.lang.reflect.Method;
@@ -22,6 +24,8 @@ class ManagementCases {
         else if (mechanism.equals("processId")) processId(mechanism.isEmpty());
         else if (mechanism.equals("threadCounts")) threadCounts();
         else if (mechanism.equals("classCounts")) classCounts();
+        else if (mechanism.equals("heapUsage")) heapUsage();
+        else if (mechanism.equals("operatingSystem")) operatingSystem();
         else throw new IllegalArgumentException("no mechanism " + mechanism);
     }
 
@@ -124,6 +128,29 @@ class ManagementCases {
             + " daemon +" + (threads.getDaemonThreadCount() - daemon)
             + " peak +" + (threads.getPeakThreadCount() - live)
             + " started +" + (threads.getTotalStartedThreadCount() - started));
+    }
+
+    static byte[] kept;
+
+    // MemoryMXBean's heap usage is consistent and follows a large allocation that stays reachable.
+    static void heapUsage() {
+        MemoryUsage before = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+        kept = new byte[16 << 20];
+        MemoryUsage after = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+        System.out.println("committed covers used: " + (after.getCommitted() >= after.getUsed()));
+        System.out.println("max undefined or covers committed: " + (after.getMax() == -1 || after.getMax() >= after.getCommitted()));
+        System.out.println("used grows by the allocation: " + (after.getUsed() - before.getUsed() >= (8 << 20)) + " " + kept.length);
+    }
+
+    // OperatingSystemMXBean's basics: the system properties, the processor count Runtime gives,
+    // and whether the host keeps a load average (Windows does not: -1).
+    static void operatingSystem() {
+        OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
+        System.out.println(os.getName().equals(System.getProperty("os.name")) + " " + os.getArch().equals(System.getProperty("os.arch"))
+            + " " + os.getVersion().equals(System.getProperty("os.version")));
+        System.out.println("processors as Runtime: " + (os.getAvailableProcessors() == Runtime.getRuntime().availableProcessors()));
+        double load = os.getSystemLoadAverage();
+        System.out.println("load average: " + (load < 0 ? "none " + load : "non-negative"));
     }
 
     static class Fresh {

@@ -421,6 +421,33 @@ fn class_counts_are_consistent_and_initialization_counts() {
 }
 
 #[test]
+fn heap_usage_follows_allocation() {
+    same_as_jvm(
+        "heapUsage",
+        &[],
+        &[],
+        &format!(
+            "MemoryImpl.getMemoryUsage0 in {NATIVES} (jabs_heap_bytes) and \
+             jabs_management_memory_usage (management::glue, constructed_by in reachable())"
+        ),
+    );
+}
+
+#[test]
+fn operating_system_basics_follow_the_jvm() {
+    same_as_jvm(
+        "operatingSystem",
+        &[],
+        &[],
+        &format!(
+            "OperatingSystemImpl.initialize0 and Unsafe.getLoadAverage0 in {NATIVES}; \
+             jabs_platform_load_average in runtime/jabs_platform.c; getAvailableProcessors \
+             (jabs_thread_processor_count)"
+        ),
+    );
+}
+
+#[test]
 fn process_id_is_the_process_that_runs() {
     let Some((jvm, native)) = runs("processId", &[], &[OPEN_SUN_MANAGEMENT]) else {
         return;
