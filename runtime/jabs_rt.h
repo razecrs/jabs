@@ -553,16 +553,28 @@ extern const jabs_class jabs_array_class_record;
 static inline const jabs_class *jabs_array_class(void) { return &jabs_array_class_record; }
 
 static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target);
+static inline int32_t jabs_is_array_instance(const jabs_object *o, const char *target, const jabs_class *component);
 
 /* aastore check: may `value` (non-null) be stored in this array? */
 static inline int jabs_array_store_ok(jabs_array *a, jabs_object *value) {
     switch (a->component_kind) {
     case JABS_COMPONENT_ANY: return 1;
     case JABS_COMPONENT_CLASS: return jabs_is_instance(value, a->component);
-    case JABS_COMPONENT_ARRAY:
-        return value->cls == jabs_array_class() &&
-               strcmp(((jabs_array *)value)->descriptor, a->component_descriptor) == 0;
-    default: jabs_not_compiled("aastore into an array whose element type is outside the unit or an interface");
+    case JABS_COMPONENT_ARRAY: {
+        if (value->cls != jabs_array_class()) return 0;
+        const char *row = a->component_descriptor;
+        if (!row || row[0] != '[') jabs_not_compiled("aastore into an array of arrays with no row type recorded");
+        /* Rows of a primitive type fit only exactly; rows of references are covariant, so a row
+         * fits exactly when it is an instance of the row type (a String[] in a CharSequence[][]). */
+        if (row[1] != 'L' && row[1] != '[') return strcmp(((jabs_array *)value)->descriptor, row) == 0;
+        if (strcmp(((jabs_array *)value)->descriptor, row) == 0) return 1;
+        /* A covariant row needs the row element's record; without it the answer would be a
+         * wrong ArrayStoreException, so stop instead. */
+        if (row[1] == 'L' && !a->component && strcmp(row, "[Ljava/lang/Object;") != 0)
+            jabs_not_compiled("aastore of a row whose element class is outside the unit");
+        return jabs_is_array_instance(value, row, a->component);
+    }
+    default: jabs_not_compiled("aastore into an array whose element type is outside the unit");
     }
     return 0;
 }

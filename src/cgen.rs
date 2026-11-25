@@ -4130,11 +4130,25 @@ fn emit_method(
                 } else {
                     format!("L{component};")
                 };
-                let primitive_rows = component.len() == 2 && component.starts_with('[');
+                // Rows (an array of arrays): the runtime checks a stored row against the row type,
+                // exactly for primitive rows and covariantly for reference rows, which needs the
+                // record of a one-level row's element class.
+                let rows = component.starts_with('[');
                 let (kind, record) = if component == OBJECT {
                     ("JABS_COMPONENT_ANY", "NULL".to_string())
-                } else if primitive_rows {
-                    ("JABS_COMPONENT_ARRAY", "NULL".to_string())
+                } else if rows {
+                    let element = component
+                        .strip_prefix("[L")
+                        .and_then(|rest| rest.strip_suffix(';'));
+                    let record = match element {
+                        Some(e)
+                            if e != OBJECT && unit.get(e).is_some() && unit.chain(e).is_ok() =>
+                        {
+                            format!("&{}", class_record(e))
+                        }
+                        _ => "NULL".to_string(),
+                    };
+                    ("JABS_COMPONENT_ARRAY", record)
                 } else if !component.starts_with('[')
                     && unit.get(component).is_some()
                     && unit.chain(component).is_ok()
@@ -4146,8 +4160,8 @@ fn emit_method(
                 } else {
                     ("JABS_COMPONENT_UNCHECKED", "NULL".to_string())
                 };
-                let component_descriptor = if primitive_rows {
-                    format!("\"{component}\"")
+                let component_descriptor = if rows {
+                    format!("\"{}\"", c_escape(component))
                 } else {
                     "NULL".to_string()
                 };
@@ -5578,8 +5592,19 @@ jabs_object *jabs_reflect_new_array(jabs_object *component, int32_t length) {{
     /* The element checks compiled anewarray uses: any for Object, the class, or the array type. */
     if (strcmp(e->name, "java/lang/Object") == 0)
         return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ANY, NULL, stable, NULL);
-    if (e->name[0] == '[')
-        return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ARRAY, NULL, stable, jabs_class_entry_of(component)->name);
+    if (e->name[0] == '[') {{
+        /* Rows of references are covariant: keep the record of a one-level row's element class. */
+        const char *row = jabs_class_entry_of(component)->name;
+        const jabs_class *element = NULL;
+        size_t row_length = strlen(row);
+        if (row[1] == 'L' && row_length > 3 && row_length < 1024) {{
+            char inner[1024];
+            memcpy(inner, row + 2, row_length - 3);
+            inner[row_length - 3] = 0;
+            element = jabs_record_named(inner);
+        }}
+        return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ARRAY, element, stable, row);
+    }}
     if (e->record && !e->record->is_interface)
         return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_CLASS, e->record, stable, NULL);
     return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_UNCHECKED, NULL, stable, NULL);

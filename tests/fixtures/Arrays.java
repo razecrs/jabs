@@ -58,6 +58,28 @@ public class Arrays {
         s[0] = Shapes.make(which, 1);   // a Circle must fail with ArrayStoreException
         return s[0].kind();
     }
+    // Arrays whose rows are reference arrays: a row store is checked covariantly, as instanceof
+    // is (java.util.Locale's LanguageTag builds a String[][] like rowsOfStrings).
+    static int rowsOfStrings(int n) {
+        String[][] t = new String[n][];
+        for (int i = 0; i < n; i++) t[i] = new String[] { "a", String.valueOf(i) };
+        int total = 0;
+        for (String[] row : t) total += row[1].length();
+        return total;
+    }
+    static int rowStore(int which) {
+        Object[][] rows = new CharSequence[1][];     // runtime type CharSequence[][]
+        Object[] row = which == 0 ? new String[1]        // a String[] is a CharSequence[]
+                     : which == 1 ? new StringBuilder[1] // so is a StringBuilder[]
+                     : new Integer[1];                   // ArrayStoreException
+        rows[0] = row;
+        return rows[0].length + which;
+    }
+    static int reflectRows(int which) {
+        Object[][] rows = (Object[][]) java.lang.reflect.Array.newInstance(Object[].class, 1);
+        rows[0] = which == 0 ? new String[2] : new Object[3]; // both are Object[]
+        return rows[0].length;
+    }
     static int negative(int n) { return new int[n].length; }
     static int outOfBounds(int i) { int[] a = new int[3]; return a[i]; }
     static int nullArray(int i) { int[] a = i > 100 ? new int[1] : null; return a[0]; }

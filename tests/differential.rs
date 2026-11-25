@@ -534,6 +534,14 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         out.push(("Arrays", "grid", vec![I(n.min(50))]));
         out.push(("Arrays", "shapes", vec![I(n.min(50))]));
         out.push(("Arrays", "objects", vec![I(n)]));
+        out.push(("Arrays", "rowsOfStrings", vec![I(n.min(50))]));
+    }
+    // Reference rows: covariant stores, an interface element type and a reflective Object[][].
+    for which in [0, 1, 2] {
+        out.push(("Arrays", "rowStore", vec![I(which)]));
+    }
+    for which in [0, 1] {
+        out.push(("Arrays", "reflectRows", vec![I(which)]));
     }
     for v in [0, 1, -1, 255, 70000, i32::MIN, i32::MAX] {
         for name in ["bytes", "booleans", "chars", "shorts"] {
