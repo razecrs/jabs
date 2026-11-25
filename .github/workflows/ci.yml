@@ -13,6 +13,16 @@ jobs:
         with:
           distribution: microsoft
           java-version: '25'
+      # JABS reads java.base from the JDK's jmods; builds made with JEP 493 leave them out.
+      - name: Check the JDK ships jmods
+        shell: bash
+        run: |
+          java -version
+          if [ ! -f "$JAVA_HOME/jmods/java.base.jmod" ]; then
+            echo "::error::$JAVA_HOME/jmods/java.base.jmod is missing: this JDK build has no jmods (JEP 493), and JABS reads java.base from them"
+            exit 1
+          fi
+          echo "jmods present: $JAVA_HOME/jmods/java.base.jmod"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
