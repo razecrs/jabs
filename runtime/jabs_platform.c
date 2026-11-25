@@ -113,6 +113,10 @@ int64_t jabs_platform_set_error_mode(int64_t mode) {
     return (int64_t)SetErrorMode((UINT)mode);
 }
 
+int64_t jabs_platform_process_id(void) {
+    return (int64_t)GetCurrentProcessId(); /* cannot fail */
+}
+
 int jabs_platform_stack_functions(const void **starts, int max) {
     void *pcs[1024];
     int n = (int)RtlCaptureStackBackTrace(0, (DWORD)(max < 1024 ? max : 1024), pcs, NULL);
@@ -214,6 +218,10 @@ int64_t jabs_platform_set_error_mode(int64_t mode) {
     return 0;
 }
 
+int64_t jabs_platform_process_id(void) {
+    return (int64_t)getpid(); /* cannot fail */
+}
+
 typedef struct { const void **starts; int count, max; } jabs_unwind_state;
 
 /* One frame of _Unwind_Backtrace: record the start of its enclosing function. */
@@ -264,6 +272,46 @@ int64_t jabs_nano_time_adjustment(int64_t offset_seconds) {
     int64_t seconds = (int64_t)now.tv_sec - offset_seconds;
     if (seconds > 0xFFFFFFFFLL || seconds < -0xFFFFFFFFLL) return -1;
     return seconds * 1000000000LL + now.tv_nsec;
+}
+
+/* The VM's start for java.lang.management (RuntimeMXBean start time and uptime). HotSpot takes
+ * the start time when VM creation ends and the uptime from its own start, both before main;
+ * JABS takes both at once when jabs_vm_startup begins, which is single-threaded. A program
+ * without that startup (a bare compiled unit) starts the clock on the first query instead.
+ * State: 0 not started, 1 being recorded, 2 recorded (release, after the two values). */
+static _Atomic int jabs_start_state;
+static int64_t jabs_start_wall_millis, jabs_start_nanos;
+/* A thread that finds another recording waits this many yields at most: recording is two clock
+ * reads, so running out means the recorder died. */
+#define JABS_START_WAIT_LIMIT 100000000
+
+void jabs_platform_record_start(void) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&jabs_start_state, &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
+        jabs_start_wall_millis = jabs_current_millis();
+        jabs_start_nanos = jabs_nano_time();
+        atomic_store_explicit(&jabs_start_state, 2, memory_order_release);
+        return;
+    }
+    for (long i = 0; i < JABS_START_WAIT_LIMIT; i++) {
+        if (atomic_load_explicit(&jabs_start_state, memory_order_acquire) == 2) return;
+        jabs_thread_yield();
+    }
+    fprintf(stderr, "jabs: the VM start time was never recorded (jabs_platform_record_start)\n");
+    abort();
+}
+
+int64_t jabs_platform_start_millis(void) {
+    jabs_platform_record_start();
+    return jabs_start_wall_millis;
+}
+
+int64_t jabs_platform_uptime_millis(void) {
+    jabs_platform_record_start();
+    int64_t elapsed = jabs_nano_time() - jabs_start_nanos;
+    /* The monotonic clock never goes back; a negative difference is a broken clock. */
+    if (elapsed < 0) { fprintf(stderr, "jabs: the monotonic clock went back (jabs_platform_uptime_millis)\n"); abort(); }
+    return elapsed / 1000000;
 }
 
 /* Values that do not depend on the operating system. */

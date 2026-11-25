@@ -29,6 +29,7 @@ use std::{
     rc::Rc,
 };
 
+mod management;
 mod reflect;
 
 pub const RUNTIME_PRELUDE: &str = include_str!("../runtime/jabs_rt.h");
@@ -665,6 +666,9 @@ const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
 /// The C body replacing a Java method, if JABS replaces it.
 fn replacement(key: &MethodKey) -> Option<(String, bool)> {
     if let Some(found) = reflect::replacement(key) {
+        return Some(found);
+    }
+    if let Some(found) = management::replacement(key) {
         return Some(found);
     }
     // JDK 25 walks the stack with StackWalker (a lambda); JABS walks native frames instead.
@@ -4826,6 +4830,13 @@ fn emit_class_registry(
         "static const jabs_class *const jabs_records[] = {{ {}NULL }};",
         records.iter().map(|r| format!("{r}, ")).collect::<String>()
     );
+    // ClassLoadingMXBean's loaded count: every class and interface compiled in is loaded when
+    // the program starts (VMManagementImpl.getTotalClassCount, src/cgen/management.rs).
+    let _ = writeln!(
+        out,
+        "const int64_t jabs_class_record_count = {};",
+        records.len()
+    );
     // Field offsets of every recorded class's own instance fields, for Unsafe.objectFieldOffset.
     let _ = writeln!(
         out,
@@ -5464,6 +5475,8 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
     out.push_str("\n/* What the JVM does before main: System.initPhase1 (properties, standard streams). */\n");
     if has_startup {
         let _ = writeln!(out, "int jabs_vm_startup(void) {{");
+        // The VM's start for RuntimeMXBean (start time, uptime), before any Java code runs.
+        out.push_str("    jabs_platform_record_start();\n");
         out.push_str("    jabs_on_not_compiled = jabs_print_java_stack;\n");
         for class in VM_PREINITIALIZED.iter().filter(|c| inits.contains(**c)) {
             let _ = writeln!(out, "    if ({}() != 0) return -1;", init_symbol(class));
@@ -7317,6 +7330,8 @@ const IO_C: &str = include_str!("../runtime/jabs_io.c");
 const SYNC_C: &str = include_str!("../runtime/jabs_sync.c");
 /// Java threads on OS threads (handwritten, OS-specific).
 const THREAD_C: &str = include_str!("../runtime/jabs_thread.c");
+/// java.lang.management natives' glue (handwritten, OS-neutral; needs the class registry).
+const MANAGEMENT_C: &str = include_str!("../runtime/jabs_management.c");
 /// Reflection: member listings and reflective calls (handwritten).
 const REFLECT_C: &str = include_str!("../runtime/jabs_reflect.c");
 /// Reflection's metadata layout and entry points (handwritten; part of every program's header).
@@ -7400,7 +7415,9 @@ pub fn compile_unit_with(
                     return Ok((sig, Analyzed::empty()));
                 }
                 if method.access & ACC_NATIVE != 0 {
-                    let Some(body) = intrinsic(&key, have_classes) else {
+                    let found = management::intrinsic(&unit, &key, have_classes)
+                        .or_else(|| intrinsic(&key, have_classes));
+                    let Some(body) = found else {
                         return Err("native method without a JABS implementation".to_string());
                     };
                     intrinsics.insert(key.clone(), body);
@@ -7756,6 +7773,7 @@ pub fn compile_unit_with(
                 + &REFLECT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &(if registry_emitted {
                     IO_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                        + &MANAGEMENT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 } else {
                     String::new()
                 })
@@ -7780,6 +7798,7 @@ pub fn compile_unit_with(
             files.push(("jabs_reflect.c".to_string(), REFLECT_C.to_string()));
             if registry_emitted {
                 files.push(("jabs_io.c".to_string(), IO_C.to_string()));
+                files.push(("jabs_management.c".to_string(), MANAGEMENT_C.to_string()));
             }
             for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
                 files.push((

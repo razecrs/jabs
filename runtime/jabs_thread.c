@@ -237,6 +237,16 @@ void jabs_unlock(int which) {
  * all waiters and each rechecks its own class. */
 static jabs_os_mutex jabs_init_mutex = JABS_OS_MUTEX_INIT;
 static jabs_os_cond jabs_init_done = JABS_OS_COND_INIT;
+/* Classes whose initialization completed (VMManagementImpl.getInitializedClassCount); changed and
+ * read under jabs_init_mutex. */
+static int64_t jabs_classes_initialized;
+
+int64_t jabs_class_initialized_count(void) {
+    jabs_os_mutex_lock(&jabs_init_mutex);
+    int64_t count = jabs_classes_initialized;
+    jabs_os_mutex_unlock(&jabs_init_mutex);
+    return count;
+}
 
 int jabs_class_init_begin(jabs_class_init *c) {
     const void *me = jabs_thread_identity();
@@ -279,6 +289,10 @@ void jabs_class_init_end(jabs_class_init *c, bool ok) {
         abort();
     }
     c->owner = NULL;
+    if (ok) {
+        if (jabs_classes_initialized == INT64_MAX) { jabs_os_mutex_unlock(&jabs_init_mutex); fprintf(stderr, "jabs: initialized class count overflow\n"); abort(); }
+        jabs_classes_initialized++;
+    }
     /* Steps 10 and 11: release pairs with the fast path's acquire load in jabs_class_initialized,
      * so a thread that sees INITIALIZED also sees every static <clinit> wrote. */
     atomic_store_explicit(&c->state, ok ? JABS_CLASS_INITIALIZED : JABS_CLASS_ERRONEOUS, memory_order_release);
@@ -294,6 +308,10 @@ typedef struct jabs_thread_record {
     jabs_object *thread;
     /* Counted in jabs_live_non_daemon while it runs (started non-daemon threads only). */
     bool counted;
+    /* Counted in the management counts (jabs_mgmt_live, and jabs_mgmt_daemon when daemon) from
+     * start0 until its end; daemon is fixed at start, as Thread.setDaemon refuses a started thread. */
+    bool live;
+    bool daemon;
     /* Seeds this thread's identity-hash sequence. */
     uint32_t number;
     /* The monitors' record of this OS thread (for interrupting Object.wait); NULL until the
@@ -310,7 +328,28 @@ static jabs_os_mutex jabs_threads_mutex = JABS_OS_MUTEX_INIT;
 static jabs_os_cond jabs_no_live = JABS_OS_COND_INIT;
 static uint32_t jabs_live_non_daemon;
 static uint32_t jabs_threads_started;
-static jabs_thread_record jabs_main_record;
+/* The main thread is live (for java.lang.management) from the start: it runs before any count is
+ * read, as HotSpot's main JavaThread does. */
+static jabs_thread_record jabs_main_record = { .live = true };
+/* java.lang.management's thread counts, as HotSpot's ThreadService keeps them: a thread counts
+ * from Thread.start0 (before it returns) and stops counting at its end before join() waiters
+ * wake, so a joined thread is never live. Started counts every thread ever started plus main.
+ * All four change and are read only under jabs_threads_mutex; they are bounded by
+ * jabs_threads_started (UINT32_MAX), so int64_t never overflows. */
+static int64_t jabs_mgmt_live = 1, jabs_mgmt_daemon, jabs_mgmt_peak = 1, jabs_mgmt_started = 1;
+
+jabs_thread_counts jabs_thread_management_counts(void) {
+    jabs_os_mutex_lock(&jabs_threads_mutex);
+    jabs_thread_counts counts = { jabs_mgmt_live, jabs_mgmt_daemon, jabs_mgmt_peak, jabs_mgmt_started };
+    jabs_os_mutex_unlock(&jabs_threads_mutex);
+    return counts;
+}
+
+void jabs_thread_reset_peak(void) {
+    jabs_os_mutex_lock(&jabs_threads_mutex);
+    jabs_mgmt_peak = jabs_mgmt_live;
+    jabs_os_mutex_unlock(&jabs_threads_mutex);
+}
 static bool jabs_main_attached;
 static _Thread_local jabs_thread_record *jabs_self;
 
@@ -365,6 +404,15 @@ static void jabs_thread_terminate(jabs_thread_record *record) {
     jabs_os_mutex_lock(&jabs_threads_mutex);
     jabs_set_status(status, JABS_THREAD_TERMINATED);
     jabs_set_eetop(thread, 0);
+    /* No longer live for management, in the same step that makes it not alive: whoever sees it
+     * TERMINATED (join) then reads counts without it, as the reference JVM reports after a join
+     * (tests/management.rs, threadCounts). */
+    if (record->live) {
+        if (jabs_mgmt_live <= 0 || (record->daemon && jabs_mgmt_daemon <= 0)) { jabs_os_mutex_unlock(&jabs_threads_mutex); fprintf(stderr, "jabs: live thread count underflow\n"); abort(); }
+        record->live = false;
+        jabs_mgmt_live--;
+        if (record->daemon) jabs_mgmt_daemon--;
+    }
     jabs_os_mutex_unlock(&jabs_threads_mutex);
     if (!jabs_monitor_notify_all(thread) || !jabs_monitor_exit(thread)) {
         fprintf(stderr, "jabs: a terminating thread does not own its Thread's monitor\n");
@@ -447,6 +495,15 @@ void jabs_thread_start(jabs_object *thread) {
     jabs_set_status(status, JABS_THREAD_RUNNABLE);
     jabs_set_eetop(thread, (int64_t)(intptr_t)record);
     if (record->counted) jabs_live_non_daemon++;
+    /* Live for management before start() returns, like alive: counted from here, never late. */
+    int64_t peak_before = jabs_mgmt_peak;
+    record->live = true;
+    record->daemon = daemon;
+    jabs_mgmt_live++;
+    if (daemon) jabs_mgmt_daemon++;
+    jabs_mgmt_started++;
+    if (jabs_mgmt_live > jabs_mgmt_peak) jabs_mgmt_peak = jabs_mgmt_live;
+    int64_t peak_set = jabs_mgmt_peak;
     jabs_os_mutex_unlock(&jabs_threads_mutex);
     if (jabs_os_thread_spawn(jabs_thread_main, record)) return;
     jabs_os_mutex_lock(&jabs_threads_mutex);
@@ -456,6 +513,14 @@ void jabs_thread_start(jabs_object *thread) {
         jabs_live_non_daemon--;
         if (jabs_live_non_daemon == 0) jabs_os_cond_broadcast(&jabs_no_live);
     }
+    /* The thread never ran: it was never started for management either. A peak this start raised
+     * goes back; if another thread started meanwhile the peak may stay one too high (accepted:
+     * it needs the OS to refuse a thread while another starts). */
+    jabs_mgmt_live--;
+    if (daemon) jabs_mgmt_daemon--;
+    jabs_mgmt_started--;
+    record->live = false;
+    if (jabs_mgmt_peak == peak_set && peak_set > peak_before) jabs_mgmt_peak = peak_before > jabs_mgmt_live ? peak_before : jabs_mgmt_live;
     jabs_os_mutex_unlock(&jabs_threads_mutex);
     jabs_os_sync_destroy(&record->sleep_lock, &record->sleep_wake);
     free(record);

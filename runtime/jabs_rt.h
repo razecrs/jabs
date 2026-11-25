@@ -166,6 +166,24 @@ void jabs_thread_yield(void);
 void jabs_thread_set_native_name(const char *name);
 /* Processors this process may run on (Runtime.availableProcessors). */
 int32_t jabs_thread_processor_count(void);
+/* java.lang.management's thread counts (VMManagementImpl, ThreadMXBean), kept as HotSpot's
+ * ThreadService does: live and daemon threads now, the most live at once since the last reset,
+ * and every thread ever started, main included. One consistent snapshot. */
+typedef struct { int64_t live, daemon, peak, started; } jabs_thread_counts;
+jabs_thread_counts jabs_thread_management_counts(void);
+/* ThreadMXBean.resetPeakThreadCount: the peak becomes the live count. */
+void jabs_thread_reset_peak(void);
+/* Classes whose initialization has completed (jabs_class_init_end with ok). */
+int64_t jabs_class_initialized_count(void);
+/* Classes and interfaces compiled into the program (generated with the class records). */
+extern const int64_t jabs_class_record_count;
+/* The VM's start (jabs_vm_startup records it; else the first query does) as wall-clock
+ * milliseconds, and milliseconds since then on the monotonic clock (jabs_platform.c). */
+void jabs_platform_record_start(void);
+int64_t jabs_platform_start_millis(void);
+int64_t jabs_platform_uptime_millis(void);
+/* The operating system's id of this process. */
+int64_t jabs_platform_process_id(void);
 /* Generated glue the thread runtime uses (thread_glue_functions in cgen.rs): the main Thread, and
  * where Thread.eetop lives (the JVM's "alive" marker: non-zero exactly while the thread runs). */
 jabs_object *jabs_main_thread(void);
@@ -430,6 +448,8 @@ jabs_object *jabs_new_string_array(int32_t length);
 void jabs_raise_message(int kind, const char *utf8);
 char *jabs_string_to_utf8(jabs_object *s);
 jabs_object *jabs_string_from_utf8(const char *text);
+/* java.lang.management natives' glue (jabs_management.c): VMManagementImpl.getVmArguments0. */
+jabs_object *jabs_management_vm_arguments(void);
 /* java.io natives' glue (jabs_io.c). */
 /* System.mapLibraryName: "name" -> "name.dll" / "libname.so" / "libname.dylib". */
 jabs_object *jabs_map_library_name(jabs_object *name);
