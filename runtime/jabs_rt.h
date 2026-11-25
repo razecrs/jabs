@@ -47,7 +47,8 @@ typedef struct jabs_class {
 /* Every object starts with this header; the class's own struct embeds it first. */
 typedef struct jabs_object {
     const jabs_class *cls;
-    /* Monitor entry count. The runtime has a single thread, so the owner is always that thread. */
+    /* 0 until the object is first locked, then the 1-based index of its monitor in
+     * runtime/jabs_sync.c's table (set once, atomically; read with acquire order). */
     uint32_t monitor;
     /* Identity hash code, assigned on first request (0 = not yet assigned). */
     uint32_t hash;
@@ -509,15 +510,20 @@ static inline int32_t jabs_is_array_instance(const jabs_object *o, const char *t
     jabs_not_compiled("array type test whose element type is outside the unit or multi-dimensional");
 }
 
-/* monitorenter: with a single thread the monitor is always free or already owned. */
-static inline void jabs_monitor_enter(jabs_object *o) { o->monitor++; }
-
-/* monitorexit: 0 means the thread does not own the monitor (IllegalMonitorStateException). */
-static inline int jabs_monitor_exit(jabs_object *o) {
-    if (o->monitor == 0) return 0;
-    o->monitor--;
-    return 1;
-}
+/* Object monitors (runtime/jabs_sync.c). The owner is the calling OS thread, never a Java Thread
+ * object. Callers raise NullPointerException for a null object first; these stop the program
+ * on NULL rather than guess.
+ * monitorenter: blocks until this thread owns the monitor (re-entering adds a level). */
+void jabs_monitor_enter(jabs_object *o);
+/* monitorexit: 1 = one level released; 0 = this thread does not own the monitor (the caller
+ * raises IllegalMonitorStateException). */
+int jabs_monitor_exit(jabs_object *o);
+/* Whether this thread owns the monitor (Thread.holdsLock). */
+int jabs_monitor_holds(jabs_object *o);
+/* The calling OS thread as the monitors know it: created on first use, never freed, so the
+ * pointer stays valid after the thread ends. */
+typedef struct jabs_sync_thread jabs_sync_thread;
+jabs_sync_thread *jabs_sync_current(void);
 
 /* invokeinterface: binary search the receiver's interface table; NULL if the class does not
  * implement a method with this selector (IncompatibleClassChangeError). */

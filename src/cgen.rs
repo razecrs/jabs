@@ -116,12 +116,12 @@ const INTRINSICS: &[Intrinsic] = &[
     },
     Intrinsic {
         key: ("java/lang/Object", "notify", "()V"),
-        body: "if (self->monitor == 0) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
+        body: "if (!jabs_monitor_holds(self)) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/Object", "notifyAll", "()V"),
-        body: "if (self->monitor == 0) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
+        body: "if (!jabs_monitor_holds(self)) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
         needs_classes: false,
     },
     Intrinsic {
@@ -412,7 +412,7 @@ const INTRINSICS: &[Intrinsic] = &[
     },
     Intrinsic {
         key: ("java/lang/Thread", "holdsLock", "(Ljava/lang/Object;)Z"),
-        body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } return a0->monitor != 0;",
+        body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } return jabs_monitor_holds(a0);",
         needs_classes: false,
     },
     // ThreadIdentifiers adds to this counter with Unsafe; the main thread already has id 1.

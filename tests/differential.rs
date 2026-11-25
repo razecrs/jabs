@@ -449,6 +449,16 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         out.push(("Sync", "twice", vec![I(n)]));
     }
     out.push(("Sync", "nullLock", vec![]));
+    for name in [
+        "holdsLockFollowsLevels",
+        "holdsLockAfterSynchronizedMethodThrows",
+        "notifyAfterExitThrows",
+        "notifyAllNeverLockedThrows",
+        "cloneHasItsOwnMonitor",
+        "holdsLockNull",
+    ] {
+        out.push(("Sync", name, vec![]));
+    }
     for w in [0, 1, 2] {
         out.push(("Sync", "castIntArray", vec![I(w)]));
         out.push(("Sync", "arrayKinds", vec![I(w)]));
@@ -639,7 +649,12 @@ int main(void) { return (int)fmod(1.0, 2.0); }
 fn where_to_look(class: &str) -> &'static str {
     match class {
         "Views" => {
-            " (byte-array view VarHandles: jabs_vh_address/jabs_var_handle_byte_view and              byte_view_access in src/cgen.rs, jabs_vh_view_load/store in runtime/jabs_rt.h)"
+            " (byte-array view VarHandles: jabs_vh_address/jabs_var_handle_byte_view and \
+             byte_view_access in src/cgen.rs, jabs_vh_view_load/store in runtime/jabs_rt.h)"
+        }
+        "Sync" => {
+            " (monitors: runtime/jabs_sync.c; monitorenter/monitorexit, emit_synchronized_wrapper \
+             and the notify/holdsLock intrinsics in src/cgen.rs)"
         }
         _ => "",
     }
@@ -959,6 +974,14 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         reference[at("Sync", "arrayKinds", Some(0))],
         format!("I {:08x}", 111)
+    );
+    assert_eq!(
+        reference[at("Sync", "holdsLockFollowsLevels", None)],
+        format!("I {:08x}", 1110)
+    );
+    assert_eq!(
+        reference[at("Sync", "notifyAfterExitThrows", None)],
+        "throw java/lang/IllegalMonitorStateException"
     );
     // Natives: a Circle stops the covariant copy after one element; overlapping copies shift.
     assert_eq!(

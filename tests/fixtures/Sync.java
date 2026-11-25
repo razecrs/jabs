@@ -29,6 +29,44 @@ public class Sync {
         synchronized (s) { synchronized (s) { return s.recurse(n) + twice(n); } }
     }
 
+    synchronized int divideInside() { return 10 / count; }
+
+    // Ownership as Thread.holdsLock sees it (runtime/jabs_sync.c, jabs_monitor_holds).
+    /** Digits, outermost first: before, in the outer block, the inner one, back out, after. */
+    static int holdsLockFollowsLevels() {
+        Object o = new Object();
+        int r = Thread.holdsLock(o) ? 1 : 0;
+        synchronized (o) {
+            r = r * 10 + (Thread.holdsLock(o) ? 1 : 0);
+            synchronized (o) { r = r * 10 + (Thread.holdsLock(o) ? 1 : 0); }
+            r = r * 10 + (Thread.holdsLock(o) ? 1 : 0);
+        }
+        return r * 10 + (Thread.holdsLock(o) ? 1 : 0);
+    }
+    /** A synchronized method that throws still releases its receiver's monitor. */
+    static int holdsLockAfterSynchronizedMethodThrows() {
+        Sync s = new Sync();
+        try { s.divideInside(); } catch (ArithmeticException e) { return Thread.holdsLock(s) ? 1 : 2; }
+        return 3;
+    }
+    /** notify needs ownership: fine inside the block, IllegalMonitorStateException after it. */
+    static int notifyAfterExitThrows() {
+        Object o = new Object();
+        synchronized (o) { o.notify(); o.notifyAll(); }
+        o.notify();
+        return 1;
+    }
+    static int notifyAllNeverLockedThrows() { new Object().notifyAll(); return 1; }
+    /** A clone does not share the original's monitor (jabs_clone resets the header). */
+    static int cloneHasItsOwnMonitor() {
+        int[] a = new int[1];
+        synchronized (a) {
+            int[] b = a.clone();
+            return (Thread.holdsLock(a) ? 10 : 0) + (Thread.holdsLock(b) ? 1 : 0);
+        }
+    }
+    static int holdsLockNull() { return Thread.holdsLock(null) ? 1 : 0; }
+
     static int castIntArray(int which) {
         Object o = which == 0 ? (Object) new int[4] : new long[2];
         return ((int[]) o).length;
