@@ -135,7 +135,7 @@ cargo clippy --locked --all-targets -- -D warnings
 Tests use temporary synthetic artifacts, not Minecraft files. They cover pinned
 identity, profile validation, cache reuse/invalidation, corrupted records,
 percentile definitions, invalid timings and CLI failure behavior. The
-differential test also needs `javac`, `java` (21 or later) and `clang` on PATH and
+differential test also needs `javac`, `java` 25 (it compiles that JDK's own `java.base`) and `clang` on PATH and
 is skipped without them; set `JABS_REQUIRE_TOOLS` to make a missing tool an error.
 
 Next: typed IR from method bytecode, wiring `inspect-jar` into profile
