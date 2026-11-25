@@ -178,7 +178,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 14] = [
+const FIXTURE_SOURCES: [&str; 15] = [
     "Arith",
     "Statics",
     "BadInit",
@@ -190,6 +190,7 @@ const FIXTURE_SOURCES: [&str; 14] = [
     "Exceptions",
     "Sync",
     "Monitors",
+    "Volatiles",
     "Natives",
     "StackOps",
     "Programs",
@@ -562,6 +563,19 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         out.push(("Atomics", "atomicIntegerArrayOutOfBounds", vec![I(index)]));
         out.push(("Atomics", "varHandleArrayIndexChecked", vec![I(index)]));
     }
+    // Volatile fields.
+    for v in [0i64, 1, -1, i64::MIN, 0x7ff8_0000_0000_0001] {
+        out.push(("Volatiles", "longRoundTrip", vec![J(v)]));
+        out.push(("Volatiles", "doubleBits", vec![J(v)]));
+    }
+    for v in [0, 1, -1, 0x1_2345, i32::MIN] {
+        out.push(("Volatiles", "narrowStores", vec![I(v)]));
+    }
+    for n in [0, 1, 1000] {
+        out.push(("Volatiles", "compoundUpdates", vec![I(n)]));
+    }
+    out.push(("Volatiles", "inheritedAndStatic", vec![]));
+    out.push(("Volatiles", "nullReceiver", vec![]));
     // wait/notify on one thread.
     for name in [
         "timedWaitReturnsOwningTheLock",
@@ -700,6 +714,7 @@ fn where_to_look(class: &str) -> &'static str {
             " (atomics: unsafe_intrinsic and var_handle_access/var_handle_order in src/cgen.rs, \
              jabs_atomic_add_float/double in runtime/jabs_rt.h)"
         }
+        "Volatiles" => " (volatile fields: field_load/field_store in src/cgen.rs)",
         "Monitors" => {
             " (wait/notify: jabs_monitor_wait/jabs_monitor_notify in runtime/jabs_sync.c, the \
              Object.wait0/notify/notifyAll intrinsics in src/cgen.rs)"
@@ -797,6 +812,34 @@ fn native_matches_reference_jvm() {
         unsupported.is_empty(),
         "unexpectedly unsupported: {unsupported:#?}"
     );
+    // One thread cannot tell a volatile access from a plain one, so check the generated C: the
+    // volatile long field must be read and written with sequentially consistent atomics.
+    for (method, descriptor, ret, wanted) in [
+        ("readLong", "()J", "int64_t", "__atomic_load(&"),
+        ("writeLong", "(J)V", "void", "__atomic_store(&"),
+    ] {
+        let start = format!(
+            "JABS_METHOD {ret} {}(",
+            cgen::symbol("Volatiles", method, descriptor)
+        );
+        // The definition, not a prototype: its first line opens the body.
+        let at = compiled
+            .c_source
+            .match_indices(&start)
+            .map(|(i, _)| i)
+            .find(|i| {
+                let line = &compiled.c_source[*i..];
+                line[..line.find('\n').unwrap_or(line.len())].ends_with('{')
+            })
+            .unwrap_or_else(|| panic!("Volatiles.{method} not defined in the generated C"));
+        let body = &compiled.c_source[at..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains(wanted) && body.contains("__ATOMIC_SEQ_CST"),
+            "Volatiles.{method}: a volatile field access is not a seq_cst atomic \
+             (field_load/field_store in src/cgen.rs); generated:\n{body}"
+        );
+    }
     // The harness is its own file next to the compiled program's split files.
     let mut c = String::from("#include \"jabs_unit.h\"\n");
     c.push_str(C_PRINTERS);

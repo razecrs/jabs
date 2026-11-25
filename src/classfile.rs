@@ -6,6 +6,8 @@ pub const ACC_PRIVATE: u16 = 0x0002;
 pub const ACC_STATIC: u16 = 0x0008;
 pub const ACC_FINAL: u16 = 0x0010;
 pub const ACC_SYNCHRONIZED: u16 = 0x0020;
+/// On a field (on a method the same bit means a bridge method).
+pub const ACC_VOLATILE: u16 = 0x0040;
 pub const ACC_NATIVE: u16 = 0x0100;
 pub const ACC_INTERFACE: u16 = 0x0200;
 pub const ACC_ABSTRACT: u16 = 0x0400;

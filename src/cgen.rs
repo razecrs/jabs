@@ -18,7 +18,7 @@ use crate::bytecode::{
 };
 use crate::classfile::{
     ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_STATIC, ACC_SYNCHRONIZED,
-    ClassFile, Constant, Member,
+    ACC_VOLATILE, ClassFile, Constant, Member,
 };
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
@@ -1642,6 +1642,36 @@ fn narrow_for_store(descriptor: &str, value: &str) -> String {
         "S" => format!("(int16_t)jabs_i2s({value})"),
         _ => value.to_string(),
     }
+}
+
+/// Whether the field a getfield/putfield/getstatic/putstatic resolved to is volatile.
+fn field_is_volatile(unit: &Unit, declaring: &str, name: &str, descriptor: &str) -> bool {
+    unit.get(declaring).is_some_and(|c| {
+        c.fields
+            .iter()
+            .any(|f| f.name == name && f.descriptor == descriptor && f.access & ACC_VOLATILE != 0)
+    })
+}
+
+/// C reading field `lvalue` into `target`. A volatile field is read with one sequentially
+/// consistent atomic load: Java volatile semantics, and single-copy atomic for long and double
+/// (JLS 17.7), which a plain C access does not promise.
+fn field_load(lvalue: &str, target: &str, descriptor: &str, volatile: bool) -> String {
+    if !volatile {
+        return format!("{target} = {lvalue};");
+    }
+    let ty = storage_type(descriptor).expect("a field type");
+    format!("{{ {ty} v; __atomic_load(&{lvalue}, &v, __ATOMIC_SEQ_CST); {target} = v; }}")
+}
+
+/// C storing `value` (already narrowed to the field's type) into field `lvalue`; a sequentially
+/// consistent atomic store when the field is volatile.
+fn field_store(lvalue: &str, value: &str, descriptor: &str, volatile: bool) -> String {
+    if !volatile {
+        return format!("{lvalue} = {value};");
+    }
+    let ty = storage_type(descriptor).expect("a field type");
+    format!("{{ {ty} v = {value}; __atomic_store(&{lvalue}, &v, __ATOMIC_SEQ_CST); }}")
 }
 
 /// Runtime package of a class: its internal name up to the last `/`.
@@ -4033,11 +4063,14 @@ fn emit_method(
                 let k = kind_of(parse_type(descriptor, name).unwrap().code).unwrap();
                 let guard = init_guard(unit, &class.name, declaring, exit);
                 let sym = field_symbol(declaring, name);
+                let volatile = field_is_volatile(unit, declaring, name, descriptor);
                 if matches!(insn.op, Op::GetStatic { .. }) {
-                    format!("{guard}s[{d}].{} = {sym};", field(k))
+                    let load =
+                        field_load(&sym, &format!("s[{d}].{}", field(k)), descriptor, volatile);
+                    format!("{guard}{load}")
                 } else {
                     let value = narrow_for_store(descriptor, &format!("s[{}].{}", d - 1, field(k)));
-                    format!("{guard}{sym} = {value};")
+                    format!("{guard}{}", field_store(&sym, &value, descriptor, volatile))
                 }
             }
             Op::New { class: target } => format!(
@@ -4167,16 +4200,26 @@ fn emit_method(
                 let k = kind_of(parse_type(&m.descriptor, &m.name).unwrap().code).unwrap();
                 let obj = object_struct(declaring);
                 let member = instance_field(&m.name);
+                let volatile = field_is_volatile(unit, declaring, &m.name, &m.descriptor);
                 if matches!(insn.op, Op::GetField(_)) {
                     let r = d - 1;
-                    format!(
-                        "if (!s[{r}].a) {npe} s[{r}].{} = (({obj} *)s[{r}].a)->{member};",
-                        field(k)
-                    )
+                    let load = field_load(
+                        &format!("(({obj} *)s[{r}].a)->{member}"),
+                        &format!("s[{r}].{}", field(k)),
+                        &m.descriptor,
+                        volatile,
+                    );
+                    format!("if (!s[{r}].a) {npe} {load}")
                 } else {
                     let (r, v) = (d - 2, d - 1);
                     let value = narrow_for_store(&m.descriptor, &format!("s[{v}].{}", field(k)));
-                    format!("if (!s[{r}].a) {npe} (({obj} *)s[{r}].a)->{member} = {value};")
+                    let store = field_store(
+                        &format!("(({obj} *)s[{r}].a)->{member}"),
+                        &value,
+                        &m.descriptor,
+                        volatile,
+                    );
+                    format!("if (!s[{r}].a) {npe} {store}")
                 }
             }
         };
