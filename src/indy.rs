@@ -686,6 +686,7 @@ fn synthetic_class(
         methods,
         string_units: pool.string_units,
         bootstrap_methods: Vec::new(),
+        reflect: Default::default(),
     }
 }
 
@@ -703,6 +704,7 @@ fn member(access: u16, name: &str, descriptor: &str, code: Option<Asm>, max_loca
         }),
         constant_value: None,
         annotations: Vec::new(),
+        reflect: Default::default(),
     }
 }
 
@@ -1463,6 +1465,7 @@ mod tests {
             code: Some(code),
             constant_value: None,
             annotations: Vec::new(),
+            reflect: Default::default(),
         };
         ClassFile {
             minor: 0,
@@ -1476,6 +1479,7 @@ mod tests {
             methods: vec![method],
             string_units: HashMap::new(),
             bootstrap_methods: vec![(9, Vec::new())],
+            reflect: Default::default(),
         }
     }
 

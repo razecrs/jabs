@@ -84,6 +84,50 @@ pub struct Member {
     /// Descriptors of the member's runtime-visible annotations, e.g.
     /// `Ljdk/internal/reflect/CallerSensitive;`.
     pub annotations: Vec<String>,
+    /// What java.lang.reflect reports about the member, as the class file has it.
+    pub reflect: MemberReflection,
+}
+
+/// A member's attributes that reflection hands out (JVMS 4.7). Annotation attributes stay raw:
+/// the JDK's AnnotationParser reads exactly these bytes, resolving their constant-pool indices
+/// through `Class.getConstantPool()`.
+#[derive(Debug, Clone, Default)]
+pub struct MemberReflection {
+    /// The Signature attribute (generic signature), if any.
+    pub signature: Option<String>,
+    /// A method's Exceptions attribute: internal class names, in order.
+    pub exceptions: Vec<String>,
+    /// Payload of RuntimeVisibleAnnotations.
+    pub annotations: Option<Vec<u8>>,
+    /// Payload of RuntimeVisibleParameterAnnotations.
+    pub parameter_annotations: Option<Vec<u8>>,
+    /// Payload of AnnotationDefault (annotation interface elements only).
+    pub annotation_default: Option<Vec<u8>>,
+}
+
+/// One InnerClasses entry (JVMS 4.7.6): names are internal names, None where the index is 0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InnerClass {
+    pub inner: String,
+    pub outer: Option<String>,
+    pub simple_name: Option<String>,
+    pub access: u16,
+}
+
+/// A class's attributes that reflection hands out (JVMS 4.7).
+#[derive(Debug, Clone, Default)]
+pub struct ClassReflection {
+    pub signature: Option<String>,
+    /// Payload of RuntimeVisibleAnnotations.
+    pub annotations: Option<Vec<u8>>,
+    pub inner_classes: Vec<InnerClass>,
+    /// EnclosingMethod: the enclosing class, and the method's (name, descriptor) when the
+    /// class is enclosed by a method rather than an initializer.
+    pub enclosing_method: Option<(String, Option<(String, String)>)>,
+    /// NestHost; None means the class is its own nest host.
+    pub nest_host: Option<String>,
+    /// Whether the class has a Record attribute (HotSpot's `is_record`).
+    pub is_record: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +145,8 @@ pub struct ClassFile {
     pub string_units: std::collections::HashMap<u16, Vec<u16>>,
     /// The BootstrapMethods attribute: (MethodHandle constant, static argument constants).
     pub bootstrap_methods: Vec<(u16, Vec<u16>)>,
+    /// What java.lang.Class reports about the class beyond its members.
+    pub reflect: ClassReflection,
 }
 
 pub(crate) struct Cursor<'a> {
@@ -198,47 +244,170 @@ fn parse_attributes(
     Ok(())
 }
 
+/// Deepest annotation nesting accepted (annotations inside arrays inside annotations...).
+const MAX_ANNOTATION_DEPTH: u32 = 64;
+
+/// Walk one element_value (JVMS 4.7.16.1), recursing into nested annotations and arrays, and
+/// hand every constant-pool index it names to `used`.
+fn walk_element_value(c: &mut Cursor, depth: u32, used: &mut dyn FnMut(u16)) -> Result<()> {
+    if depth > MAX_ANNOTATION_DEPTH {
+        bail!("annotation nesting too deep");
+    }
+    match c.u8()? {
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' | b'c' => used(c.u16()?),
+        b'e' => {
+            used(c.u16()?);
+            used(c.u16()?);
+        }
+        b'@' => walk_annotation(c, depth + 1, used)?,
+        b'[' => {
+            for _ in 0..c.u16()? {
+                walk_element_value(c, depth + 1, used)?;
+            }
+        }
+        tag => bail!("unknown annotation element tag {tag}"),
+    }
+    Ok(())
+}
+
+/// Walk one annotation structure (JVMS 4.7.16): type index, then (name index, value) pairs.
+fn walk_annotation(c: &mut Cursor, depth: u32, used: &mut dyn FnMut(u16)) -> Result<()> {
+    used(c.u16()?);
+    for _ in 0..c.u16()? {
+        used(c.u16()?);
+        walk_element_value(c, depth, used)?;
+    }
+    Ok(())
+}
+
+/// What an annotation-carrying attribute's payload is, for [`annotation_pool_indices`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationAttribute {
+    /// RuntimeVisibleAnnotations: u2 count, then annotations.
+    Annotations,
+    /// RuntimeVisibleParameterAnnotations: u1 parameter count, then per parameter u2 count and
+    /// annotations.
+    ParameterAnnotations,
+    /// AnnotationDefault: one element_value.
+    Default,
+}
+
+/// Every constant-pool index an annotation attribute's payload names, so the binary can keep
+/// exactly the constants `Class.getConstantPool()` must answer for it. Fails on malformed or
+/// trailing bytes rather than guess.
+pub fn annotation_pool_indices(data: &[u8], kind: AnnotationAttribute) -> Result<Vec<u16>> {
+    let mut c = Cursor::new(data);
+    let mut out = Vec::new();
+    let mut used = |i: u16| out.push(i);
+    match kind {
+        AnnotationAttribute::Annotations => {
+            for _ in 0..c.u16()? {
+                walk_annotation(&mut c, 0, &mut used)?;
+            }
+        }
+        AnnotationAttribute::ParameterAnnotations => {
+            for _ in 0..c.u8()? {
+                for _ in 0..c.u16()? {
+                    walk_annotation(&mut c, 0, &mut used)?;
+                }
+            }
+        }
+        AnnotationAttribute::Default => walk_element_value(&mut c, 0, &mut used)?,
+    }
+    if c.remaining() != 0 {
+        bail!(
+            "{} trailing bytes after an annotation attribute",
+            c.remaining()
+        );
+    }
+    Ok(out)
+}
+
 /// Top-level annotation type descriptors of a RuntimeVisibleAnnotations attribute (JVMS 4.7.16).
 fn parse_annotation_types(data: &[u8], pool: &[Constant]) -> Result<Vec<String>> {
-    // Skip one element_value (JVMS 4.7.16.1), recursing into nested annotations and arrays.
-    fn skip_value(c: &mut Cursor, depth: u32) -> Result<()> {
-        if depth > 64 {
-            bail!("annotation nesting too deep");
-        }
-        match c.u8()? {
-            b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' | b'c' => {
-                c.u16()?;
-            }
-            b'e' => {
-                c.u16()?;
-                c.u16()?;
-            }
-            b'@' => {
-                c.u16()?;
-                for _ in 0..c.u16()? {
-                    c.u16()?;
-                    skip_value(c, depth + 1)?;
-                }
-            }
-            b'[' => {
-                for _ in 0..c.u16()? {
-                    skip_value(c, depth + 1)?;
-                }
-            }
-            tag => bail!("unknown annotation element tag {tag}"),
-        }
-        Ok(())
-    }
     let mut c = Cursor::new(data);
     let mut out = Vec::new();
     for _ in 0..c.u16()? {
         out.push(utf8(pool, c.u16()?)?.to_owned());
         for _ in 0..c.u16()? {
             c.u16()?;
-            skip_value(&mut c, 0)?;
+            walk_element_value(&mut c, 0, &mut |_| {})?;
         }
     }
     Ok(out)
+}
+
+/// A two-byte attribute payload that is one constant-pool index.
+fn single_index(attribute: &str, data: &[u8]) -> Result<u16> {
+    if data.len() != 2 {
+        bail!("{attribute} attribute must be 2 bytes");
+    }
+    Ok(u16::from_be_bytes([data[0], data[1]]))
+}
+
+/// Exceptions attribute (JVMS 4.7.5): the declared exception classes, in order.
+fn parse_exceptions(data: &[u8], pool: &[Constant]) -> Result<Vec<String>> {
+    let mut c = Cursor::new(data);
+    let mut out = Vec::new();
+    for _ in 0..c.u16()? {
+        out.push(class_name(pool, c.u16()?)?.to_owned());
+    }
+    if c.remaining() != 0 {
+        bail!("Exceptions attribute has trailing bytes");
+    }
+    Ok(out)
+}
+
+/// InnerClasses attribute (JVMS 4.7.6).
+fn parse_inner_classes(data: &[u8], pool: &[Constant]) -> Result<Vec<InnerClass>> {
+    let mut c = Cursor::new(data);
+    let mut out = Vec::new();
+    for _ in 0..c.u16()? {
+        let inner = class_name(pool, c.u16()?)?.to_owned();
+        let outer = match c.u16()? {
+            0 => None,
+            i => Some(class_name(pool, i)?.to_owned()),
+        };
+        let simple_name = match c.u16()? {
+            0 => None,
+            i => Some(utf8(pool, i)?.to_owned()),
+        };
+        let access = c.u16()?;
+        out.push(InnerClass {
+            inner,
+            outer,
+            simple_name,
+            access,
+        });
+    }
+    if c.remaining() != 0 {
+        bail!("InnerClasses attribute has trailing bytes");
+    }
+    Ok(out)
+}
+
+/// EnclosingMethod attribute (JVMS 4.7.7).
+fn parse_enclosing_method(
+    data: &[u8],
+    pool: &[Constant],
+) -> Result<(String, Option<(String, String)>)> {
+    if data.len() != 4 {
+        bail!("EnclosingMethod attribute must be 4 bytes");
+    }
+    let class = class_name(pool, u16::from_be_bytes([data[0], data[1]]))?.to_owned();
+    let method = match u16::from_be_bytes([data[2], data[3]]) {
+        0 => None,
+        i => {
+            let Some(Constant::NameAndType { name, descriptor }) = pool.get(i as usize) else {
+                bail!("EnclosingMethod method {i} is not NameAndType");
+            };
+            Some((
+                utf8(pool, *name)?.to_owned(),
+                utf8(pool, *descriptor)?.to_owned(),
+            ))
+        }
+    };
+    Ok((class, method))
 }
 
 /// Parse a Code attribute: limits, bytecode and exception handlers.
@@ -387,6 +556,7 @@ impl ClassFile {
                 let mut code = None;
                 let mut constant_value = None;
                 let mut annotations = Vec::new();
+                let mut reflect = MemberReflection::default();
                 parse_attributes(c, &pool, |attr, data| {
                     match attr {
                         "Code" if code.is_some() => bail!("duplicate Code attribute"),
@@ -399,7 +569,25 @@ impl ClassFile {
                         }
                         "RuntimeVisibleAnnotations" => {
                             annotations = parse_annotation_types(data, &pool)?;
+                            annotation_pool_indices(data, AnnotationAttribute::Annotations)?;
+                            reflect.annotations = Some(data.to_vec());
                         }
+                        "RuntimeVisibleParameterAnnotations" => {
+                            annotation_pool_indices(
+                                data,
+                                AnnotationAttribute::ParameterAnnotations,
+                            )?;
+                            reflect.parameter_annotations = Some(data.to_vec());
+                        }
+                        "AnnotationDefault" => {
+                            annotation_pool_indices(data, AnnotationAttribute::Default)?;
+                            reflect.annotation_default = Some(data.to_vec());
+                        }
+                        "Signature" => {
+                            reflect.signature =
+                                Some(utf8(&pool, single_index(attr, data)?)?.to_owned());
+                        }
+                        "Exceptions" => reflect.exceptions = parse_exceptions(data, &pool)?,
                         _ => {}
                     }
                     Ok(())
@@ -411,6 +599,7 @@ impl ClassFile {
                     code,
                     constant_value,
                     annotations,
+                    reflect,
                 });
             }
             Ok(out)
@@ -418,7 +607,27 @@ impl ClassFile {
         let fields = members(&mut c)?;
         let methods = members(&mut c)?;
         let mut bootstrap_methods = Vec::new();
+        let mut reflect = ClassReflection::default();
         parse_attributes(&mut c, &pool, |attr, data| {
+            match attr {
+                "Signature" => {
+                    reflect.signature = Some(utf8(&pool, single_index(attr, data)?)?.to_owned());
+                }
+                "RuntimeVisibleAnnotations" => {
+                    annotation_pool_indices(data, AnnotationAttribute::Annotations)?;
+                    reflect.annotations = Some(data.to_vec());
+                }
+                "InnerClasses" => reflect.inner_classes = parse_inner_classes(data, &pool)?,
+                "EnclosingMethod" => {
+                    reflect.enclosing_method = Some(parse_enclosing_method(data, &pool)?);
+                }
+                "NestHost" => {
+                    reflect.nest_host =
+                        Some(class_name(&pool, single_index(attr, data)?)?.to_owned());
+                }
+                "Record" => reflect.is_record = true,
+                _ => {}
+            }
             if attr == "BootstrapMethods" {
                 let mut b = Cursor::new(data);
                 for _ in 0..b.u16()? {
@@ -451,6 +660,7 @@ impl ClassFile {
             methods,
             string_units,
             bootstrap_methods,
+            reflect,
         })
     }
 

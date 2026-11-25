@@ -29,6 +29,8 @@ use std::{
     rc::Rc,
 };
 
+mod reflect;
+
 pub const RUNTIME_PRELUDE: &str = include_str!("../runtime/jabs_rt.h");
 const OBJECT: &str = "java/lang/Object";
 const STRING: &str = "java/lang/String";
@@ -662,6 +664,9 @@ const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
 
 /// The C body replacing a Java method, if JABS replaces it.
 fn replacement(key: &MethodKey) -> Option<(String, bool)> {
+    if let Some(found) = reflect::replacement(key) {
+        return Some(found);
+    }
     // JDK 25 walks the stack with StackWalker (a lambda); JABS walks native frames instead.
     if key.0 == "java/lang/SecurityManager"
         && key.1 == "getClassContext"
@@ -1103,6 +1108,9 @@ fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(String, bool)>
         let body = match (key.1.as_str(), key.2.as_str()) {
             ("refersTo0", "(Ljava/lang/Object;)Z") => format!("return {referent} == a0;"),
             ("clear0", "()V") => format!("{referent} = NULL;"),
+            // JDK 25.0.5 reads the referent through a native (25.0.4 read the field): with no
+            // GC nothing is ever cleared behind the program's back, so it is the field.
+            ("get0", "()Ljava/lang/Object;") => format!("return {referent};"),
             _ => String::new(),
         };
         if !body.is_empty() {
@@ -1134,6 +1142,9 @@ fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(String, bool)>
         && let Some((body, needs_classes)) = unsafe_intrinsic(&key.1, &key.2)
     {
         return (classes_available || !needs_classes).then_some((body, needs_classes));
+    }
+    if let Some(found) = reflect::intrinsic(key, classes_available) {
+        return Some(found);
     }
     INTRINSICS
         .iter()
@@ -4937,7 +4948,7 @@ jabs_object *jabs_class_object(const char *name) {{
     }} else if (name[0] == '[') {{
         (({class_struct} *)c)->{modifiers} = 0x411;
     }} else if (record) {{
-        (({class_struct} *)c)->{modifiers} = (uint16_t)(record->access & 0x7631);
+        (({class_struct} *)c)->{modifiers} = (uint16_t)jabs_reflect_class_modifiers(name, record->access);
     }}
     if (name[0] == '[') {{
         /* componentType: "[I" -> int, "[Ljava/lang/String;" -> java/lang/String, "[[I" -> [I.
@@ -5150,6 +5161,15 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
     out.push_str(&stack_trace_functions(unit, recorded));
     out.push_str(&new_instance_function(unit, recorded, methods));
     out.push_str(&main_thread_function(unit, recorded));
+    out.push_str(&reflect::functions(
+        unit,
+        &reflect::MetadataInputs {
+            recorded,
+            interfaces,
+            methods,
+            inits,
+        },
+    ));
     out.push('\n');
 }
 
@@ -7121,7 +7141,33 @@ fn reachable(
                 pending_inits.extend(init_prerequisites(unit, c));
             }
         }
-        let Some(key) = work.pop() else { break };
+        let Some(key) = work.pop() else {
+            // Reflection reaches code that no instruction names (src/cgen/reflect.rs): add it,
+            // and stop only when it adds nothing.
+            let (classes, keys) = reflect::reach(
+                unit,
+                &out.records,
+                &out.instantiated,
+                &out.methods,
+                &compiled,
+            );
+            if classes.is_empty() && keys.is_empty() {
+                break;
+            }
+            for class in classes {
+                add_records(&class, &mut out.records);
+                pending_inits.push(class.clone());
+                if out.instantiated.insert(class.clone()) {
+                    work.extend(
+                        implementations(&class).into_iter().filter(|k| {
+                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
+                        }),
+                    );
+                }
+            }
+            work.extend(keys);
+            continue;
+        };
         if !out.methods.insert(key.clone()) {
             continue;
         }
@@ -7273,6 +7319,8 @@ const SYNC_C: &str = include_str!("../runtime/jabs_sync.c");
 const THREAD_C: &str = include_str!("../runtime/jabs_thread.c");
 /// Reflection: member listings and reflective calls (handwritten).
 const REFLECT_C: &str = include_str!("../runtime/jabs_reflect.c");
+/// Reflection's metadata layout and entry points (handwritten; part of every program's header).
+const REFLECT_H: &str = include_str!("../runtime/jabs_reflect.h");
 
 /// What a program needs beyond its classes.
 #[derive(Default)]
@@ -7465,6 +7513,12 @@ pub fn compile_unit_with(
         classes.len()
     );
     source.push_str(RUNTIME_PRELUDE);
+    source.push('\n');
+    // Reflection needs the class registry: runtime/jabs_reflect.c compiles to nothing without it.
+    if have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING) {
+        source.push_str("#define JABS_HAVE_REFLECTION 1\n");
+    }
+    source.push_str(REFLECT_H);
     source.push('\n');
     // Layouts for every class whose hierarchy is complete, superclasses first (types only).
     let mut laid_out = laid_out_all.clone();
