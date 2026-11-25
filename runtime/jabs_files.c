@@ -2,6 +2,16 @@
  * Paths are UTF-8. Windows and POSIX (Linux, macOS) implement the same functions; the Java
  * glue (jabs_io.c) and the generated code never call an OS API themselves.
  * On failure a function returns its error value and jabs_files_error() describes why. */
+/* POSIX 2008 (st_mtim, O_CLOEXEC, utimensat, strdup) and XSI (realpath) are hidden by -std=c11
+ * unless asked for. */
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#endif
 #include "jabs_unit.h"
 
 static char error_text[512];
