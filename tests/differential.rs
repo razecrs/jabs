@@ -194,14 +194,24 @@ const FIXTURE_SOURCES: [&str; 13] = [
     "Programs",
 ];
 
-/// Whole programs from `Programs.java`, each run with these arguments.
-const PROGRAMS: [(&str, &[&str]); 6] = [
-    ("EchoArgs", &[]),
-    ("EchoArgs", &["one", "two words", ""]),
-    ("ExitCode", &[]),
-    ("ExitCode", &["7"]),
-    ("Uncaught", &[]),
-    ("UncaughtNull", &[]),
+/// Whole programs from `Programs.java`: (class, `-D` properties, arguments).
+const PROGRAMS: [(&str, &[&str], &[&str]); 8] = [
+    ("EchoArgs", &[], &[]),
+    ("EchoArgs", &[], &["one", "two words", ""]),
+    ("ExitCode", &[], &[]),
+    ("ExitCode", &[], &["7"]),
+    ("Uncaught", &[], &[]),
+    ("UncaughtNull", &[], &[]),
+    ("Props", &[], &[]),
+    (
+        "Props",
+        &[
+            "jabs.test.value=a=b c",
+            "jabs.test.empty",
+            "jabs.test.flag=true",
+        ],
+        &["-Dnot.a.property"],
+    ),
 ];
 
 /// The prefix the JVM's launcher puts before an exception that escaped `main`.
@@ -241,23 +251,32 @@ fn run_program(cmd: &mut Command, prefix: &str) -> Outcome {
     }
 }
 
-/// The native entry point for one program: start the VM, build `String[] args` from argv,
-/// initialize the class and call `main`, then report an escaping exception the way the JVM
-/// does (status 1).
+/// The native entry point for one program, shaped like the `java` launcher: leading `-Dkey=value`
+/// arguments are system properties and `--` ends them; then start the VM, build `String[] args`
+/// from the rest, initialize the class and call `main`, and report an escaping exception the
+/// way the JVM does (status 1).
 fn program_harness(class: &str) -> String {
     let record = cgen::class_record("java/lang/String");
     format!(
         r#"#include "jabs_unit.h"
 extern const jabs_class {record};
 int main(int argc, char **argv) {{
-    if (jabs_vm_startup() != 0) {{ fprintf(stderr, "startup failed: %s\n", jabs_pending->cls->name); return 2; }}
     if (argc < 1) return 2;
-    jabs_object *args = jabs_new_array(argc - 1, sizeof(jabs_object *), JABS_COMPONENT_CLASS, &{record}, "[Ljava/lang/String;", NULL);
+    static const char *defines[256];
+    int first = 1, count = 0;
+    while (first < argc && strncmp(argv[first], "-D", 2) == 0) {{
+        if (count == 256) {{ fprintf(stderr, "too many -D properties\n"); return 2; }}
+        defines[count++] = argv[first++] + 2;
+    }}
+    if (first < argc && strcmp(argv[first], "--") == 0) first++;
+    if (jabs_set_command_line_properties(count, defines) != 0) {{ fprintf(stderr, "a -D property has no key\n"); return 2; }}
+    if (jabs_vm_startup() != 0) {{ fprintf(stderr, "startup failed: %s\n", jabs_pending->cls->name); return 2; }}
+    jabs_object *args = jabs_new_array(argc - first, sizeof(jabs_object *), JABS_COMPONENT_CLASS, &{record}, "[Ljava/lang/String;", NULL);
     if (!args) {{ fprintf(stderr, "out of memory\n"); return 2; }}
-    for (int i = 1; i < argc; i++) {{
+    for (int i = first; i < argc; i++) {{
         jabs_object *s = jabs_string_from_utf8(argv[i]);
         if (!s) {{ fprintf(stderr, "out of memory\n"); return 2; }}
-        ((jabs_object **)jabs_array_data((jabs_array *)args))[i - 1] = s;
+        ((jabs_object **)jabs_array_data((jabs_array *)args))[i - first] = s;
     }}
     if ({init}() == 0) {main}(args);
     fflush(stdout);
@@ -935,7 +954,8 @@ fn native_matches_reference_jvm() {
     assert_eq!(shared.len() + 1, objects.len(), "harness object not found");
     let phase = std::time::Instant::now();
     let mut jvm_runs = Vec::with_capacity(PROGRAMS.len());
-    for (n, (class, args)) in PROGRAMS.iter().enumerate() {
+    for (n, (class, defines, args)) in PROGRAMS.iter().enumerate() {
+        let properties: Vec<String> = defines.iter().map(|d| format!("-D{d}")).collect();
         let source = root.join(format!("program_{n}.c"));
         fs::write(&source, program_harness(class)).unwrap();
         let program = root.join(if cfg!(windows) {
@@ -953,14 +973,24 @@ fn native_matches_reference_jvm() {
             .args(if cfg!(windows) { None } else { Some("-lm") }));
         let jvm = run_program(
             Command::new("java")
+                .args(&properties)
                 .arg("-cp")
                 .arg(root)
                 .arg(class)
                 .args(*args),
             JVM_UNCAUGHT,
         );
-        let native = run_program(Command::new(&program).args(*args), "uncaught ");
-        assert_eq!(native, jvm, "{class} {args:?}: native differs from the JVM");
+        let native = run_program(
+            Command::new(&program)
+                .args(&properties)
+                .arg("--")
+                .args(*args),
+            "uncaught ",
+        );
+        assert_eq!(
+            native, jvm,
+            "{class} {defines:?} {args:?}: native differs from the JVM"
+        );
         jvm_runs.push(jvm);
     }
     // Guard that the programs really reach each ending (normal return, System.exit, a thrown
@@ -979,6 +1009,11 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         jvm_runs[5].uncaught.as_deref(),
         Some("java/lang/NullPointerException")
+    );
+    assert_eq!(jvm_runs[6].stdout, "null\n[null]\nfalse\ndefault\n0 \n");
+    assert_eq!(
+        jvm_runs[7].stdout,
+        "a=b c\n[]\ntrue\ndefault\n1 -Dnot.a.property\n"
     );
     eprintln!(
         "{} programs identical between the JVM and native code: {:.1?}",

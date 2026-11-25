@@ -182,10 +182,23 @@ static inline int32_t jabs_fcmpg(float a, float b) { return a < b ? -1 : a == b 
 static inline int32_t jabs_dcmpl(double a, double b) { return a > b ? 1 : a == b ? 0 : -1; }
 static inline int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == b ? 0 : 1; }
 
+/* System properties from the command line, as `java -Dkey=value` gives them: each entry is
+ * "key=value" ("key" alone means an empty value). Call before jabs_vm_startup; the strings must
+ * outlive the program (argv does). Returns 0, or -1 if an entry has an empty key. */
+int jabs_set_command_line_properties(int count, const char *const *defines);
+extern int jabs_define_count;
+extern const char *const *jabs_defines;
+
+/* Set by programs whose class registry can name Java frames (jabs_vm_startup does it): prints
+ * the Java methods on the current stack to stderr before an uncompiled method stops the program. */
+extern void (*jabs_on_not_compiled)(void);
+void jabs_print_java_stack(void);
+
 /* Reached a method that has no native code yet: stop with a diagnostic rather than guess.
  * The profile must run on the JVM backend until this method compiles. */
 static inline _Noreturn void jabs_not_compiled(const char *method) {
     fprintf(stderr, "jabs: %s is not compiled to native code; run this profile on the JVM backend\n", method);
+    if (jabs_on_not_compiled) jabs_on_not_compiled();
     abort();
 }
 
@@ -211,6 +224,7 @@ jabs_object *jabs_class_new_instance(jabs_object *c);
 /* jabs_not_compiled naming the class involved. */
 static inline _Noreturn void jabs_not_compiled_class(const char *what, const char *class_name) {
     fprintf(stderr, "jabs: %s (%s) is not compiled to native code; run this profile on the JVM backend\n", what, class_name);
+    if (jabs_on_not_compiled) jabs_on_not_compiled();
     abort();
 }
 

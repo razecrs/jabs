@@ -1294,7 +1294,17 @@ const jabs_class jabs_array_class_record = { \"[\", 0, NULL, NULL, NULL, 0, NULL
 uint32_t jabs_hash_next = 0x9e3779b9u;\n\
 const char *jabs_where = \"\";\n\
 int64_t jabs_heap_bytes;\n\
-_Thread_local const char *jabs_caller;\n\n";
+_Thread_local const char *jabs_caller;\n\
+void (*jabs_on_not_compiled)(void);\n\
+int jabs_define_count;\n\
+const char *const *jabs_defines;\n\
+int jabs_set_command_line_properties(int count, const char *const *defines) {\n\
+    if (count < 0 || (count > 0 && !defines)) return -1;\n\
+    for (int i = 0; i < count; i++) if (!defines[i] || defines[i][0] == '=' || defines[i][0] == 0) return -1;\n\
+    jabs_define_count = count;\n\
+    jabs_defines = defines;\n\
+    return 0;\n\
+}\n\n";
 
 /// Extern declarations for the external definitions in `code` (records, vtables, static fields
 /// and non-static functions), so other files can reference them.
@@ -5088,10 +5098,17 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
         out,
         "\n/* Raw.vmProperties: key, value pairs the VM defines. */\njabs_object *jabs_vm_properties(void) {{"
     );
+    // Command-line -D properties come after the VM's own, so a later one with the same key wins,
+    // as SystemProps applies them in order.
+    let _ = writeln!(
+        out,
+        "    if (jabs_define_count < 0 || jabs_define_count > (INT32_MAX - {fixed}) / 2) return NULL;",
+        fixed = vm.len() * 2
+    );
     let _ = writeln!(
         out,
         "    jabs_object *a = {};",
-        string_array.replace("{n}", &(vm.len() * 2).to_string())
+        string_array.replace("{n}", &format!("{} + 2 * jabs_define_count", vm.len() * 2))
     );
     let _ = writeln!(out, "    if (!a) return NULL;");
     let _ = writeln!(out, "    const char *v;");
@@ -5103,6 +5120,21 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
             2 * i + 1
         );
     }
+    let _ = writeln!(
+        out,
+        "    for (int i = 0; i < jabs_define_count; i++) {{
+        const char *d = jabs_defines[i], *eq = strchr(d, '=');
+        size_t key_length = eq ? (size_t)(eq - d) : strlen(d);
+        char *key = (char *)malloc(key_length + 1);
+        if (!key) return NULL;
+        memcpy(key, d, key_length);
+        key[key_length] = 0;
+        int ok = jabs_put_utf8(a, {fixed} + 2 * i, key) && jabs_put_utf8(a, {fixed} + 2 * i + 1, eq ? eq + 1 : \"\");
+        free(key);
+        if (!ok) return NULL;
+    }}",
+        fixed = vm.len() * 2
+    );
     let _ = writeln!(out, "    return a;\n}}");
     // Startup, when the unit has it.
     // Only whole programs (with the app loader) compile the startup in.
@@ -5114,6 +5146,7 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
     out.push_str("\n/* What the JVM does before main: System.initPhase1 (properties, standard streams). */\n");
     if has_startup {
         let _ = writeln!(out, "int jabs_vm_startup(void) {{");
+        out.push_str("    jabs_on_not_compiled = jabs_print_java_stack;\n");
         for class in VM_PREINITIALIZED.iter().filter(|c| inits.contains(**c)) {
             let _ = writeln!(out, "    if ({}() != 0) return -1;", init_symbol(class));
             if *class == "jdk/internal/misc/UnsafeConstants" {
@@ -5145,7 +5178,9 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
             symbol(SYSTEM, "initPhase1", "()V")
         );
     } else {
-        out.push_str("int jabs_vm_startup(void) { return 0; }\n");
+        out.push_str(
+            "int jabs_vm_startup(void) { jabs_on_not_compiled = jabs_print_java_stack; return 0; }\n",
+        );
     }
     out
 }
@@ -5332,34 +5367,57 @@ jabs_object *jabs_class_new_instance(jabs_object *c) {{
 /// helpers, class initialization wrappers) are not Java frames and are skipped.
 fn stack_functions(methods: &BTreeSet<MethodKey>) -> String {
     let mut out = String::from(
-        "typedef struct { const void *start; const char *class_name; } jabs_frame_entry;\nstatic jabs_frame_entry jabs_frames[] = {\n",
+        "typedef struct { const void *start; const char *class_name; const char *method; } jabs_frame_entry;\nstatic jabs_frame_entry jabs_frames[] = {\n",
     );
     for (class, name, descriptor) in methods {
         let _ = writeln!(
             out,
-            "    {{ (const void *)&{}, \"{}\" }},",
+            "    {{ (const void *)&{}, \"{}\", \"{}{}\" }},",
             symbol(class, name, descriptor),
-            c_escape(class)
+            c_escape(class),
+            c_escape(name),
+            c_escape(descriptor)
         );
     }
     // Runtime functions that stand in for a Java method keep that method's class.
-    out.push_str("    { (const void *)&jabs_class_new_instance, \"java/lang/Class\" },\n    { NULL, NULL }\n};\n");
+    out.push_str("    { (const void *)&jabs_class_new_instance, \"java/lang/Class\", \"newInstance()Ljava/lang/Object;\" },\n    { NULL, NULL, NULL }\n};\n");
     out.push_str(
         r#"static int jabs_compare_frames(const void *a, const void *b) {
     uintptr_t x = (uintptr_t)((const jabs_frame_entry *)a)->start, y = (uintptr_t)((const jabs_frame_entry *)b)->start;
     return x < y ? -1 : x > y;
 }
 
-/* The class of the compiled method whose function starts at `start`, or NULL. */
-static const char *jabs_frame_class(const void *start) {
+/* The compiled method whose function starts at `start`, or NULL. */
+static const jabs_frame_entry *jabs_frame_of(const void *start) {
     static size_t count;
     if (!count) {
         while (jabs_frames[count].start) count++;
         qsort(jabs_frames, count, sizeof *jabs_frames, jabs_compare_frames);
     }
-    jabs_frame_entry key = { start, NULL };
-    const jabs_frame_entry *e = (const jabs_frame_entry *)bsearch(&key, jabs_frames, count, sizeof key, jabs_compare_frames);
+    jabs_frame_entry key = { start, NULL, NULL };
+    return (const jabs_frame_entry *)bsearch(&key, jabs_frames, count, sizeof key, jabs_compare_frames);
+}
+
+/* The class of the compiled method whose function starts at `start`, or NULL. */
+static const char *jabs_frame_class(const void *start) {
+    const jabs_frame_entry *e = jabs_frame_of(start);
     return e ? e->class_name : NULL;
+}
+
+/* The compiled Java methods on this thread's stack, innermost first, to stderr. Frames that are
+ * not compiled Java methods (runtime helpers, inlined code) are left out. */
+void jabs_print_java_stack(void) {
+    const void *starts[1024];
+    int n = jabs_platform_stack_functions(starts, 1024);
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+        const jabs_frame_entry *e = starts[i] ? jabs_frame_of(starts[i]) : NULL;
+        if (!e) continue;
+        fprintf(stderr, "    at %s.%s\n", e->class_name, e->method);
+        shown++;
+    }
+    if (!shown) fprintf(stderr, "    (no compiled Java frames found on the stack)\n");
+    if (n >= 1024) fprintf(stderr, "    (stack cut at 1024 native frames)\n");
 }
 
 /* Java classes on the stack below the frame of function `from` (its callers, innermost first):

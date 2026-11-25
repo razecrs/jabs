@@ -45,3 +45,16 @@ class UncaughtNull {
         System.out.println("length " + nothing(args.length).length());
     }
 }
+
+// System properties from the command line (-Dkey=value), as the java launcher passes them:
+// split at the first '=', a bare key is an empty value, and an argument after the class (or
+// after "--" natively) that looks like -D is a program argument, not a property.
+class Props {
+    public static void main(String[] args) {
+        System.out.println(System.getProperty("jabs.test.value"));
+        System.out.println("[" + System.getProperty("jabs.test.empty") + "]");
+        System.out.println(Boolean.getBoolean("jabs.test.flag"));
+        System.out.println(System.getProperty("jabs.test.missing", "default"));
+        System.out.println(args.length + " " + (args.length > 0 ? args[0] : ""));
+    }
+}
