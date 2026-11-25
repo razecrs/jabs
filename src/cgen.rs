@@ -1548,7 +1548,8 @@ fn object_struct(class: &str) -> String {
 }
 
 /// C name of a class's runtime record.
-fn class_record(class: &str) -> String {
+/// C name of a class's `jabs_class` record.
+pub fn class_record(class: &str) -> String {
     mangled("jk_", &[class])
 }
 

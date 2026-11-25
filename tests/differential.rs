@@ -178,7 +178,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 12] = [
+const FIXTURE_SOURCES: [&str; 13] = [
     "Arith",
     "Statics",
     "BadInit",
@@ -191,7 +191,84 @@ const FIXTURE_SOURCES: [&str; 12] = [
     "Sync",
     "Natives",
     "StackOps",
+    "Programs",
 ];
+
+/// Whole programs from `Programs.java`, each run with these arguments.
+const PROGRAMS: [(&str, &[&str]); 6] = [
+    ("EchoArgs", &[]),
+    ("EchoArgs", &["one", "two words", ""]),
+    ("ExitCode", &[]),
+    ("ExitCode", &["7"]),
+    ("Uncaught", &[]),
+    ("UncaughtNull", &[]),
+];
+
+/// The prefix the JVM's launcher puts before an exception that escaped `main`.
+const JVM_UNCAUGHT: &str = "Exception in thread \"main\" ";
+
+/// What a finished program left behind: stdout with normalized newlines, the exit status, and
+/// the class of an exception that escaped `main` (internal name), if one did.
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    stdout: String,
+    status: Option<i32>,
+    uncaught: Option<String>,
+}
+
+/// Run a program to completion, whatever its exit status. `uncaught` is read from the first
+/// stderr line starting with `prefix`, up to the message.
+fn run_program(cmd: &mut Command, prefix: &str) -> Outcome {
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {cmd:?}: {e}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut uncaught = None;
+    for line in stderr.lines() {
+        let Some(rest) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        let name = rest.split(':').next().unwrap_or(rest).trim();
+        uncaught = Some(name.replace('.', "/"));
+        break;
+    }
+    Outcome {
+        stdout: String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        status: output.status.code(),
+        uncaught,
+    }
+}
+
+/// The native entry point for one program: start the VM, build `String[] args` from argv,
+/// initialize the class and call `main`, then report an escaping exception the way the JVM
+/// does (status 1).
+fn program_harness(class: &str) -> String {
+    let record = cgen::class_record("java/lang/String");
+    format!(
+        r#"#include "jabs_unit.h"
+extern const jabs_class {record};
+int main(int argc, char **argv) {{
+    if (jabs_vm_startup() != 0) {{ fprintf(stderr, "startup failed: %s\n", jabs_pending->cls->name); return 2; }}
+    if (argc < 1) return 2;
+    jabs_object *args = jabs_new_array(argc - 1, sizeof(jabs_object *), JABS_COMPONENT_CLASS, &{record}, "[Ljava/lang/String;", NULL);
+    if (!args) {{ fprintf(stderr, "out of memory\n"); return 2; }}
+    for (int i = 1; i < argc; i++) {{
+        jabs_object *s = jabs_string_from_utf8(argv[i]);
+        if (!s) {{ fprintf(stderr, "out of memory\n"); return 2; }}
+        ((jabs_object **)jabs_array_data((jabs_array *)args))[i - 1] = s;
+    }}
+    if ({init}() == 0) {main}(args);
+    fflush(stdout);
+    if (jabs_pending) {{ fprintf(stderr, "uncaught %s\n", jabs_pending->cls->name); return 1; }}
+    return 0;
+}}
+"#,
+        init = cgen::init_symbol(class),
+        main = cgen::symbol(class, "main", "([Ljava/lang/String;)V"),
+    )
+}
 
 /// Fixtures that need a newer language level (records, pattern switches, indy string concat).
 const MODERN_FIXTURE_SOURCES: [&str; 1] = ["Indy"];
@@ -849,5 +926,63 @@ fn native_matches_reference_jvm() {
     eprintln!(
         "{} cases bit-identical between the JVM and native code",
         all.len()
+    );
+
+    // main() mode: link each program's entry point against the same objects, without the case
+    // harness, and compare whole runs.
+    let harness_object = root.join("harness.o");
+    let shared: Vec<_> = objects.iter().filter(|o| **o != harness_object).collect();
+    assert_eq!(shared.len() + 1, objects.len(), "harness object not found");
+    let phase = std::time::Instant::now();
+    let mut jvm_runs = Vec::with_capacity(PROGRAMS.len());
+    for (n, (class, args)) in PROGRAMS.iter().enumerate() {
+        let source = root.join(format!("program_{n}.c"));
+        fs::write(&source, program_harness(class)).unwrap();
+        let program = root.join(if cfg!(windows) {
+            format!("program_{n}.exe")
+        } else {
+            format!("program_{n}")
+        });
+        run(Command::new("clang")
+            .args(&target)
+            .args(flags)
+            .arg(&source)
+            .args(&shared)
+            .arg("-o")
+            .arg(&program)
+            .args(if cfg!(windows) { None } else { Some("-lm") }));
+        let jvm = run_program(
+            Command::new("java")
+                .arg("-cp")
+                .arg(root)
+                .arg(class)
+                .args(*args),
+            JVM_UNCAUGHT,
+        );
+        let native = run_program(Command::new(&program).args(*args), "uncaught ");
+        assert_eq!(native, jvm, "{class} {args:?}: native differs from the JVM");
+        jvm_runs.push(jvm);
+    }
+    // Guard that the programs really reach each ending (normal return, System.exit, a thrown
+    // and a JVM-raised exception), so all of them are compared rather than skipped.
+    assert_eq!(
+        jvm_runs[1].stdout,
+        "3\n0: [one] 3\n1: [two words] 9\n2: [] 0\n465\n"
+    );
+    assert_eq!(jvm_runs[0].status, Some(0));
+    assert_eq!(jvm_runs[2].status, Some(3));
+    assert_eq!(jvm_runs[3].status, Some(7));
+    assert_eq!(
+        jvm_runs[4].uncaught.as_deref(),
+        Some("java/lang/IllegalStateException")
+    );
+    assert_eq!(
+        jvm_runs[5].uncaught.as_deref(),
+        Some("java/lang/NullPointerException")
+    );
+    eprintln!(
+        "{} programs identical between the JVM and native code: {:.1?}",
+        PROGRAMS.len(),
+        phase.elapsed()
     );
 }

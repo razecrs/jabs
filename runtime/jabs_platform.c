@@ -5,6 +5,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
+#include <fcntl.h>
 
 /* A malloc'd UTF-8 copy of a wide string. */
 static char *utf8_from_wide(const wchar_t *w) {
@@ -117,8 +118,22 @@ void jabs_sleep_nanos(int64_t nanos) {
     if (nanos > 0) Sleep((DWORD)((nanos + 999999) / 1000000 > 0x7fffffff ? 0x7fffffff : (nanos + 999999) / 1000000));
 }
 
+/* The CRT opens the standard streams in text mode, which turns every "
+" written to them into
+   "
+"; Java already writes its own line separator, so the JVM writes them raw. Switch each to
+   binary once, flushing C stdio's buffered text first so nothing written before changes. */
+static void jabs_std_binary(int32_t fd) {
+    static int done[3];
+    if (fd < 0 || fd > 2 || done[fd]) return;
+    if (fd == 1) fflush(stdout);
+    if (fd == 2) fflush(stderr);
+    if (_setmode(fd, _O_BINARY) != -1) done[fd] = 1;
+}
+
 int64_t jabs_platform_write(int32_t fd, const void *data, size_t length) {
     size_t done = 0;
+    jabs_std_binary(fd);
     while (done < length) {
         unsigned chunk = length - done > 0x40000000u ? 0x40000000u : (unsigned)(length - done);
         int n = _write(fd, (const char *)data + done, chunk);
