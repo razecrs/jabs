@@ -1,0 +1,414 @@
+{
+  "schema_version": 4,
+  "classes": 6632,
+  "unparsable_classes": 0,
+  "methods": 58671,
+  "compiled_methods": 58342,
+  "self_contained_methods": 37304,
+  "blockers": [
+    [
+      "superclass/interface outside the unit (JDK or other jars)",
+      196
+    ],
+    [
+      "instanceof/checkcast against an interface or outside class",
+      51
+    ],
+    [
+      "uses a class outside the unit (JDK or other jars)",
+      38
+    ],
+    [
+      "type relationship outside the unit",
+      14
+    ],
+    [
+      "opcode multianewarray",
+      11
+    ],
+    [
+      "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+      7
+    ],
+    [
+      "catch type javax/mail/MessagingException is outside the unit or not a Throwable",
+      3
+    ],
+    [
+      "catch type com/mongodb/MongoException is outside the unit or not a Throwable",
+      2
+    ],
+    [
+      "catch type java/sql/SQLException is outside the unit or not a Throwable",
+      2
+    ],
+    [
+      "catch type javax/naming/NameNotFoundException is outside the unit or not a Throwable",
+      2
+    ],
+    [
+      "catch type javax/jms/JMSException is outside the unit or not a Throwable",
+      1
+    ],
+    [
+      "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+      1
+    ],
+    [
+      "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+      1
+    ]
+  ],
+  "blast_radius": [
+    {
+      "category": "instanceof/checkcast against an interface or outside class",
+      "direct": 51,
+      "reaches": 4678,
+      "unlocks": 143
+    },
+    {
+      "category": "native method without a JABS implementation",
+      "direct": 0,
+      "reaches": 20781,
+      "unlocks": 38
+    },
+    {
+      "category": "uses a class outside the unit (JDK or other jars)",
+      "direct": 38,
+      "reaches": 3198,
+      "unlocks": 30
+    },
+    {
+      "category": "superclass/interface outside the unit (JDK or other jars)",
+      "direct": 196,
+      "reaches": 49,
+      "unlocks": 22
+    },
+    {
+      "category": "type relationship outside the unit",
+      "direct": 14,
+      "reaches": 20764,
+      "unlocks": 21
+    },
+    {
+      "category": "opcode multianewarray",
+      "direct": 11,
+      "reaches": 20759,
+      "unlocks": 18
+    },
+    {
+      "category": "static initializer not compiled",
+      "direct": 0,
+      "reaches": 20760,
+      "unlocks": 0
+    },
+    {
+      "category": "call inherited from outside the unit (e.g. Object methods)",
+      "direct": 0,
+      "reaches": 20737,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+      "direct": 7,
+      "reaches": 4,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+      "direct": 1,
+      "reaches": 4,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/jms/JMSException is outside the unit or not a Throwable",
+      "direct": 1,
+      "reaches": 2,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+      "direct": 1,
+      "reaches": 1,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/mail/MessagingException is outside the unit or not a Throwable",
+      "direct": 3,
+      "reaches": 0,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type com/mongodb/MongoException is outside the unit or not a Throwable",
+      "direct": 2,
+      "reaches": 0,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type java/sql/SQLException is outside the unit or not a Throwable",
+      "direct": 2,
+      "reaches": 0,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/naming/NameNotFoundException is outside the unit or not a Throwable",
+      "direct": 2,
+      "reaches": 0,
+      "unlocks": 0
+    }
+  ],
+  "jdk": {
+    "classes": 7367,
+    "methods": 61576,
+    "compiled_methods": 60778,
+    "self_contained_methods": 28527,
+    "blockers": [
+      [
+        "native method without a JABS implementation",
+        564
+      ],
+      [
+        "call inherited from outside the unit (e.g. Object methods)",
+        211
+      ],
+      [
+        "opcode multianewarray",
+        15
+      ],
+      [
+        "type relationship outside the unit",
+        7
+      ],
+      [
+        "constructor call shape",
+        1
+      ]
+    ],
+    "blast_radius": [
+      {
+        "category": "native method without a JABS implementation",
+        "direct": 564,
+        "reaches": 32142,
+        "unlocks": 357
+      },
+      {
+        "category": "type relationship outside the unit",
+        "direct": 7,
+        "reaches": 31850,
+        "unlocks": 66
+      },
+      {
+        "category": "call inherited from outside the unit (e.g. Object methods)",
+        "direct": 211,
+        "reaches": 31786,
+        "unlocks": 4
+      },
+      {
+        "category": "opcode multianewarray",
+        "direct": 15,
+        "reaches": 31822,
+        "unlocks": 0
+      },
+      {
+        "category": "static initializer not compiled",
+        "direct": 0,
+        "reaches": 31822,
+        "unlocks": 0
+      },
+      {
+        "category": "constructor call shape",
+        "direct": 1,
+        "reaches": 0,
+        "unlocks": 0
+      }
+    ]
+  },
+  "loaded": {
+    "classes_listed": 3644,
+    "classes_not_in_unit": 524,
+    "jar": {
+      "classes": 1220,
+      "methods": 10246,
+      "compiled_methods": 10198,
+      "self_contained_methods": 3155,
+      "blockers": [
+        [
+          "instanceof/checkcast against an interface or outside class",
+          15
+        ],
+        [
+          "superclass/interface outside the unit (JDK or other jars)",
+          11
+        ],
+        [
+          "uses a class outside the unit (JDK or other jars)",
+          11
+        ],
+        [
+          "opcode multianewarray",
+          3
+        ],
+        [
+          "catch type java/sql/SQLException is outside the unit or not a Throwable",
+          2
+        ],
+        [
+          "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+          2
+        ],
+        [
+          "type relationship outside the unit",
+          2
+        ],
+        [
+          "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+          1
+        ],
+        [
+          "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+          1
+        ]
+      ],
+      "blast_radius": [
+        {
+          "category": "instanceof/checkcast against an interface or outside class",
+          "direct": 15,
+          "reaches": 335,
+          "unlocks": 57
+        },
+        {
+          "category": "uses a class outside the unit (JDK or other jars)",
+          "direct": 11,
+          "reaches": 266,
+          "unlocks": 20
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "direct": 0,
+          "reaches": 6938,
+          "unlocks": 11
+        },
+        {
+          "category": "type relationship outside the unit",
+          "direct": 2,
+          "reaches": 6934,
+          "unlocks": 7
+        },
+        {
+          "category": "opcode multianewarray",
+          "direct": 3,
+          "reaches": 6923,
+          "unlocks": 2
+        },
+        {
+          "category": "static initializer not compiled",
+          "direct": 0,
+          "reaches": 6940,
+          "unlocks": 0
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "direct": 0,
+          "reaches": 6921,
+          "unlocks": 0
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "direct": 11,
+          "reaches": 7,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+          "direct": 1,
+          "reaches": 2,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+          "direct": 1,
+          "reaches": 1,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type java/sql/SQLException is outside the unit or not a Throwable",
+          "direct": 2,
+          "reaches": 0,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+          "direct": 2,
+          "reaches": 0,
+          "unlocks": 0
+        }
+      ]
+    },
+    "jdk": {
+      "classes": 1900,
+      "methods": 25035,
+      "compiled_methods": 24462,
+      "self_contained_methods": 11460,
+      "blockers": [
+        [
+          "native method without a JABS implementation",
+          407
+        ],
+        [
+          "call inherited from outside the unit (e.g. Object methods)",
+          159
+        ],
+        [
+          "opcode multianewarray",
+          3
+        ],
+        [
+          "type relationship outside the unit",
+          3
+        ],
+        [
+          "constructor call shape",
+          1
+        ]
+      ],
+      "blast_radius": [
+        {
+          "category": "native method without a JABS implementation",
+          "direct": 407,
+          "reaches": 12916,
+          "unlocks": 244
+        },
+        {
+          "category": "type relationship outside the unit",
+          "direct": 3,
+          "reaches": 12727,
+          "unlocks": 56
+        },
+        {
+          "category": "opcode multianewarray",
+          "direct": 3,
+          "reaches": 12702,
+          "unlocks": 0
+        },
+        {
+          "category": "static initializer not compiled",
+          "direct": 0,
+          "reaches": 12702,
+          "unlocks": 0
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "direct": 159,
+          "reaches": 12671,
+          "unlocks": 0
+        },
+        {
+          "category": "constructor call shape",
+          "direct": 1,
+          "reaches": 0,
+          "unlocks": 0
+        }
+      ]
+    }
+  }
+}
