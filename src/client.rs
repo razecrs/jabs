@@ -584,6 +584,14 @@ pub struct CurseForgeInstance {
 
 /// Read `minecraftinstance.json` from a CurseForge instance folder.
 pub fn curseforge_instance(dir: &Path) -> Result<CurseForgeInstance> {
+    curseforge_instance_with_loader_root(dir, None)
+}
+
+/// An explicit install root takes precedence over automatic discovery.
+pub fn curseforge_instance_with_loader_root(
+    dir: &Path,
+    explicit_root: Option<&Path>,
+) -> Result<CurseForgeInstance> {
     let path = dir.join("minecraftinstance.json");
     let meta: Value = serde_json::from_slice(
         &fs::read(&path)
@@ -594,22 +602,24 @@ pub fn curseforge_instance(dir: &Path) -> Result<CurseForgeInstance> {
         .context("instance has no gameVersion")?
         .to_string();
     let loader = meta["baseModLoader"]["name"].as_str().map(str::to_string);
-    let loader_root = loader.as_ref().and_then(|id| {
-        let mut candidates = Vec::new();
-        if let Some(parent) = std::path::absolute(dir)
-            .ok()
-            .and_then(|d| d.parent().and_then(Path::parent).map(Path::to_path_buf))
-        {
-            candidates.push(parent.join("Install"));
-        }
-        if let Some(home) = std::env::var_os("USERPROFILE") {
-            candidates.push(PathBuf::from(home).join("curseforge/minecraft/Install"));
-        }
-        candidates.into_iter().find(|c| {
-            c.join("versions")
-                .join(id)
-                .join(format!("{id}.json"))
-                .is_file()
+    let loader_root = explicit_root.map(Path::to_path_buf).or_else(|| {
+        loader.as_ref().and_then(|id| {
+            let mut candidates = Vec::new();
+            if let Some(parent) = std::path::absolute(dir)
+                .ok()
+                .and_then(|d| d.parent().and_then(Path::parent).map(Path::to_path_buf))
+            {
+                candidates.push(parent.join("Install"));
+            }
+            if let Some(home) = std::env::var_os("USERPROFILE") {
+                candidates.push(PathBuf::from(home).join("curseforge/minecraft/Install"));
+            }
+            candidates.into_iter().find(|c| {
+                c.join("versions")
+                    .join(id)
+                    .join(format!("{id}.json"))
+                    .is_file()
+            })
         })
     });
     if loader.is_some() && loader_root.is_none() {

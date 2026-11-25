@@ -597,17 +597,12 @@ static inline jabs_object *jabs_clone(jabs_object *o) {
     return copy;
 }
 
-/* System.currentTimeMillis and System.nanoTime from the C11 clock (nanoTime is only meaningful
- * as a difference, as in Java). */
+/* Wall time for currentTimeMillis; nanoTime uses the host's monotonic clock. */
 static inline int64_t jabs_current_millis(void) {
     struct timespec t;
     timespec_get(&t, TIME_UTC);
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
-static inline int64_t jabs_nano_time(void) {
-    struct timespec t;
-    timespec_get(&t, TIME_UTC);
-    return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
-}
+int64_t jabs_nano_time(void);
 
 #endif

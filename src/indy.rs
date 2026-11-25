@@ -137,18 +137,37 @@ fn instruction_starts(code: &[u8]) -> Vec<usize> {
                 let (Some(low), Some(high)) = (read_i32(base + 4), read_i32(base + 8)) else {
                     return Vec::new();
                 };
-                let count = (high as i64 - low as i64 + 1).max(0) as usize;
-                base + 12 + count * 4 - pc
+                if high < low {
+                    return Vec::new();
+                }
+                let Some(end) = usize::try_from(high as i64 - low as i64 + 1)
+                    .ok()
+                    .and_then(|count| count.checked_mul(4))
+                    .and_then(|bytes| (base + 12).checked_add(bytes))
+                else {
+                    return Vec::new();
+                };
+                end - pc
             }
             0xab => {
                 let base = (pc + 4) & !3;
                 let Some(pairs) = read_i32(base + 4) else {
                     return Vec::new();
                 };
-                base + 8 + pairs.max(0) as usize * 8 - pc
+                let Some(end) = usize::try_from(pairs)
+                    .ok()
+                    .and_then(|count| count.checked_mul(8))
+                    .and_then(|bytes| (base + 8).checked_add(bytes))
+                else {
+                    return Vec::new();
+                };
+                end - pc
             }
             _ => 1,
         };
+        if len > code.len() - pc {
+            return Vec::new();
+        }
         pc += len;
     }
     out

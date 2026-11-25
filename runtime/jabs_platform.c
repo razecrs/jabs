@@ -1,5 +1,10 @@
 /* Host facts the JVM reads from the operating system at startup, and raw standard-stream I/O.
  * Kept apart from generated code so OS headers (windows.h) never meet it. Strings are UTF-8. */
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
 #include "jabs_unit.h"
 
 #ifdef _WIN32
@@ -118,6 +123,19 @@ void jabs_sleep_nanos(int64_t nanos) {
     if (nanos > 0) Sleep((DWORD)((nanos + 999999) / 1000000 > 0x7fffffff ? 0x7fffffff : (nanos + 999999) / 1000000));
 }
 
+int64_t jabs_nano_time(void) {
+    LARGE_INTEGER counter, frequency;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&counter)) abort();
+    uint64_t ticks = (uint64_t)counter.QuadPart;
+    uint64_t hz = (uint64_t)frequency.QuadPart;
+    /* Split before scaling: multiplying the full tick count would overflow after days.
+     * The fractional calculation also accommodates unusually high counter frequencies. */
+    uint64_t ns = (ticks / hz) * UINT64_C(1000000000)
+        + (uint64_t)((long double)(ticks % hz) * 1000000000.0L / (long double)hz);
+    return (int64_t)ns;
+}
+
 /* The CRT opens the standard streams in text mode, which turns every "
 " written to them into
    "
@@ -202,6 +220,12 @@ int jabs_platform_stack_functions(const void **starts, int max) {
 void jabs_sleep_nanos(int64_t nanos) {
     struct timespec t = { (time_t)(nanos / 1000000000), (long)(nanos % 1000000000) };
     if (nanos > 0) nanosleep(&t, NULL);
+}
+
+int64_t jabs_nano_time(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) abort();
+    return (int64_t)((uint64_t)t.tv_sec * UINT64_C(1000000000) + (uint64_t)t.tv_nsec);
 }
 
 int64_t jabs_platform_std_handle(int32_t fd) {

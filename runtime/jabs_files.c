@@ -291,6 +291,32 @@ int32_t jabs_fd_open(const char *path, int32_t flags) {
     if (!w) { strcpy(error_text, "out of memory"); return -1; }
     int32_t hidden;
     if (jabs_fs_attributes(path, &hidden) & JABS_FS_DIRECTORY) { free(w); strcpy(error_text, "Is a directory"); return -1; }
+    if (flags & (JABS_OPEN_SYNC | JABS_OPEN_DSYNC)) {
+        /* The CRT's open flags have no synchronous-write mode. Give it ownership of
+         * a write-through Win32 handle instead. DSYNC may provide the stronger SYNC
+         * guarantee; ordinary descriptors keep their existing buffered behavior. */
+        DWORD access = (flags & JABS_OPEN_WRITE) ? GENERIC_WRITE : 0;
+        if (flags & JABS_OPEN_READ || !(flags & JABS_OPEN_WRITE)) access |= GENERIC_READ;
+        DWORD disposition = (flags & JABS_OPEN_CREATE)
+            ? ((flags & JABS_OPEN_TRUNCATE) ? CREATE_ALWAYS : OPEN_ALWAYS)
+            : ((flags & JABS_OPEN_TRUNCATE) ? TRUNCATE_EXISTING : OPEN_EXISTING);
+        DWORD attributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH;
+        if (flags & JABS_OPEN_DELETE_ON_CLOSE) {
+            access |= DELETE;
+            attributes |= FILE_FLAG_DELETE_ON_CLOSE;
+        }
+        HANDLE h = CreateFileW(w, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              NULL, disposition, attributes, NULL);
+        DWORD code = GetLastError();
+        free(w);
+        if (h == INVALID_HANDLE_VALUE) { win32_error(code); return -1; }
+        int fd = _open_osfhandle((intptr_t)h, mode & (_O_BINARY | _O_APPEND | _O_RDONLY | _O_WRONLY | _O_RDWR));
+        if (fd < 0) {
+            snprintf(error_text, sizeof error_text, "%s", strerror(errno));
+            CloseHandle(h);
+        }
+        return fd;
+    }
     int fd = -1;
     errno_t e = _wsopen_s(&fd, w, mode, _SH_DENYNO, _S_IREAD | _S_IWRITE);
     free(w);
@@ -305,6 +331,12 @@ int32_t jabs_fd_open(const char *path, int32_t flags) {
 }
 
 int64_t jabs_fd_read(int32_t fd, void *buffer, size_t length) {
+    /* Inherited stdin starts in CRT text mode (CRLF translation and Ctrl-Z EOF).
+     * Reapply on reads so a replaced standard descriptor is handled as well. */
+    if (fd >= 0 && fd <= 2 && _setmode(fd, _O_BINARY) == -1) {
+        snprintf(error_text, sizeof error_text, "%s", strerror(errno));
+        return -1;
+    }
     int n = _read(fd, buffer, length > 0x7fffffff ? 0x7fffffffu : (unsigned)length);
     if (n < 0) { snprintf(error_text, sizeof error_text, "%s", strerror(errno)); return -1; }
     return n;

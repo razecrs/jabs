@@ -272,7 +272,9 @@ fn execute(cli: Cli) -> Result<()> {
         } => {
             let cf = instance
                 .as_deref()
-                .map(jabs::client::curseforge_instance)
+                .map(|dir| {
+                    jabs::client::curseforge_instance_with_loader_root(dir, loader_root.as_deref())
+                })
                 .transpose()?;
             let version = match (&cf, version) {
                 (Some(cf), None) => cf.version.clone(),
