@@ -259,6 +259,215 @@ pub struct Coverage {
     /// The same counts restricted to the classes a JVM run loaded, when a list is given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loaded: Option<LoadedCoverage>,
+    /// What a traced JVM run actually executed, when a method trace is given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed: Option<ExecutedCoverage>,
+}
+
+/// The first line of a method trace written by `tools/method-trace/jabs_trace.c`.
+const TRACE_HEADER: &str = "# jabs method trace 1";
+/// Most methods accepted in a trace; the agent itself stops at 2^22.
+const MAX_TRACED_METHODS: usize = 1 << 22;
+
+/// A method trace from a real JVM run: every method that ran, natives included.
+#[derive(Debug, Default)]
+pub struct MethodTrace {
+    /// (class, name, descriptor) of each method that ran, classes as internal names.
+    pub methods: std::collections::BTreeSet<(String, String, String)>,
+    /// Methods of hidden classes (lambda proxies and the like, defined at run time with names
+    /// like `a/B$$Lambda.0x...`); no compiled unit can contain them.
+    pub hidden_class_methods: usize,
+}
+
+/// Read a trace written by the JABS method-trace agent. Refused unless it is whole: the header
+/// first, `# complete <n>` last with `n` equal to the method lines, every line three
+/// tab-separated fields with a descriptor, and no method twice (the agent writes each once).
+pub fn read_method_trace(path: &Path) -> Result<MethodTrace> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut lines = text.lines();
+    if lines.next() != Some(TRACE_HEADER) {
+        bail!(
+            "{}: not a JABS method trace (first line is not `{TRACE_HEADER}`)",
+            path.display()
+        );
+    }
+    let mut trace = MethodTrace::default();
+    let mut seen = 0usize;
+    let mut complete = None;
+    for (index, line) in lines.enumerate() {
+        let number = index + 2;
+        if complete.is_some() {
+            bail!(
+                "{}:{number}: text after the `# complete` line",
+                path.display()
+            );
+        }
+        if let Some(count) = line.strip_prefix("# complete ") {
+            let count: usize = count
+                .parse()
+                .with_context(|| format!("{}:{number}: bad method count", path.display()))?;
+            complete = Some(count);
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [class, name, descriptor] = fields[..] else {
+            bail!(
+                "{}:{number}: expected class, name and descriptor",
+                path.display()
+            );
+        };
+        if class.is_empty() || name.is_empty() || !descriptor.starts_with('(') {
+            bail!("{}:{number}: malformed method `{line}`", path.display());
+        }
+        seen += 1;
+        if seen > MAX_TRACED_METHODS {
+            bail!("{}: more than {MAX_TRACED_METHODS} methods", path.display());
+        }
+        // A hidden class's name carries a '.' before its suffix; no class file has one.
+        if class.contains('.') {
+            trace.hidden_class_methods += 1;
+            continue;
+        }
+        let key = (class.to_owned(), name.to_owned(), descriptor.to_owned());
+        if !trace.methods.insert(key) {
+            bail!(
+                "{}:{number}: {class}.{name}{descriptor} appears twice",
+                path.display()
+            );
+        }
+    }
+    let Some(count) = complete else {
+        bail!(
+            "{}: incomplete trace (no `# complete` line; the run was killed or the agent stopped)",
+            path.display()
+        );
+    };
+    if count != seen {
+        bail!(
+            "{}: trace says {count} methods but holds {seen}",
+            path.display()
+        );
+    }
+    Ok(trace)
+}
+
+/// What a traced run executed, against what JABS compiles.
+#[derive(Debug, Serialize)]
+pub struct ExecutedCoverage {
+    /// Methods in the trace, hidden classes excluded.
+    pub methods_traced: usize,
+    pub hidden_class_methods: usize,
+    /// Traced methods the unit does not contain (other JDK modules, other jars).
+    pub methods_not_in_unit: usize,
+    pub jar: ExecutedPart,
+    pub jdk: Option<ExecutedPart>,
+}
+
+/// Executed methods of one part of the unit.
+#[derive(Debug, Default, Serialize)]
+pub struct ExecutedPart {
+    pub executed: usize,
+    pub compiled: usize,
+    /// Executed and compiled, and never reaching code that did not compile.
+    pub self_contained: usize,
+    /// Executed but not compiled. This includes what the JVM's own launcher ran (loading and
+    /// reflecting on the main class, starting its service threads), which a JABS program does
+    /// not do, so it is the list to check rather than the list to implement.
+    pub unsupported: usize,
+    /// Executed methods whose class is in the unit without them. The JDK's runtime image adds
+    /// generated methods to some classes (`java/lang/invoke/*$Holder`) that its jmods lack, so a
+    /// few here are expected; many mean the trace came from another build of the jar or JDK.
+    pub method_not_in_class: usize,
+    /// Executed but abstract in the unit, which a run cannot do: the trace and the unit disagree.
+    pub abstract_in_unit: usize,
+    /// Executed unsupported methods per blocker category, most first.
+    pub blockers: Vec<(String, usize)>,
+    /// Every executed unsupported method, by category then name.
+    pub unsupported_methods: Vec<UnsupportedMethod>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnsupportedMethod {
+    pub category: String,
+    pub class: String,
+    pub name: String,
+    pub descriptor: String,
+    pub reason: String,
+}
+
+fn executed_coverage(
+    unit: &crate::cgen::CompiledUnit,
+    trace: &MethodTrace,
+    jar_set: &std::collections::HashSet<&str>,
+    jdk_set: &std::collections::HashSet<&str>,
+    with_jdk: bool,
+) -> ExecutedCoverage {
+    use crate::cgen::MethodStatus;
+    let mut by_key = std::collections::HashMap::new();
+    for method in &unit.methods {
+        by_key.insert(
+            (
+                method.class.as_str(),
+                method.name.as_str(),
+                method.descriptor.as_str(),
+            ),
+            method,
+        );
+    }
+    let (mut jar, mut jdk) = (ExecutedPart::default(), ExecutedPart::default());
+    let mut not_in_unit = 0;
+    for (class, name, descriptor) in &trace.methods {
+        let found = by_key.get(&(class.as_str(), name.as_str(), descriptor.as_str()));
+        let part = if jar_set.contains(class.as_str()) {
+            &mut jar
+        } else if jdk_set.contains(class.as_str()) {
+            &mut jdk
+        } else {
+            not_in_unit += 1;
+            continue;
+        };
+        let Some(method) = found else {
+            // The class is in the unit but has no such method: another build of it.
+            part.executed += 1;
+            part.method_not_in_class += 1;
+            continue;
+        };
+        part.executed += 1;
+        match &method.status {
+            MethodStatus::Compiled { self_contained, .. } => {
+                part.compiled += 1;
+                part.self_contained += usize::from(*self_contained);
+            }
+            MethodStatus::Unsupported { reason } => {
+                part.unsupported += 1;
+                part.unsupported_methods.push(UnsupportedMethod {
+                    category: crate::cgen::blocker_category(reason),
+                    class: class.clone(),
+                    name: name.clone(),
+                    descriptor: descriptor.clone(),
+                    reason: reason.clone(),
+                });
+            }
+            MethodStatus::Abstract => part.abstract_in_unit += 1,
+        }
+    }
+    for part in [&mut jar, &mut jdk] {
+        part.unsupported_methods.sort();
+        let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+        for method in &part.unsupported_methods {
+            *tally.entry(method.category.clone()).or_default() += 1;
+        }
+        part.blockers = tally.into_iter().collect();
+        part.blockers
+            .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+    ExecutedCoverage {
+        methods_traced: trace.methods.len(),
+        hidden_class_methods: trace.hidden_class_methods,
+        methods_not_in_unit: not_in_unit,
+        jar,
+        jdk: with_jdk.then_some(jdk),
+    }
 }
 
 /// Coverage of only the classes a real JVM run loaded (`-Xlog:class+load`). This is class
@@ -519,14 +728,16 @@ fn part_coverage(
 /// Compile every class in a JAR (plus, optionally, the JDK's java.base) as one unit, without
 /// writing C, and tally what blocks the rest.
 pub fn coverage(path: &Path, jdk: Option<&Path>) -> Result<Coverage> {
-    coverage_with(path, jdk, None)
+    coverage_with(path, jdk, None, None)
 }
 
-/// [`coverage`], plus the same counts over only the classes in `loaded` when it is given.
+/// [`coverage`], plus the same counts over only the classes in `loaded`, and what a traced run
+/// executed, when they are given.
 pub fn coverage_with(
     path: &Path,
     jdk: Option<&Path>,
     loaded: Option<&std::collections::BTreeSet<String>>,
+    executed: Option<&MethodTrace>,
 ) -> Result<Coverage> {
     let (mut classes, tried, unparsable) = read_jar_classes(path)?;
     let jar_names: Vec<String> = classes.iter().map(|c| c.name.clone()).collect();
@@ -571,8 +782,10 @@ pub fn coverage_with(
             jdk: (!jdk_names.is_empty()).then(|| part_coverage(&unit, &jdk_loaded)),
         }
     });
+    let executed_part = executed
+        .map(|trace| executed_coverage(&unit, trace, &jar_set, &jdk_set, !jdk_names.is_empty()));
     Ok(Coverage {
-        schema_version: 4,
+        schema_version: 5,
         classes: tried,
         unparsable_classes: unparsable,
         methods: jar.methods,
@@ -582,5 +795,6 @@ pub fn coverage_with(
         blast_radius: jar.blast_radius,
         jdk: jdk_part,
         loaded: loaded_part,
+        executed: executed_part,
     })
 }

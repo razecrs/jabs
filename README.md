@@ -35,6 +35,14 @@ The architecture and rollout are in [PLAN.md](PLAN.md).
   and ranks what blocks the rest. For each blocker category it reports the
   methods unsupported for that reason, the compiled methods that can reach it,
   and the ones it alone keeps from being self-contained, most unlocked first.
+  `--loaded-classes` repeats the counts over only the classes a JVM run loaded
+  (`-Xlog:class+load`). `--executed-methods` reads a trace from
+  [`tools/method-trace`](tools/method-trace/jabs_trace.c), a JVMTI agent that
+  records every method a real JVM run executed, natives included, and lists the
+  executed methods JABS does not compile. Traces without the agent's closing line
+  are refused as incomplete. The agent is a development tool, never part of a
+  compiled program, and a trace also contains the `java` launcher's own work
+  (loading the main class, its service threads), which a JABS program skips.
 - `run`: launches a vanilla **server** profile on the JVM after rehashing every
   artifact, with the main class from the jar manifest and a required exact Java
   version. `--until-ready` reports wall-clock time to the server's `Done` line and

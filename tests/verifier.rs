@@ -461,7 +461,7 @@ net/Gone
         "comments and blank lines skipped, repeats merged"
     );
 
-    let report = jabs::jar::coverage_with(&jar, None, Some(&loaded)).unwrap();
+    let report = jabs::jar::coverage_with(&jar, None, Some(&loaded), None).unwrap();
     let jsr = &report.blast_radius[0];
     assert_eq!(
         (jsr.direct, jsr.reaches, jsr.unlocks),

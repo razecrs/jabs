@@ -49,6 +49,10 @@ enum Action {
         /// report the counts over only those classes.
         #[arg(long)]
         loaded_classes: Option<PathBuf>,
+        /// A method trace from a JVM run with `tools/method-trace` attached: also report what
+        /// that run executed that JABS does not compile.
+        #[arg(long)]
+        executed_methods: Option<PathBuf>,
     },
     /// Compile class files (or every class in jars) together as one unit; reports every unsupported method.
     Compile {
@@ -150,15 +154,21 @@ fn execute(cli: Cli) -> Result<()> {
             jar,
             jdk,
             loaded_classes,
+            executed_methods,
         } => {
             let loaded = match loaded_classes {
                 Some(path) => Some(jabs::jar::read_class_list(&path)?),
+                None => None,
+            };
+            let executed = match executed_methods {
+                Some(path) => Some(jabs::jar::read_method_trace(&path)?),
                 None => None,
             };
             print_json(jabs::jar::coverage_with(
                 &jar,
                 jdk.as_deref(),
                 loaded.as_ref(),
+                executed.as_ref(),
             )?)
         }
         Action::Compile {
