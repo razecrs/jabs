@@ -48,8 +48,8 @@ typedef struct jabs_class {
 /* Every object starts with this header; the class's own struct embeds it first. */
 typedef struct jabs_object {
     const jabs_class *cls;
-    /* 0 until the object is first locked, then the 1-based index of its monitor in
-     * runtime/jabs_sync.c's table (set once, atomically; read with acquire order). */
+    /* Lock word, only touched atomically by runtime/jabs_sync.c: 0 unlocked, a thin lock
+     * (owner thread id and depth), or an inflated monitor's index. 0 in a fresh object. */
     uint32_t monitor;
     /* Identity hash code, assigned on first request (0 = not yet assigned). Atomic: two threads
      * asking at once must agree on one value. */
@@ -653,6 +653,13 @@ jabs_sync_thread *jabs_sync_current(void);
  * Thread.clearInterruptEvent). Any thread may call either for any record. */
 void jabs_sync_interrupt(jabs_sync_thread *t);
 bool jabs_sync_clear_interrupt(jabs_sync_thread *t);
+/* Optional, for the threads code: the calling thread is ending and holds no monitor level (it
+ * stops the program otherwise). Its small id, which lock words use to name owners, may then go
+ * to a new thread; its record stays allocated. Without this call ids are never reused and at
+ * most 2^20 - 1 threads can ever touch monitors. */
+void jabs_sync_thread_end(void);
+/* For tests and diagnostics: monitors inflated so far (thin locks have none). */
+uint32_t jabs_sync_inflated_monitors(void);
 
 /* invokeinterface: binary search the receiver's interface table; NULL if the class does not
  * implement a method with this selector (IncompatibleClassChangeError). */

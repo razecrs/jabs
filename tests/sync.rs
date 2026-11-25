@@ -249,3 +249,38 @@ fn atomic_compare_and_set_loses_no_updates() {
 fn volatile_long_is_never_torn() {
     run("volatile_long_is_never_torn");
 }
+
+#[test]
+fn thin_locks_create_no_monitor() {
+    run("thin_locks_create_no_monitor");
+}
+
+#[test]
+fn contention_inflates_and_excludes() {
+    run("contention_inflates_and_excludes");
+}
+
+#[test]
+fn wait_on_thin_lock_inflates_keeping_depth() {
+    run("wait_on_thin_lock_inflates_keeping_depth");
+}
+
+#[test]
+fn recursion_overflow_inflates() {
+    run("recursion_overflow_inflates");
+}
+
+#[test]
+fn mixed_thin_and_inflated_stress() {
+    run("mixed_thin_and_inflated_stress");
+}
+
+#[test]
+fn thin_lock_ownership_queries() {
+    run("thin_lock_ownership_queries");
+}
+
+#[test]
+fn thread_end_recycles_its_id() {
+    run("thread_end_recycles_its_id");
+}

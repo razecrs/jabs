@@ -90,7 +90,7 @@ static void first_use_worker(void *p) {
         arrive_and_wait(&f->arrived[i], RACE_THREADS);
         jabs_monitor_enter(f->objects[i]);
         int others = __atomic_fetch_add(&f->inside[i], 1, __ATOMIC_RELAXED);
-        CHECK(others == 0, "sync_monitor_of in runtime/jabs_sync.c (two monitors installed for one object?)",
+        CHECK(others == 0, "sync_inflate in runtime/jabs_sync.c (two monitors installed for one object?)",
               "object %d: two threads own its monitor at once after racing to lock it first", i);
         __atomic_fetch_sub(&f->inside[i], 1, __ATOMIC_RELAXED);
         CHECK(jabs_monitor_exit(f->objects[i]) == 1, ENTER_EXIT, "object %d: exit by the owner was refused", i);
@@ -103,12 +103,14 @@ static void monitor_first_use_race_installs_one_monitor(void) {
     harness_thread *t[RACE_THREADS];
     for (int i = 0; i < RACE_THREADS; i++) t[i] = harness_spawn(first_use_worker, &f);
     for (int i = 0; i < RACE_THREADS; i++) harness_join(t[i]);
+    /* Afterwards every lock word is free (0) or an inflated monitor of its own. */
     for (int i = 0; i < RACE_OBJECTS; i++) {
         uint32_t a = f.objects[i]->monitor;
-        CHECK(a != 0, "sync_monitor_of in runtime/jabs_sync.c", "object %d: header has no monitor index after being locked", i);
-        for (int j = 0; j < i; j++) {
-            CHECK(f.objects[j]->monitor != a, "sync_monitor_of in runtime/jabs_sync.c",
-                  "objects %d and %d share monitor index %u", j, i, (unsigned)a);
+        CHECK(a == 0 || (a & 1) != 0, "jabs_monitor_exit in runtime/jabs_sync.c",
+              "object %d: lock word %08x still names a thin owner after every thread exited", i, (unsigned)a);
+        for (int j = 0; j < i && a != 0; j++) {
+            CHECK(f.objects[j]->monitor != a, "sync_inflate in runtime/jabs_sync.c",
+                  "objects %d and %d share inflated monitor word %08x", j, i, (unsigned)a);
         }
     }
 }
@@ -132,7 +134,7 @@ static void monitor_unlocked_object_is_not_owned(void) {
     jabs_object *o = fresh_object();
     CHECK(!jabs_monitor_holds(o), "jabs_monitor_holds in runtime/jabs_sync.c", "a never-locked object reports an owner");
     CHECK(jabs_monitor_exit(o) == 0, ENTER_EXIT, "exit of a never-locked object: expected 0, got 1");
-    CHECK(o->monitor == 0, "sync_monitor_if_any in runtime/jabs_sync.c",
+    CHECK(o->monitor == 0, "jabs_monitor_holds/jabs_monitor_exit in runtime/jabs_sync.c",
           "queries on a never-locked object installed monitor %u; only locking should", (unsigned)o->monitor);
 }
 
@@ -475,6 +477,211 @@ static void volatile_long_is_never_torn(void) {
     harness_join(w);
 }
 
+/* ---- thin locks and inflation ---- */
+
+#define THIN "the thin-lock paths of jabs_monitor_enter/jabs_monitor_exit in runtime/jabs_sync.c"
+#define INFLATE "sync_inflate in runtime/jabs_sync.c"
+
+static bool word_is_inflated(jabs_object *o) { return (__atomic_load_n(&o->monitor, __ATOMIC_SEQ_CST) & 1u) != 0; }
+static uint32_t thin_owner_of(jabs_object *o) { return __atomic_load_n(&o->monitor, __ATOMIC_SEQ_CST) >> 12; }
+
+enum { THIN_OBJECTS = 1000000 };
+
+static void thin_locks_create_no_monitor(void) {
+    jabs_object *objects = (jabs_object *)calloc(THIN_OBJECTS, sizeof *objects);
+    if (!objects) { fprintf(stderr, "harness: out of memory\n"); exit(2); }
+    for (int i = 0; i < THIN_OBJECTS; i++) {
+        jabs_object *o = &objects[i];
+        o->cls = &probe_class;
+        jabs_monitor_enter(o);
+        if (i % 3 == 0) jabs_monitor_enter(o);
+        CHECK(jabs_monitor_holds(o), THIN, "object %d: owner does not hold its thin lock", i);
+        if (i % 3 == 0) CHECK(jabs_monitor_exit(o) == 1, THIN, "object %d: inner thin exit refused", i);
+        CHECK(jabs_monitor_exit(o) == 1, THIN, "object %d: thin exit refused", i);
+        CHECK(o->monitor == 0, THIN, "object %d: lock word %08x after the final exit, expected 0", i, (unsigned)o->monitor);
+    }
+    uint32_t inflated = jabs_sync_inflated_monitors();
+    CHECK(inflated == 0, THIN, "%d uncontended lock/unlock pairs inflated %u monitor(s), expected 0", THIN_OBJECTS, (unsigned)inflated);
+    free(objects);
+}
+
+typedef struct {
+    jabs_object *lock;
+    int owner_done;  /* the first owner finished all its exits */
+    int saw_done;    /* what the contender saw once it got in */
+    int entered;
+} contention;
+
+static void contender(void *p) {
+    contention *c = (contention *)p;
+    jabs_monitor_enter(c->lock);
+    c->saw_done = __atomic_load_n(&c->owner_done, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&c->entered, 1, __ATOMIC_SEQ_CST);
+    jabs_monitor_exit(c->lock);
+}
+
+static void contention_inflates_and_excludes(void) {
+    contention c = { fresh_object(), 0, -1, 0 };
+    for (int i = 0; i < 3; i++) jabs_monitor_enter(c.lock);
+    CHECK(!word_is_inflated(c.lock), THIN, "three uncontended levels already inflated the lock");
+    harness_thread *t = harness_spawn(contender, &c);
+    harness_sleep_ms(150);
+    CHECK(word_is_inflated(c.lock), INFLATE, "a blocked contender did not inflate the thin lock (word %08x)", (unsigned)c.lock->monitor);
+    CHECK(__atomic_load_n(&c.entered, __ATOMIC_SEQ_CST) == 0, INFLATE, "the contender got in while the thin owner held 3 levels");
+    for (int i = 3; i > 0; i--) {
+        CHECK(jabs_monitor_holds(c.lock), INFLATE, "inflation lost the owner with %d level(s) still held", i);
+        if (i == 1) __atomic_store_n(&c.owner_done, 1, __ATOMIC_SEQ_CST);
+        CHECK(jabs_monitor_exit(c.lock) == 1, INFLATE, "exit %d after inflation refused (depth not carried over)", 4 - i);
+    }
+    harness_join(t);
+    CHECK(c.saw_done == 1, INFLATE, "the contender entered before the owner's last exit (depth carried over too small)");
+    CHECK(jabs_monitor_exit(c.lock) == 0, INFLATE, "a fourth exit succeeded: depth carried over too large");
+    uint32_t inflated = jabs_sync_inflated_monitors();
+    CHECK(inflated >= 1 && inflated <= 2, INFLATE, "one contended object made %u monitors (expected 1, or 2 with a lost race's spare)", (unsigned)inflated);
+}
+
+static void wait_on_thin_lock_inflates_keeping_depth(void) {
+    jabs_object *o = fresh_object();
+    for (int i = 0; i < 5; i++) jabs_monitor_enter(o);
+    CHECK(!word_is_inflated(o) && jabs_sync_inflated_monitors() == 0, THIN, "five uncontended levels inflated the lock");
+    int r = jabs_monitor_wait(o, 10);
+    CHECK(r == JABS_WAIT_TIMED_OUT, "jabs_monitor_wait in runtime/jabs_sync.c", "wait(10) on a thin lock: expected JABS_WAIT_TIMED_OUT, got %d", r);
+    CHECK(word_is_inflated(o), "jabs_monitor_wait in runtime/jabs_sync.c", "wait did not inflate the thin lock (word %08x)", (unsigned)o->monitor);
+    for (int i = 5; i > 0; i--) {
+        CHECK(jabs_monitor_holds(o), INFLATE, "after wait the lock was released with %d level(s) left", i);
+        CHECK(jabs_monitor_exit(o) == 1, INFLATE, "exit %d after wait refused (thin depth not carried into the monitor)", 6 - i);
+    }
+    CHECK(jabs_monitor_exit(o) == 0, INFLATE, "a sixth exit after wait succeeded: depth too large");
+}
+
+enum { THIN_MAX = 2047 };
+
+static void other_thread_enters_and_exits(void *p) {
+    jabs_object *o = (jabs_object *)p;
+    jabs_monitor_enter(o);
+    jabs_monitor_exit(o);
+}
+
+static void recursion_overflow_inflates(void) {
+    jabs_object *o = fresh_object();
+    for (int i = 0; i < THIN_MAX; i++) jabs_monitor_enter(o);
+    CHECK(!word_is_inflated(o), THIN, "%d levels (the thin maximum) already inflated", THIN_MAX);
+    jabs_monitor_enter(o);
+    CHECK(word_is_inflated(o), INFLATE, "level %d did not inflate (word %08x)", THIN_MAX + 1, (unsigned)o->monitor);
+    for (int i = THIN_MAX + 1; i > 0; i--) {
+        CHECK(jabs_monitor_holds(o), INFLATE, "released with %d level(s) still held after overflow", i);
+        CHECK(jabs_monitor_exit(o) == 1, INFLATE, "exit with %d level(s) held refused after overflow", i);
+    }
+    CHECK(jabs_monitor_exit(o) == 0, INFLATE, "an exit beyond the %d levels succeeded", THIN_MAX + 1);
+    CHECK(!jabs_monitor_holds(o), INFLATE, "still owner after the final exit");
+    harness_join(harness_spawn(other_thread_enters_and_exits, o));
+    CHECK(word_is_inflated(o), INFLATE, "an inflated lock went back to thin (inflation is meant to be permanent)");
+}
+
+/* Many threads on a few objects: some stay thin, contended ones inflate mid-run. */
+enum { MIXED_THREADS = 8, MIXED_OBJECTS = 64, MIXED_ROUNDS = 50000 };
+typedef struct {
+    jabs_object *objects[MIXED_OBJECTS];
+    int inside[MIXED_OBJECTS];
+    long counters[MIXED_OBJECTS];
+    int arrived;
+    int next_seed;
+} mixed;
+
+static void mixed_worker(void *p) {
+    mixed *m = (mixed *)p;
+    uint32_t seed = (uint32_t)__atomic_add_fetch(&m->next_seed, 1, __ATOMIC_SEQ_CST) * 2654435761u;
+    arrive_and_wait(&m->arrived, MIXED_THREADS);
+    for (int i = 0; i < MIXED_ROUNDS; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        /* Half the traffic goes to 4 hot objects so they inflate; the rest spreads thin. */
+        int k = (seed >> 8) & 1 ? (int)((seed >> 9) % 4) : (int)((seed >> 9) % MIXED_OBJECTS);
+        jabs_object *o = m->objects[k];
+        jabs_monitor_enter(o);
+        bool nested = (seed >> 20) & 1;
+        if (nested) jabs_monitor_enter(o);
+        int others = __atomic_fetch_add(&m->inside[k], 1, __ATOMIC_RELAXED);
+        CHECK(others == 0, "jabs_monitor_enter/exit and sync_inflate in runtime/jabs_sync.c",
+              "object %d: %d other owner(s) inside at once (thin/inflated hand-over broke exclusion)", k, others);
+        m->counters[k]++;
+        if ((seed >> 24) % 16 == 0) jabs_monitor_notify(o);
+        __atomic_fetch_sub(&m->inside[k], 1, __ATOMIC_RELAXED);
+        if (nested) CHECK(jabs_monitor_exit(o) == 1, THIN, "object %d: inner exit refused", k);
+        CHECK(jabs_monitor_exit(o) == 1, THIN, "object %d: exit refused", k);
+    }
+}
+
+static void mixed_thin_and_inflated_stress(void) {
+    static mixed m;
+    for (int i = 0; i < MIXED_OBJECTS; i++) m.objects[i] = fresh_object();
+    harness_thread *t[MIXED_THREADS];
+    for (int i = 0; i < MIXED_THREADS; i++) t[i] = harness_spawn(mixed_worker, &m);
+    for (int i = 0; i < MIXED_THREADS; i++) harness_join(t[i]);
+    long total = 0;
+    int inflated = 0;
+    for (int i = 0; i < MIXED_OBJECTS; i++) {
+        total += m.counters[i];
+        inflated += word_is_inflated(m.objects[i]);
+        uint32_t w = m.objects[i]->monitor;
+        CHECK(w == 0 || (w & 1), THIN, "object %d: lock word %08x names a thin owner after every thread left", i, (unsigned)w);
+    }
+    long want = (long)MIXED_THREADS * MIXED_ROUNDS;
+    CHECK(total == want, "jabs_monitor_enter/exit in runtime/jabs_sync.c", "lost updates: expected %ld, got %ld", want, total);
+    CHECK(inflated >= 1, INFLATE, "no object inflated although 8 threads hammered 4 hot ones");
+}
+
+typedef struct { jabs_object *lock; int holds, exit, notify, notify_all, wait; } foreign;
+
+static void foreign_queries(void *p) {
+    foreign *f = (foreign *)p;
+    f->holds = jabs_monitor_holds(f->lock);
+    f->exit = jabs_monitor_exit(f->lock);
+    f->notify = jabs_monitor_notify(f->lock);
+    f->notify_all = jabs_monitor_notify_all(f->lock);
+    f->wait = jabs_monitor_wait(f->lock, 1);
+}
+
+static void thin_lock_ownership_queries(void) {
+    foreign f = { fresh_object(), -1, -1, -1, -1, -1 };
+    jabs_monitor_enter(f.lock);
+    jabs_monitor_enter(f.lock);
+    uint32_t before = f.lock->monitor;
+    harness_join(harness_spawn(foreign_queries, &f));
+    CHECK(f.holds == 0, THIN, "a non-owner sees itself holding a thin lock");
+    CHECK(f.exit == 0, THIN, "a non-owner's exit of a thin lock: expected 0, got %d", f.exit);
+    CHECK(f.notify == 0 && f.notify_all == 0, "sync_notify in runtime/jabs_sync.c", "a non-owner's notify/notifyAll on a thin lock: expected 0/0, got %d/%d", f.notify, f.notify_all);
+    CHECK(f.wait == JABS_WAIT_NOT_OWNER, "jabs_monitor_wait in runtime/jabs_sync.c", "a non-owner's wait on a thin lock: expected JABS_WAIT_NOT_OWNER, got %d", f.wait);
+    CHECK(f.lock->monitor == before, THIN, "a non-owner's refused calls changed the lock word %08x -> %08x", (unsigned)before, (unsigned)f.lock->monitor);
+    CHECK(jabs_monitor_notify(f.lock) == 1 && jabs_monitor_notify_all(f.lock) == 1, "sync_notify in runtime/jabs_sync.c", "the thin owner's notify/notifyAll was refused");
+    CHECK(f.lock->monitor == before && jabs_sync_inflated_monitors() == 0, "sync_notify in runtime/jabs_sync.c",
+          "notify on a thin lock inflated it (nobody can be waiting on a thin lock)");
+    CHECK(jabs_monitor_exit(f.lock) == 1 && jabs_monitor_exit(f.lock) == 1, THIN, "the owner's exits were refused after the foreign calls");
+}
+
+typedef struct { jabs_object *lock; uint32_t id; } id_probe;
+
+static void lock_report_id_and_end(void *p) {
+    id_probe *probe = (id_probe *)p;
+    jabs_monitor_enter(probe->lock);
+    probe->id = thin_owner_of(probe->lock);
+    jabs_monitor_exit(probe->lock);
+    jabs_sync_thread_end();
+}
+
+static void thread_end_recycles_its_id(void) {
+    id_probe a = { fresh_object(), 0 }, b = { fresh_object(), 0 };
+    jabs_object *mine = fresh_object();
+    jabs_monitor_enter(mine); /* this thread keeps its id the whole time */
+    uint32_t main_id = thin_owner_of(mine);
+    harness_join(harness_spawn(lock_report_id_and_end, &a));
+    harness_join(harness_spawn(lock_report_id_and_end, &b));
+    CHECK(a.id != 0, "jabs_sync_current in runtime/jabs_sync.c", "a thin lock word named owner id 0");
+    CHECK(a.id == b.id, "jabs_sync_thread_end/jabs_sync_current in runtime/jabs_sync.c",
+          "an ended thread's id %u was not reused (the next thread got %u)", (unsigned)a.id, (unsigned)b.id);
+    CHECK(a.id != main_id, "jabs_sync_current in runtime/jabs_sync.c", "a new thread got id %u, which a live thread holding a lock still has", (unsigned)a.id);
+    jabs_monitor_exit(mine);
+}
+
 typedef struct { const char *name; void (*run)(void); } harness_test;
 static const harness_test tests[] = {
     { "monitor_excludes_concurrent_owners", monitor_excludes_concurrent_owners },
@@ -495,6 +702,13 @@ static const harness_test tests[] = {
     { "atomic_float_add_loses_no_updates", atomic_float_add_loses_no_updates },
     { "atomic_compare_and_set_loses_no_updates", atomic_compare_and_set_loses_no_updates },
     { "volatile_long_is_never_torn", volatile_long_is_never_torn },
+    { "thin_locks_create_no_monitor", thin_locks_create_no_monitor },
+    { "contention_inflates_and_excludes", contention_inflates_and_excludes },
+    { "wait_on_thin_lock_inflates_keeping_depth", wait_on_thin_lock_inflates_keeping_depth },
+    { "recursion_overflow_inflates", recursion_overflow_inflates },
+    { "mixed_thin_and_inflated_stress", mixed_thin_and_inflated_stress },
+    { "thin_lock_ownership_queries", thin_lock_ownership_queries },
+    { "thread_end_recycles_its_id", thread_end_recycles_its_id },
 };
 
 int main(int argc, char **argv) {
