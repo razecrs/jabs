@@ -34,9 +34,10 @@ const OBJECT: &str = "java/lang/Object";
 const STRING: &str = "java/lang/String";
 const THROWABLE: &str = "java/lang/Throwable";
 const CLASS: &str = "java/lang/Class";
+const THREAD: &str = "java/lang/Thread";
 
 /// Exceptions the runtime raises itself, in the order of the JABS_VM_* constants.
-const VM_EXCEPTIONS: [(&str, &str); 18] = [
+const VM_EXCEPTIONS: [(&str, &str); 19] = [
     ("java/lang/NullPointerException", "JABS_VM_NULL_POINTER"),
     ("java/lang/ArithmeticException", "JABS_VM_ARITHMETIC"),
     (
@@ -79,6 +80,7 @@ const VM_EXCEPTIONS: [(&str, &str); 18] = [
     ("java/lang/InstantiationException", "JABS_VM_INSTANTIATION"),
     ("java/io/FileNotFoundException", "JABS_VM_FILE_NOT_FOUND"),
     ("java/io/SyncFailedException", "JABS_VM_SYNC_FAILED"),
+    ("java/lang/InterruptedException", "JABS_VM_INTERRUPTED"),
 ];
 
 /// Native methods the runtime implements: (class, name, descriptor) -> C body. `self` and
@@ -129,7 +131,7 @@ const INTRINSICS: &[Intrinsic] = &[
     // then nothing can interrupt a wait, and a reported interrupt stops rather than guess.
     Intrinsic {
         key: ("java/lang/Object", "wait0", "(J)V"),
-        body: "switch (jabs_monitor_wait(self, a0)) { case JABS_WAIT_NOT_OWNER: jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE); return; case JABS_WAIT_INTERRUPTED: jabs_not_compiled(\"java/lang/Object.wait0 interrupted (InterruptedException is not wired to thread interruption yet)\"); default: return; }",
+        body: "switch (jabs_monitor_wait(self, a0)) { case JABS_WAIT_NOT_OWNER: jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE); return; case JABS_WAIT_INTERRUPTED: jabs_thread_wait_interrupted(); return; default: return; }",
         needs_classes: false,
     },
     Intrinsic {
@@ -173,7 +175,7 @@ const INTRINSICS: &[Intrinsic] = &[
     },
     Intrinsic {
         key: ("java/lang/Runtime", "availableProcessors", "()I"),
-        body: "return 1; /* the native runtime is single-threaded */",
+        body: "return jabs_thread_processor_count();",
         needs_classes: false,
     },
     Intrinsic {
@@ -260,10 +262,11 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } if (a0->cls != jabs_array_class()) jabs_not_compiled(\"Array.getLength of a non-array (IllegalArgumentException)\"); return ((jabs_array *)a0)->length;",
         needs_classes: false,
     },
-    // The VM creates the main thread before any Java code runs; JABS does it on first request.
+    // Each thread knows its own Thread (jabs_thread.c); the VM creates the main thread's before
+    // any Java code runs, JABS on first request.
     Intrinsic {
         key: ("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;"),
-        body: "return jabs_main_thread();",
+        body: "return jabs_current_thread();",
         needs_classes: true,
     },
     // System properties the VM supplies (System.initPhase1 -> SystemProps.initProperties).
@@ -355,7 +358,7 @@ const INTRINSICS: &[Intrinsic] = &[
     },
     Intrinsic {
         key: ("java/lang/Runtime", "totalMemory", "()J"),
-        body: "return jabs_heap_bytes;",
+        body: "return atomic_load_explicit(&jabs_heap_bytes, memory_order_relaxed);",
         needs_classes: false,
     },
     Intrinsic {
@@ -368,36 +371,45 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "/* no garbage collector yet */",
         needs_classes: false,
     },
-    // Thread natives with one thread: priorities and names have no OS thread to apply to,
-    // nothing can be interrupted while running, and yielding has no one to yield to.
+    // Thread.start0: jabs_thread.c runs run() on a new OS thread and ends the thread as HotSpot
+    // does (reachable() keeps run, dispatchUncaughtException and exit compiled in).
+    Intrinsic {
+        key: ("java/lang/Thread", "start0", "()V"),
+        body: "jabs_thread_start(self);",
+        needs_classes: false,
+    },
+    // Java priorities are not applied to OS threads: HotSpot's default on Linux
+    // (ThreadPriorityPolicy=0) does not either, and the Java-visible priority is a Java field.
     Intrinsic {
         key: ("java/lang/Thread", "setPriority0", "(I)V"),
         body: "(void)a0;",
         needs_classes: false,
     },
+    // HotSpot names only the calling thread's OS thread (JVM_SetNativeThreadName).
     Intrinsic {
         key: ("java/lang/Thread", "setNativeName", "(Ljava/lang/String;)V"),
-        body: "(void)a0;",
-        needs_classes: false,
+        body: "if (!a0 || self != jabs_current_thread()) return; char *name = jabs_string_to_utf8(a0); if (!name) return; jabs_thread_set_native_name(name); free(name);",
+        needs_classes: true,
     },
     Intrinsic {
         key: ("java/lang/Thread", "yield0", "()V"),
-        body: "/* single-threaded */",
+        body: "jabs_thread_yield();",
         needs_classes: false,
     },
+    // The caller cleared the Java interrupt status; the monitors' interrupt mark goes too.
     Intrinsic {
         key: ("java/lang/Thread", "clearInterruptEvent", "()V"),
-        body: "/* no OS interrupt event: nothing blocks interruptibly yet */",
+        body: "jabs_thread_clear_interrupt_event();",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/Thread", "interrupt0", "()V"),
-        body: "/* the interrupted flag is a Java field; with one thread nothing is blocked */",
+        body: "jabs_thread_interrupt(self);",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/Thread", "sleepNanos0", "(J)V"),
-        body: "jabs_sleep_nanos(a0);",
+        body: "jabs_thread_sleep(a0);",
         needs_classes: false,
     },
     Intrinsic {
@@ -415,7 +427,7 @@ const INTRINSICS: &[Intrinsic] = &[
             "currentCarrierThread",
             "()Ljava/lang/Thread;",
         ),
-        body: "return jabs_main_thread();",
+        body: "return jabs_current_thread();",
         needs_classes: true,
     },
     Intrinsic {
@@ -423,7 +435,8 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "if (!a0) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } return jabs_monitor_holds(a0);",
         needs_classes: false,
     },
-    // ThreadIdentifiers adds to this counter with Unsafe; the main thread already has id 1.
+    // ThreadIdentifiers adds to this counter with Unsafe; the main thread already has id 1. Every
+    // thread updates it only through Unsafe.getAndAddLong, which is atomic (jabs_sync.c).
     Intrinsic {
         key: ("java/lang/Thread", "getNextThreadIdOffset", "()J"),
         body: "static int64_t next_thread_id = 2; return (int64_t)(intptr_t)&next_thread_id;",
@@ -1340,9 +1353,9 @@ pub struct CompiledUnit {
 /// Definitions of the runtime's globals; exactly one file of a program contains them.
 const RUNTIME_GLOBALS: &str = "_Thread_local jabs_object *jabs_pending;\n\
 const jabs_class jabs_array_class_record = { \"[\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 };\n\
-uint32_t jabs_hash_next = 0x9e3779b9u;\n\
-const char *jabs_where = \"\";\n\
-int64_t jabs_heap_bytes;\n\
+_Thread_local uint32_t jabs_hash_next = 0x9e3779b9u;\n\
+_Thread_local const char *jabs_where = \"\";\n\
+_Atomic int64_t jabs_heap_bytes;\n\
 _Thread_local const char *jabs_caller;\n\
 void (*jabs_on_not_compiled)(void);\n\
 int jabs_define_count;\n\
@@ -4258,14 +4271,24 @@ fn emit_synchronized_wrapper(
 ) {
     let is_static = method.access & ACC_STATIC != 0;
     let name = symbol(&class.name, &method.name, &method.descriptor);
-    let lock = if is_static {
-        // Static methods lock the class. Class objects are not modeled yet, so each class gets a
-        // dedicated monitor object; nothing else can lock it until `X.class` exists.
-        let monitor = mangled("jcm_", &[&class.name]);
-        let _ = writeln!(out, "static jabs_object {monitor};");
-        format!("&{monitor}")
+    let ret_default = if sig.ret.code == 'V' {
+        "return;"
     } else {
-        "self".to_string()
+        "return 0;"
+    };
+    // Static methods lock the Class object (jabs_static_monitor), found once and cached; the
+    // dedicated object is the monitor only in programs without a Class registry.
+    let lock = if is_static {
+        let monitor = mangled("jcm_", &[&class.name]);
+        let cached = mangled("jcl_", &[&class.name]);
+        let _ = writeln!(out, "static jabs_object {monitor};");
+        let _ = writeln!(out, "static _Atomic(jabs_object *) {cached};");
+        format!(
+            "atomic_load_explicit(&{cached}, memory_order_acquire);\n    if (!lock) {{ lock = jabs_static_monitor(\"{}\", &{monitor}); if (!lock) {ret_default} atomic_store_explicit(&{cached}, lock, memory_order_release); }}",
+            c_escape(&class.name)
+        )
+    } else {
+        "self;".to_string()
     };
     let mut args: Vec<String> = Vec::new();
     if !is_static {
@@ -4274,7 +4297,7 @@ fn emit_synchronized_wrapper(
     args.extend((0..sig.params.len()).map(|i| format!("a{i}")));
     let call = format!("{name}__sync({})", args.join(", "));
     let _ = writeln!(out, "{} {{", prototype(&class.name, method, sig));
-    let _ = writeln!(out, "    jabs_object *lock = {lock};");
+    let _ = writeln!(out, "    jabs_object *lock = {lock}");
     let _ = writeln!(out, "    jabs_monitor_enter(lock);");
     if sig.ret.code == 'V' {
         let _ = writeln!(out, "    {call};\n    jabs_monitor_exit(lock);\n}}\n");
@@ -4376,8 +4399,14 @@ fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>, intern_table: 
         let length = if latin1 { units.len() } else { units.len() * 2 };
         let name = literal_symbol(units);
         let _ = writeln!(out, "jabs_object *{name}(void) {{");
-        let _ = writeln!(out, "    static jabs_object *interned;");
-        let _ = writeln!(out, "    if (interned) return interned;");
+        // Threads may build the same literal at once; the first one stored wins, so every thread
+        // gets the same object.
+        let _ = writeln!(out, "    static _Atomic(jabs_object *) interned;");
+        let _ = writeln!(
+            out,
+            "    jabs_object *cached = atomic_load_explicit(&interned, memory_order_acquire);"
+        );
+        let _ = writeln!(out, "    if (cached) return cached;");
         let _ = writeln!(out, "    if ({}() != 0) return NULL;", init_symbol(STRING));
         if latin1 {
             let _ = writeln!(
@@ -4427,11 +4456,15 @@ fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>, intern_table: 
         );
         // Literals and String.intern share one table, so equal contents give the same object.
         if intern_table {
-            let _ = writeln!(out, "    interned = jabs_string_intern(s);");
-        } else {
-            let _ = writeln!(out, "    interned = s;");
+            let _ = writeln!(out, "    s = jabs_string_intern(s);");
+            let _ = writeln!(out, "    if (!s) return NULL;");
         }
-        let _ = writeln!(out, "    return interned;\n}}");
+        let _ = writeln!(out, "    jabs_object *expected = NULL;");
+        let _ = writeln!(
+            out,
+            "    if (!atomic_compare_exchange_strong_explicit(&interned, &expected, s, memory_order_acq_rel, memory_order_acquire)) return expected;"
+        );
+        let _ = writeln!(out, "    return s;\n}}");
     }
     out.push('\n');
 }
@@ -4806,9 +4839,25 @@ fn emit_class_registry(
     let _ = writeln!(out, "    {{ NULL, NULL, 0 }}\n}};");
     out.push_str(&format!(r#"
 typedef struct {{ char *name; const jabs_class *record; jabs_object *object; }} jabs_class_entry;
-static jabs_class_entry *jabs_class_entries;
+/* Every thread shares the registry. The list is read and grown only under JABS_LOCK_CLASSES;
+ * each entry is allocated on its own and never changes or moves once listed, so a pointer to one
+ * stays valid after the lock is released. */
+static jabs_class_entry **jabs_class_entries;
 static size_t jabs_class_count, jabs_class_capacity;
 static void jabs_set_defining_loader(jabs_object *c, const char *name);
+
+/* Listed entry for a name; the caller holds JABS_LOCK_CLASSES. */
+static jabs_class_entry *jabs_class_entry_named_locked(const char *name) {{
+    for (size_t i = 0; i < jabs_class_count; i++) if (strcmp(jabs_class_entries[i]->name, name) == 0) return jabs_class_entries[i];
+    return NULL;
+}}
+
+static jabs_class_entry *jabs_class_entry_named(const char *name) {{
+    jabs_lock(JABS_LOCK_CLASSES);
+    jabs_class_entry *e = jabs_class_entry_named_locked(name);
+    jabs_unlock(JABS_LOCK_CLASSES);
+    return e;
+}}
 
 /* Record for an internal class name, if the unit compiled one. */
 static const jabs_class *jabs_record_named(const char *name) {{
@@ -4865,9 +4914,12 @@ static int jabs_is_primitive_name(const char *n) {{
 }}
 
 /* The Class object for an internal name ("java/lang/String"), array descriptor ("[I") or
- * primitive name ("int"). Created once; the same object is returned afterwards. */
+ * primitive name ("int"). Created once; the same object is returned afterwards. Building one runs
+ * Java code (String and Class initialization), so it happens outside the lock; if two threads
+ * build the same Class at once, the first one listed is the only one anybody gets. */
 jabs_object *jabs_class_object(const char *name) {{
-    for (size_t i = 0; i < jabs_class_count; i++) if (strcmp(jabs_class_entries[i].name, name) == 0) return jabs_class_entries[i].object;
+    jabs_class_entry *listed = jabs_class_entry_named(name);
+    if (listed) return listed->object;
     if ({class_init}() != 0) return NULL;
     jabs_object *c = jabs_new(&{class_record_name});
     if (!c) return NULL;
@@ -4887,37 +4939,63 @@ jabs_object *jabs_class_object(const char *name) {{
     }} else if (record) {{
         (({class_struct} *)c)->{modifiers} = (uint16_t)(record->access & 0x7631);
     }}
-    if (jabs_class_count == jabs_class_capacity) {{
-        size_t grown = jabs_class_capacity ? jabs_class_capacity * 2 : 64;
-        jabs_class_entry *more = (jabs_class_entry *)realloc(jabs_class_entries, grown * sizeof *more);
-        if (!more) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
-        jabs_class_entries = more;
-        jabs_class_capacity = grown;
-    }}
-    char *copy = (char *)malloc(strlen(name) + 1);
-    if (!copy) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
-    strcpy(copy, name);
-    jabs_class_entries[jabs_class_count++] = (jabs_class_entry){{ copy, record, c }};
-    jabs_set_defining_loader(c, name);
     if (name[0] == '[') {{
-        /* componentType: "[I" -> int, "[Ljava/lang/String;" -> java/lang/String, "[[I" -> [I. */
+        /* componentType: "[I" -> int, "[Ljava/lang/String;" -> java/lang/String, "[[I" -> [I.
+         * Set before the Class is listed, so no thread ever sees an array Class without it. */
         char element[512];
         static const char *const prims[] = {{ "Z", "boolean", "B", "byte", "C", "char", "S", "short", "I", "int", "J", "long", "F", "float", "D", "double" }};
         const char *e = name + 1;
-        if (*e == 'L') {{ size_t len = strlen(e) - 2; if (len >= sizeof element) return c; memcpy(element, e + 1, len); element[len] = 0; }}
-        else if (*e == '[') {{ if (strlen(e) >= sizeof element) return c; strcpy(element, e); }}
-        else {{ for (size_t i = 0; i < 16; i += 2) if (*e == prims[i][0]) strcpy(element, prims[i + 1]); }}
-        jabs_object *component = jabs_class_object(element);
-        if (!component) return NULL;
-        (({class_struct} *)c)->{component} = component;
+        int named = 0;
+        element[0] = 0;
+        if (*e == 'L') {{ size_t len = strlen(e) - 2; if (len < sizeof element) {{ memcpy(element, e + 1, len); element[len] = 0; named = 1; }} }}
+        else if (*e == '[') {{ if (strlen(e) < sizeof element) {{ strcpy(element, e); named = 1; }} }}
+        else {{ for (size_t i = 0; i < 16; i += 2) if (*e == prims[i][0]) {{ strcpy(element, prims[i + 1]); named = 1; }} }}
+        if (named) {{
+            jabs_object *component = jabs_class_object(element);
+            if (!component) return NULL;
+            (({class_struct} *)c)->{component} = component;
+        }}
     }}
+    jabs_class_entry *entry = (jabs_class_entry *)malloc(sizeof *entry);
+    char *copy = (char *)malloc(strlen(name) + 1);
+    if (!entry || !copy) {{ free(entry); free(copy); jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+    strcpy(copy, name);
+    *entry = (jabs_class_entry){{ copy, record, c }};
+    jabs_lock(JABS_LOCK_CLASSES);
+    listed = jabs_class_entry_named_locked(name);
+    if (listed) {{
+        /* Another thread listed this Class first: theirs is the one. */
+        jabs_unlock(JABS_LOCK_CLASSES);
+        free(entry);
+        free(copy);
+        return listed->object;
+    }}
+    if (jabs_class_count == jabs_class_capacity) {{
+        size_t grown = jabs_class_capacity ? jabs_class_capacity * 2 : 64;
+        jabs_class_entry **more = grown > SIZE_MAX / sizeof *more ? NULL : (jabs_class_entry **)realloc(jabs_class_entries, grown * sizeof *more);
+        if (!more) {{
+            jabs_unlock(JABS_LOCK_CLASSES);
+            free(entry);
+            free(copy);
+            jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
+            return NULL;
+        }}
+        jabs_class_entries = more;
+        jabs_class_capacity = grown;
+    }}
+    jabs_class_entries[jabs_class_count++] = entry;
+    jabs_set_defining_loader(c, name);
+    jabs_unlock(JABS_LOCK_CLASSES);
     return c;
 }}
 
 /* Registry entry of a Class object (every Class object comes from jabs_class_object). */
 static jabs_class_entry *jabs_class_entry_of(jabs_object *c) {{
-    for (size_t i = 0; i < jabs_class_count; i++) if (jabs_class_entries[i].object == c) return &jabs_class_entries[i];
-    return NULL;
+    jabs_class_entry *found = NULL;
+    jabs_lock(JABS_LOCK_CLASSES);
+    for (size_t i = 0; i < jabs_class_count; i++) if (jabs_class_entries[i]->object == c) {{ found = jabs_class_entries[i]; break; }}
+    jabs_unlock(JABS_LOCK_CLASSES);
+    return found;
 }}
 
 /* Object.getClass. */
@@ -5004,7 +5082,8 @@ jabs_object *jabs_class_superclass(jabs_object *c) {{
     ));
     out.push_str(&format!(
         r#"
-/* The String intern table (String.intern and every literal): open addressing on contents. */
+/* The String intern table (String.intern and every literal): open addressing on contents.
+ * Every thread shares it; it is read and changed only under JABS_LOCK_STRINGS. */
 static jabs_object **jabs_interned;
 static size_t jabs_interned_count, jabs_interned_capacity;
 
@@ -5025,10 +5104,11 @@ static int jabs_string_contents_equal(jabs_object *a, jabs_object *b) {{
 /* The canonical String with these contents: `s` itself if none was interned yet. */
 jabs_object *jabs_string_intern(jabs_object *s) {{
     if (!s) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    jabs_lock(JABS_LOCK_STRINGS);
     if (2 * (jabs_interned_count + 1) > jabs_interned_capacity) {{
         size_t grown = jabs_interned_capacity ? jabs_interned_capacity * 2 : 1024;
         jabs_object **table = (jabs_object **)calloc(grown, sizeof *table);
-        if (!table) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+        if (!table) {{ jabs_unlock(JABS_LOCK_STRINGS); jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
         for (size_t i = 0; i < jabs_interned_capacity; i++) {{
             jabs_object *e = jabs_interned[i];
             if (!e) continue;
@@ -5042,10 +5122,15 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
     }}
     size_t j = (size_t)jabs_string_contents_hash(s) & (jabs_interned_capacity - 1);
     for (; jabs_interned[j]; j = (j + 1) & (jabs_interned_capacity - 1)) {{
-        if (jabs_string_contents_equal(jabs_interned[j], s)) return jabs_interned[j];
+        if (jabs_string_contents_equal(jabs_interned[j], s)) {{
+            jabs_object *canonical = jabs_interned[j];
+            jabs_unlock(JABS_LOCK_STRINGS);
+            return canonical;
+        }}
     }}
     jabs_interned[j] = s;
     jabs_interned_count++;
+    jabs_unlock(JABS_LOCK_STRINGS);
     return s;
 }}
 "#,
@@ -5113,26 +5198,40 @@ static int jabs_compare_names(const void *a, const void *b) { return strcmp(*(co
         let instance = field_symbol(APP_LOADER, "INSTANCE");
         let _ = write!(
             out,
-            r#"static jabs_object *jabs_app_loader_object;
+            r#"/* Set once, under JABS_LOCK_CLASSES together with the loader of every Class listed so far. */
+static _Atomic(jabs_object *) jabs_app_loader_object;
 extern jabs_object *{instance};
 
 /* The app class loader (jabs.rt.AppLoader.INSTANCE), created on first use. Classes created
- * before it existed get it as their loader once it does. NULL while it is being created. */
+ * before it existed get it as their loader once it does. NULL while it is being created on this
+ * thread; another thread asking meanwhile waits in AppLoader's initialization lock. */
 jabs_object *jabs_app_loader(void) {{
-    static int state; /* 0 = not created, 1 = creating, 2 = created */
-    if (state == 2) return jabs_app_loader_object;
-    if (state == 1) return NULL;
-    state = 1;
-    if ({init}() != 0) {{ state = 0; return NULL; }}
-    jabs_app_loader_object = {instance};
-    state = 2;
-    for (size_t i = 0; i < jabs_class_count; i++) jabs_set_defining_loader(jabs_class_entries[i].object, jabs_class_entries[i].name);
-    return jabs_app_loader_object;
+    jabs_object *published = atomic_load_explicit(&jabs_app_loader_object, memory_order_acquire);
+    if (published) return published;
+    static _Thread_local bool creating;
+    if (creating) return NULL;
+    creating = true;
+    int failed = {init}() != 0;
+    creating = false;
+    if (failed) return NULL;
+    /* Still NULL when this thread is inside AppLoader's own initialization by another path. */
+    jabs_object *loader = {instance};
+    if (!loader) return NULL;
+    jabs_lock(JABS_LOCK_CLASSES);
+    if (!atomic_load_explicit(&jabs_app_loader_object, memory_order_relaxed)) {{
+        atomic_store_explicit(&jabs_app_loader_object, loader, memory_order_release);
+        for (size_t i = 0; i < jabs_class_count; i++) jabs_set_defining_loader(jabs_class_entries[i]->object, jabs_class_entries[i]->name);
+    }}
+    loader = atomic_load_explicit(&jabs_app_loader_object, memory_order_relaxed);
+    jabs_unlock(JABS_LOCK_CLASSES);
+    return loader;
 }}
 
-/* Class.getClassLoader: the app loader for classes from the inputs, null (boot) for the rest. */
+/* Class.getClassLoader: the app loader for classes from the inputs, null (boot) for the rest.
+ * The caller holds JABS_LOCK_CLASSES. */
 static void jabs_set_defining_loader(jabs_object *c, const char *name) {{
-    if (jabs_app_loader_object && name[0] != '[' && jabs_is_app_class(name)) (({class_struct} *)c)->{field} = jabs_app_loader_object;
+    jabs_object *loader = atomic_load_explicit(&jabs_app_loader_object, memory_order_relaxed);
+    if (loader && name[0] != '[' && jabs_is_app_class(name)) (({class_struct} *)c)->{field} = loader;
 }}
 "#,
             init = init_symbol(APP_LOADER),
@@ -5465,14 +5564,14 @@ jabs_object *jabs_class_for_name(jabs_object *binary, int32_t initialize, jabs_o
     /* The boot loader (null) does not see application classes. */
     if (!known || (!loader && jabs_is_app_class(name))) {{ jabs_pending = jabs_vm_throwable(JABS_VM_CLASS_NOT_FOUND); return NULL; }}
     if (!jabs_record_named(name)) {{
-        static char message[1100];
+        char message[1100];
         snprintf(message, sizeof message, "Class.forName(\"%s\") (the class was not compiled into this program)", name);
         jabs_not_compiled(message);
     }}
     if (initialize) {{
         const jabs_init_entry *e = (const jabs_init_entry *)bsearch(name, jabs_init_functions, {init_count}, sizeof *e, jabs_compare_init);
         if (!e) {{
-            static char message[1100];
+            char message[1100];
             snprintf(message, sizeof message, "Class.forName(\"%s\", true, ...) (its initialization was not compiled)", name);
             jabs_not_compiled(message);
         }}
@@ -5544,7 +5643,7 @@ jabs_object *jabs_class_new_instance(jabs_object *c) {{
         return NULL;
     }}
     if (!k->ctor) {{
-        static char message[1100];
+        char message[1100];
         snprintf(message, sizeof message, "Class.newInstance of %s (its constructor was not compiled into this program)", e->name);
         jabs_not_compiled(message);
     }}
@@ -5590,10 +5689,20 @@ fn stack_functions(methods: &BTreeSet<MethodKey>, hidden: &BTreeSet<String>) -> 
 
 /* The compiled method whose function starts at `start`, or NULL. */
 static const jabs_frame_entry *jabs_frame_of(const void *start) {
-    static size_t count;
+    /* 0 until sorted; published with release after the sort, so a reader that sees the count
+     * also sees the sorted table. */
+    static _Atomic size_t sorted;
+    size_t count = atomic_load_explicit(&sorted, memory_order_acquire);
     if (!count) {
-        while (jabs_frames[count].start) count++;
-        qsort(jabs_frames, count, sizeof *jabs_frames, jabs_compare_frames);
+        jabs_lock(JABS_LOCK_FRAMES);
+        count = atomic_load_explicit(&sorted, memory_order_relaxed);
+        if (!count) {
+            size_t cap = sizeof jabs_frames / sizeof *jabs_frames;
+            while (count < cap && jabs_frames[count].start) count++;
+            qsort(jabs_frames, count, sizeof *jabs_frames, jabs_compare_frames);
+            atomic_store_explicit(&sorted, count, memory_order_release);
+        }
+        jabs_unlock(JABS_LOCK_FRAMES);
     }
     jabs_frame_entry key = { start, NULL, NULL, NULL, 0 };
     return (const jabs_frame_entry *)bsearch(&key, jabs_frames, count, sizeof key, jabs_compare_frames);
@@ -6146,7 +6255,8 @@ pub fn resources_file(resources: &[(String, Vec<u8>)]) -> String {
 
 /// `jabs_main_thread()`: the main Thread the VM would create at startup (thread groups "system"
 /// and "main", priority 5, not a daemon, RUNNABLE), built once without running constructors.
-/// Only fields the JDK's classes declare are set.
+/// Only fields the JDK's classes declare are set. Only the main OS thread ever calls it (every
+/// other thread knows its Thread from the start), so its static is never shared.
 fn main_thread_function(unit: &Unit, recorded: &[&ClassFile]) -> String {
     let (thread, holder, group) = (
         "java/lang/Thread",
@@ -6243,7 +6353,7 @@ fn main_thread_function(unit: &Unit, recorded: &[&ClassFile]) -> String {
         "Ljava/lang/Object;",
         "lock",
     ));
-    body.push_str("    main_thread = t;\n");
+    body.push_str("    main_thread = t;\n    jabs_thread_attach_main(t);\n");
     // The context class loader of the main thread is the application class loader.
     body.push_str(
         "    jabs_object *loader = jabs_app_loader();\n    if (jabs_pending) return NULL;\n",
@@ -6257,6 +6367,136 @@ fn main_thread_function(unit: &Unit, recorded: &[&ClassFile]) -> String {
     ));
     body.push_str("    return t;\n}\n");
     body
+}
+
+/// What runtime/jabs_thread.c needs from java.lang.Thread, emitted in every program (the thread
+/// runtime is always linked): where its fields live, and the main Thread when the registry that
+/// builds it is absent. Anything the unit lacks stops with a diagnostic when it is reached.
+fn thread_glue_functions(unit: &Unit, registry: bool, methods: &BTreeSet<MethodKey>) -> String {
+    const HOLDER: &str = "java/lang/Thread$FieldHolder";
+    let mut out =
+        String::from("\n/* Glue for jabs_thread.c (see thread_glue_functions in cgen.rs). */\n");
+    if !registry {
+        out.push_str("jabs_object *jabs_main_thread(void) { jabs_not_compiled(\"Thread.currentThread (the Class registry is not in the unit)\"); }\n");
+    }
+    let laid_out = unit
+        .get(THREAD)
+        .is_some_and(|c| c.access & ACC_INTERFACE == 0)
+        && unit.chain(THREAD).is_ok();
+    let declared_in = |class: &str, name: &str, descriptor: &str| {
+        laid_out
+            && unit.chain(class).is_ok()
+            && unit.get(class).is_some_and(|c| {
+                c.fields.iter().any(|f| {
+                    f.name == name && f.descriptor == descriptor && f.access & ACC_STATIC == 0
+                })
+            })
+    };
+    let declared = |name: &str, descriptor: &str| declared_in(THREAD, name, descriptor);
+    if declared("eetop", "J") {
+        let _ = writeln!(
+            out,
+            "int64_t *jabs_thread_eetop_slot(jabs_object *thread) {{ return &(({} *)thread)->{}; }}",
+            object_struct(THREAD),
+            instance_field("eetop")
+        );
+    } else {
+        out.push_str("int64_t *jabs_thread_eetop_slot(jabs_object *thread) { (void)thread; jabs_not_compiled(\"Thread.eetop (java.lang.Thread without that field is not supported)\"); }\n");
+    }
+    // holder.threadStatus and holder.daemon: where JDK 25 keeps a platform thread's state.
+    if declared("interrupted", "Z") {
+        let _ = writeln!(
+            out,
+            "uint8_t *jabs_thread_interrupted_slot(jabs_object *thread) {{ return &(({} *)thread)->{}; }}",
+            object_struct(THREAD),
+            instance_field("interrupted")
+        );
+    } else {
+        out.push_str("uint8_t *jabs_thread_interrupted_slot(jabs_object *thread) { (void)thread; jabs_not_compiled(\"Thread.interrupted (java.lang.Thread without that field is not supported)\"); }\n");
+    }
+    let holder_fields = declared("holder", "Ljava/lang/Thread$FieldHolder;")
+        && declared_in(HOLDER, "threadStatus", "I")
+        && declared_in(HOLDER, "daemon", "Z");
+    if holder_fields {
+        let holder = format!(
+            "(({} *)((({} *)thread)->{}))",
+            object_struct(HOLDER),
+            object_struct(THREAD),
+            instance_field("holder")
+        );
+        let _ = writeln!(
+            out,
+            "int32_t *jabs_thread_status_slot(jabs_object *thread) {{ if (!(({} *)thread)->{}) return NULL; return &{holder}->{}; }}",
+            object_struct(THREAD),
+            instance_field("holder"),
+            instance_field("threadStatus")
+        );
+        let _ = writeln!(
+            out,
+            "bool jabs_thread_is_daemon(jabs_object *thread) {{ if (!(({} *)thread)->{}) jabs_not_compiled(\"Thread.start0 of a Thread without a FieldHolder\"); return {holder}->{} != 0; }}",
+            object_struct(THREAD),
+            instance_field("holder"),
+            instance_field("daemon")
+        );
+    } else {
+        out.push_str("int32_t *jabs_thread_status_slot(jabs_object *thread) { (void)thread; jabs_not_compiled(\"Thread.holder.threadStatus (java.lang.Thread without a FieldHolder is not supported)\"); }\n");
+        out.push_str("bool jabs_thread_is_daemon(jabs_object *thread) { (void)thread; jabs_not_compiled(\"Thread.holder.daemon (java.lang.Thread without a FieldHolder is not supported)\"); }\n");
+    }
+    // run() through Thread's vtable slot: a subclass keeps the slot index of the method it overrides.
+    let run_slot = if laid_out {
+        unit.vtable(THREAD).ok().and_then(|v| {
+            v.iter()
+                .position(|s| s.name == "run" && s.descriptor == "()V")
+        })
+    } else {
+        None
+    };
+    match run_slot {
+        Some(slot) => {
+            let _ = writeln!(
+                out,
+                "void jabs_thread_run_java(jabs_object *thread) {{ ((void (*)(jabs_object *))thread->cls->vtable[{slot}])(thread); }}"
+            );
+        }
+        None => out.push_str("void jabs_thread_run_java(jabs_object *thread) { (void)thread; jabs_not_compiled(\"Thread.run (java.lang.Thread is not in the unit)\"); }\n"),
+    }
+    let dispatch = (
+        THREAD.to_string(),
+        "dispatchUncaughtException".to_string(),
+        "(Ljava/lang/Throwable;)V".to_string(),
+    );
+    if methods.contains(&dispatch) {
+        let _ = writeln!(
+            out,
+            "bool jabs_thread_dispatch_uncaught(jabs_object *thread, jabs_object *uncaught) {{ {}(thread, uncaught); return true; }}",
+            symbol(&dispatch.0, &dispatch.1, &dispatch.2)
+        );
+    } else {
+        out.push_str("bool jabs_thread_dispatch_uncaught(jabs_object *thread, jabs_object *uncaught) { (void)thread; (void)uncaught; return false; }\n");
+    }
+    let exit = (THREAD.to_string(), "exit".to_string(), "()V".to_string());
+    if methods.contains(&exit) {
+        let _ = writeln!(
+            out,
+            "bool jabs_thread_exit_java(jabs_object *thread) {{ {}(thread); return true; }}",
+            symbol(&exit.0, &exit.1, &exit.2)
+        );
+    } else {
+        out.push_str(
+            "bool jabs_thread_exit_java(jabs_object *thread) { (void)thread; return false; }\n",
+        );
+    }
+    if registry {
+        out.push_str("jabs_object *jabs_static_monitor(const char *name, jabs_object *fallback) { (void)fallback; return jabs_class_object(name); }\n");
+    } else {
+        out.push_str("jabs_object *jabs_static_monitor(const char *name, jabs_object *fallback) { (void)name; return fallback; }\n");
+    }
+    if registry {
+        out.push_str("void jabs_thread_raise(int kind, const char *message) { jabs_raise_message(kind, message); }\n");
+    } else {
+        out.push_str("void jabs_thread_raise(int kind, const char *message) { (void)message; jabs_pending = jabs_vm_throwable(kind); }\n");
+    }
+    out
 }
 
 /// Classes whose initialization must precede this one's: the superclass, then (for classes)
@@ -6281,7 +6521,9 @@ fn init_prerequisites(unit: &Unit, class: &ClassFile) -> Vec<String> {
     out
 }
 
-/// Emit a class's static field storage and initialization function (JVMS 5.5, single-threaded).
+/// Emit a class's static field storage and initialization function (JVMS 5.5). The state and
+/// its lock live in the runtime (`jabs_class_init` in jabs_rt.h, the procedure in
+/// jabs_thread.c); an initialized class costs one acquire load.
 fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
     let init = init_symbol(&class.name);
     let state = format!("{init}_state");
@@ -6307,32 +6549,22 @@ fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
         } else if let Some(units) = constant_string(class, f) {
             let _ = writeln!(
                 constants,
-                "    {sym} = {}(); if (!{sym}) {{ {state} = 3; return -1; }}",
+                "    {sym} = {}(); if (!{sym}) {{ jabs_class_init_end(&{state}, false); return -1; }}",
                 literal_symbol(&units)
             );
         }
     }
-    let _ = writeln!(
-        out,
-        "\n/* 0 = uninitialized, 1 = initializing, 2 = initialized, 3 = erroneous. */"
-    );
-    let _ = writeln!(out, "static int {state};");
+    let _ = writeln!(out, "\nstatic jabs_class_init {state};");
     let _ = writeln!(out, "int {init}(void) {{");
-    let _ = writeln!(
-        out,
-        "    /* State 1 can only mean this thread is mid-initialization (no other threads exist yet). */"
-    );
-    let _ = writeln!(out, "    if ({state} == 1 || {state} == 2) return 0;");
-    let _ = writeln!(
-        out,
-        "    if ({state} == 3) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NO_CLASS_DEF_FOUND); return -1; }}"
-    );
-    let _ = writeln!(out, "    {state} = 1;");
+    let _ = writeln!(out, "    if (jabs_class_initialized(&{state})) return 0;");
+    let _ = writeln!(out, "    int step = jabs_class_init_begin(&{state});");
+    let _ = writeln!(out, "    if (step == JABS_INIT_DONE) return 0;");
+    let _ = writeln!(out, "    if (step != JABS_INIT_RUN) return -1;");
     // Superclass first, then superinterfaces with default methods (JVMS 5.5 step 7).
     for prerequisite in init_prerequisites(unit, class) {
         let _ = writeln!(
             out,
-            "    if ({}() != 0) {{ {state} = 3; return -1; }}",
+            "    if ({}() != 0) {{ jabs_class_init_end(&{state}, false); return -1; }}",
             init_symbol(&prerequisite)
         );
     }
@@ -6341,10 +6573,10 @@ fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
         let _ = writeln!(out, "    {}();", symbol(&class.name, "<clinit>", "()V"));
         let _ = writeln!(
             out,
-            "    if (jabs_pending) {{ jabs_pending = jabs_initializer_failure(jabs_pending); {state} = 3; return -1; }}"
+            "    if (jabs_pending) {{ jabs_pending = jabs_initializer_failure(jabs_pending); jabs_class_init_end(&{state}, false); return -1; }}"
         );
     }
-    let _ = writeln!(out, "    {state} = 2;");
+    let _ = writeln!(out, "    jabs_class_init_end(&{state}, true);");
     let _ = writeln!(out, "    return 0;\n}}\n");
 }
 
@@ -6893,6 +7125,29 @@ fn reachable(
         if !out.methods.insert(key.clone()) {
             continue;
         }
+        if key.0 == THREAD && key.1 == "start0" && key.2 == "()V" {
+            // jabs_thread_start calls run() virtually, then (as HotSpot's JavaThread::exit does)
+            // Thread.dispatchUncaughtException and Thread.exit.
+            for (name, descriptor) in [
+                ("exit", "()V"),
+                ("dispatchUncaughtException", "(Ljava/lang/Throwable;)V"),
+            ] {
+                let end = (THREAD.to_string(), name.to_string(), descriptor.to_string());
+                if compiled(&end) {
+                    work.push(end);
+                }
+            }
+            let run = ("run".to_string(), "()V".to_string());
+            if called.insert(run.clone()) {
+                for class in &out.instantiated {
+                    work.extend(
+                        implementations(class)
+                            .into_iter()
+                            .filter(|k| k.1 == run.0 && k.2 == run.1 && compiled(k)),
+                    );
+                }
+            }
+        }
         let Some(Ok((_, analyzed))) = results.get(&key) else {
             continue;
         };
@@ -7333,6 +7588,7 @@ pub fn compile_unit_with(
         emit_statics_and_init(&mut source, &unit, class);
     }
     emit_reached_stubs(&mut source, &unit, &results, &emission, &init_ok);
+    source.push_str(&thread_glue_functions(&unit, registry, &emission.methods));
     // Everything above the methods: shared declarations, then data and support definitions.
     let header_end = source
         .find(&format!("\n{}", "/* @@definitions@@ */"))

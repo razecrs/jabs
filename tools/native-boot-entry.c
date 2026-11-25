@@ -35,7 +35,11 @@ int main(int argc, char **argv) {
     }
     if (jc_net_2fminecraft_2fserver_2fMinecraftServer__init() != 0) { report("initializing MinecraftServer", jabs_pending); return 1; }
     jm_net_2fminecraft_2fserver_2fMinecraftServer__main___28_5bLjava_2flang_2fString_3b_29V(args);
-    if (jabs_pending) { report("main", jabs_pending); return 1; }
-    printf("main returned normally\n");
-    return 0;
+    int status = 0;
+    if (jabs_pending) { report("main", jabs_pending); status = 1; }
+    else printf("main returned normally; waiting for non-daemon threads\n");
+    fflush(stdout);
+    /* As the java launcher does: the server runs on its own "Server thread" after main returns. */
+    jabs_destroy_java_vm();
+    return status;
 }

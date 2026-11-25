@@ -5,7 +5,14 @@
 //! locally; set JABS_REQUIRE_TOOLS=1 (as CI does) to make that a failure.
 
 use jabs::{cgen, classfile::ClassFile};
-use std::{fmt::Write, fs, path::Path, process::Command};
+use std::{
+    fmt::Write,
+    fs,
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy)]
 enum Arg {
@@ -178,7 +185,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 15] = [
+const FIXTURE_SOURCES: [&str; 17] = [
     "Arith",
     "Statics",
     "BadInit",
@@ -194,10 +201,12 @@ const FIXTURE_SOURCES: [&str; 15] = [
     "Natives",
     "StackOps",
     "Programs",
+    "Threads",
+    "Joins",
 ];
 
 /// Whole programs from `Programs.java`: (class, `-D` properties, arguments).
-const PROGRAMS: [(&str, &[&str], &[&str]); 9] = [
+const PROGRAMS: [(&str, &[&str], &[&str]); 28] = [
     ("EchoArgs", &[], &[]),
     ("EchoArgs", &[], &["one", "two words", ""]),
     ("ExitCode", &[], &[]),
@@ -215,27 +224,168 @@ const PROGRAMS: [(&str, &[&str], &[&str]); 9] = [
         &["-Dnot.a.property"],
     ),
     ("Traces", &[], &[]),
+    // Threads.java: one mechanism each; where to look when one differs is in THREAD_PROGRAMS.
+    ("StartRunsOnOwnThread", &[], &[]),
+    ("StartTwiceThrows", &[], &[]),
+    ("UncaughtInOtherThread", &[], &[]),
+    ("NonDaemonOutlivesMain", &[], &[]),
+    ("DaemonDoesNotKeepProcess", &[], &[]),
+    ("SleepInterrupted", &[], &[]),
+    ("ClassInitOnceUnderThreads", &[], &[]),
+    ("ClassInitFailureOtherThread", &[], &[]),
+    ("ManyShortThreads", &[], &[]),
+    ("AvailableProcessors", &[], &[]),
+    // Joins.java: threads with real monitors (join, wait/notify, interrupting a wait).
+    ("JoinReturnsAfterRunThrows", &[], &[]),
+    ("JoinSeesResult", &[], &[]),
+    ("WaitInterrupted", &[], &[]),
+    ("HandOffWithNotify", &[], &[]),
+    ("ContendedSynchronizedCounter", &[], &[]),
+    ("NotifyWakesOne", &[], &[]),
+    ("TimedWaitWokenEarly", &[], &[]),
+    ("AtomicIntegerContention", &[], &[]),
+    ("VolatilePublication", &[], &[]),
 ];
+
+/// Where to look when a thread program differs from the JVM (or hangs), by class.
+const THREAD_PROGRAMS: [(&str, &str); 19] = [
+    (
+        "StartRunsOnOwnThread",
+        "jabs_thread_start/jabs_thread_main (current-thread record, eetop, threadStatus) in runtime/jabs_thread.c",
+    ),
+    (
+        "StartTwiceThrows",
+        "threadStatus set by jabs_thread_start before start() returns, runtime/jabs_thread.c",
+    ),
+    (
+        "UncaughtInOtherThread",
+        "jabs_thread_main's uncaught dispatch (jabs_thread_dispatch_uncaught glue in thread_glue_functions, src/cgen.rs)",
+    ),
+    (
+        "NonDaemonOutlivesMain",
+        "jabs_destroy_java_vm (main thread's end, waiting for non-daemon threads) in runtime/jabs_thread.c",
+    ),
+    (
+        "DaemonDoesNotKeepProcess",
+        "the non-daemon count (record->counted) in jabs_thread_start/jabs_thread_terminate, runtime/jabs_thread.c",
+    ),
+    (
+        "SleepInterrupted",
+        "jabs_thread_sleep and jabs_thread_interrupt in runtime/jabs_thread.c",
+    ),
+    (
+        "ClassInitOnceUnderThreads",
+        "jabs_class_init_begin/end in runtime/jabs_thread.c and the init function from emit_statics_and_init in src/cgen.rs",
+    ),
+    (
+        "ClassInitFailureOtherThread",
+        "the ERRONEOUS state in jabs_class_init_begin, runtime/jabs_thread.c",
+    ),
+    (
+        "ManyShortThreads",
+        "thread creation and termination (jabs_os_thread_spawn, jabs_thread_terminate) in runtime/jabs_thread.c",
+    ),
+    (
+        "AvailableProcessors",
+        "jabs_thread_processor_count in runtime/jabs_thread.c",
+    ),
+    (
+        "JoinReturnsAfterRunThrows",
+        "jabs_thread_terminate (monitor enter, TERMINATED, eetop cleared, notify_all) in runtime/jabs_thread.c",
+    ),
+    (
+        "JoinSeesResult",
+        "jabs_thread_terminate in runtime/jabs_thread.c, then Object.wait in runtime/jabs_sync.c",
+    ),
+    (
+        "WaitInterrupted",
+        "jabs_thread_interrupt -> jabs_sync_interrupt, and jabs_thread_wait_interrupted (wait0 intrinsic) in runtime/jabs_thread.c",
+    ),
+    (
+        "HandOffWithNotify",
+        "jabs_monitor_wait/notify_all in runtime/jabs_sync.c",
+    ),
+    (
+        "ContendedSynchronizedCounter",
+        "jabs_monitor_enter/exit in runtime/jabs_sync.c",
+    ),
+    (
+        "NotifyWakesOne",
+        "jabs_monitor_notify in runtime/jabs_sync.c",
+    ),
+    (
+        "TimedWaitWokenEarly",
+        "the timed path of jabs_monitor_wait in runtime/jabs_sync.c",
+    ),
+    (
+        "AtomicIntegerContention",
+        "Unsafe compare-and-set / getAndAdd intrinsics (atomic accesses in src/cgen.rs, jabs_rt.h)",
+    ),
+    (
+        "VolatilePublication",
+        "volatile field accesses compiled as seq_cst atomics (src/cgen.rs)",
+    ),
+];
+
+/// A whole-program run that has not ended by then is hung (each takes a few seconds at most).
+const PROGRAM_LIMIT: Duration = Duration::from_secs(60);
 
 /// The prefix the JVM's launcher puts before an exception that escaped `main`.
 const JVM_UNCAUGHT: &str = "Exception in thread \"main\" ";
 
-/// What a finished program left behind: stdout with normalized newlines, the exit status, and
-/// the class of an exception that escaped `main` (internal name), if one did.
+/// What a finished program left behind: stdout with normalized newlines, the exit status, the
+/// class of an exception that escaped `main` (internal name), if one did, and the first line the
+/// uncaught-exception handler printed for each other thread (`Exception in thread "name" ...`).
 #[derive(Debug, PartialEq, Eq)]
 struct Outcome {
     stdout: String,
     status: Option<i32>,
     uncaught: Option<String>,
+    other_threads_uncaught: Vec<String>,
 }
 
-/// Run a program to completion, whatever its exit status. `uncaught` is read from the first
-/// stderr line starting with `prefix`, up to the message.
-fn run_program(cmd: &mut Command, prefix: &str) -> Outcome {
-    let output = cmd
-        .output()
+/// Run a program to completion, whatever its exit status, killing it after PROGRAM_LIMIT so a
+/// hang fails the test (naming `what`). `uncaught` is read from the first stderr line starting
+/// with `prefix`, up to the message.
+fn run_program(cmd: &mut Command, prefix: &str, what: &str) -> Outcome {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap_or_else(|e| panic!("spawn {cmd:?}: {e}"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let out_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = out.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = err.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + PROGRAM_LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for program") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = out_reader.join().unwrap();
+    let stderr = err_reader.join().unwrap();
+    let stderr = String::from_utf8_lossy(&stderr);
+    let Some(status) = status else {
+        panic!(
+            "{what}: hung, killed after {PROGRAM_LIMIT:?}\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&stdout)
+        );
+    };
     let mut uncaught = None;
     for line in stderr.lines() {
         let Some(rest) = line.strip_prefix(prefix) else {
@@ -245,19 +395,24 @@ fn run_program(cmd: &mut Command, prefix: &str) -> Outcome {
         uncaught = Some(name.replace('.', "/"));
         break;
     }
+    let other_threads_uncaught = stderr
+        .lines()
+        .filter(|l| l.starts_with("Exception in thread \"") && !l.starts_with(JVM_UNCAUGHT))
+        .map(|l| l.trim_end().to_string())
+        .collect();
     Outcome {
-        stdout: String::from_utf8(output.stdout)
-            .unwrap()
-            .replace("\r\n", "\n"),
-        status: output.status.code(),
+        stdout: String::from_utf8(stdout).unwrap().replace("\r\n", "\n"),
+        status: status.code(),
         uncaught,
+        other_threads_uncaught,
     }
 }
 
 /// The native entry point for one program, shaped like the `java` launcher: leading `-Dkey=value`
 /// arguments are system properties and `--` ends them; then start the VM, build `String[] args`
 /// from the rest, initialize the class and call `main`, and report an escaping exception the
-/// way the JVM does (status 1).
+/// way the JVM does (status 1); then, like the launcher's DestroyJavaVM, wait for every
+/// non-daemon thread.
 fn program_harness(class: &str) -> String {
     let record = cgen::class_record("java/lang/String");
     format!(
@@ -283,13 +438,23 @@ int main(int argc, char **argv) {{
     }}
     if ({init}() == 0) {main}(args);
     fflush(stdout);
-    if (jabs_pending) {{ fprintf(stderr, "uncaught %s\n", jabs_pending->cls->name); return 1; }}
-    return 0;
+    int status = 0;
+    if (jabs_pending) {{ fprintf(stderr, "uncaught %s\n", jabs_pending->cls->name); status = 1; }}
+    jabs_destroy_java_vm();
+    return status;
 }}
 "#,
         init = cgen::init_symbol(class),
         main = cgen::symbol(class, "main", "([Ljava/lang/String;)V"),
     )
+}
+
+/// Where to look when a program differs: the thread programs name their mechanism.
+fn look_for(class: &str) -> &'static str {
+    THREAD_PROGRAMS
+        .iter()
+        .find(|(c, _)| *c == class)
+        .map_or("the program's output above", |(_, look)| look)
 }
 
 /// Fixtures that need a newer language level (records, pattern switches, indy string concat).
@@ -953,7 +1118,11 @@ fn native_matches_reference_jvm() {
         .args(&objects)
         .arg("-o")
         .arg(&exe)
-        .args(if cfg!(windows) { None } else { Some("-lm") }));
+        .args(if cfg!(windows) {
+            &[][..]
+        } else {
+            &["-pthread", "-lm"][..]
+        }));
     eprintln!(
         "clang ({} files, parallel): {:.1?}",
         sources.len(),
@@ -1192,7 +1361,11 @@ fn native_matches_reference_jvm() {
             .args(&shared)
             .arg("-o")
             .arg(&program)
-            .args(if cfg!(windows) { None } else { Some("-lm") }));
+            .args(if cfg!(windows) {
+                &[][..]
+            } else {
+                &["-pthread", "-lm"][..]
+            }));
         let jvm = run_program(
             Command::new("java")
                 .args(&properties)
@@ -1201,6 +1374,7 @@ fn native_matches_reference_jvm() {
                 .arg(class)
                 .args(*args),
             JVM_UNCAUGHT,
+            &format!("{class} on the JVM"),
         );
         let native = run_program(
             Command::new(&program)
@@ -1208,10 +1382,13 @@ fn native_matches_reference_jvm() {
                 .arg("--")
                 .args(*args),
             "uncaught ",
+            &format!("{class} natively (look at {})", look_for(class)),
         );
         assert_eq!(
-            native, jvm,
-            "{class} {defines:?} {args:?}: native differs from the JVM"
+            native,
+            jvm,
+            "{class} {defines:?} {args:?}: native differs from the JVM (look at {})",
+            look_for(class)
         );
         jvm_runs.push(jvm);
     }
@@ -1251,6 +1428,52 @@ fn native_matches_reference_jvm() {
             "java.lang.NumberFormatException.forInputString\n",
             "main\n"
         )
+    );
+    // Guard that the thread programs reach what they are about on the JVM itself.
+    let thread_run = |class: &str| {
+        let n = PROGRAMS.iter().position(|p| p.0 == class).unwrap();
+        &jvm_runs[n]
+    };
+    assert_eq!(
+        thread_run("StartRunsOnOwnThread").stdout,
+        "NEW false\nTERMINATED false\ntrue true worker\nmain true true\n"
+    );
+    assert_eq!(
+        thread_run("UncaughtInOtherThread").other_threads_uncaught,
+        ["Exception in thread \"worker\" java.lang.IllegalStateException: boom"]
+    );
+    assert_eq!(
+        thread_run("NonDaemonOutlivesMain").stdout,
+        "main returns\nworker saw main end\n"
+    );
+    assert_eq!(
+        thread_run("SleepInterrupted").stdout,
+        "sleep interrupted false\n"
+    );
+    assert_eq!(
+        thread_run("ClassInitOnceUnderThreads").stdout,
+        "42 42 42 42 42 42 42 42 runs=1\n"
+    );
+    assert_eq!(
+        thread_run("JoinReturnsAfterRunThrows").stdout,
+        "joined TERMINATED false\n"
+    );
+    assert_eq!(
+        thread_run("WaitInterrupted").stdout,
+        "InterruptedException false\n"
+    );
+    assert_eq!(thread_run("HandOffWithNotify").stdout, "499500\n");
+    assert_eq!(
+        thread_run("ContendedSynchronizedCounter").stdout,
+        "400000\n"
+    );
+    assert_eq!(thread_run("NotifyWakesOne").stdout, "1 4\n");
+    assert_eq!(thread_run("TimedWaitWokenEarly").stdout, "woken early\n");
+    assert_eq!(thread_run("AtomicIntegerContention").stdout, "400000\n");
+    assert_eq!(thread_run("VolatilePublication").stdout, "42\n");
+    assert_eq!(
+        thread_run("ClassInitFailureOtherThread").stdout,
+        "main: ExceptionInInitializerError\nworker: NoClassDefFoundError runs=1\n"
     );
     eprintln!(
         "{} programs identical between the JVM and native code: {:.1?}",

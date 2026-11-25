@@ -10,6 +10,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -50,8 +51,9 @@ typedef struct jabs_object {
     /* 0 until the object is first locked, then the 1-based index of its monitor in
      * runtime/jabs_sync.c's table (set once, atomically; read with acquire order). */
     uint32_t monitor;
-    /* Identity hash code, assigned on first request (0 = not yet assigned). */
-    uint32_t hash;
+    /* Identity hash code, assigned on first request (0 = not yet assigned). Atomic: two threads
+     * asking at once must agree on one value. */
+    _Atomic uint32_t hash;
 } jabs_object;
 
 typedef union jabs_value {
@@ -65,8 +67,9 @@ typedef union jabs_value {
 /* Internal class name of the pending exception, or NULL. */
 /* The exception being thrown (a Throwable object), or NULL. */
 extern _Thread_local jabs_object *jabs_pending;
-/* The method whose code last raised a VM exception (a breadcrumb until stack traces exist). */
-extern const char *jabs_where;
+/* The method whose code last raised a VM exception on this thread (a breadcrumb until stack
+ * traces exist). */
+extern _Thread_local const char *jabs_where;
 
 /* Exceptions the runtime itself raises, by kind. The generated unit defines jabs_vm_throwable,
  * which allocates an instance of the JDK class when it is in the unit. Constructors are not run
@@ -89,7 +92,8 @@ enum {
     JABS_VM_CLASS_NOT_FOUND,
     JABS_VM_INSTANTIATION,
     JABS_VM_FILE_NOT_FOUND,
-    JABS_VM_SYNC_FAILED
+    JABS_VM_SYNC_FAILED,
+    JABS_VM_INTERRUPTED
 };
 jabs_object *jabs_vm_throwable(int kind);
 /* Whether a thrown object is a java.lang.Error (which class initialization passes through unwrapped). */
@@ -103,12 +107,85 @@ jabs_object *jabs_cause_of(jabs_object *o);
 static inline jabs_object *jabs_new(const jabs_class *cls);
 /* The canonical String with the same contents (String.intern; literals use it too). */
 jabs_object *jabs_string_intern(jabs_object *s);
-/* Bytes of Java objects allocated so far. With no garbage collector the heap only grows, so this
- * is Runtime.totalMemory (and freeMemory is 0). */
-extern int64_t jabs_heap_bytes;
+/* Bytes of Java objects allocated so far, by every thread. With no garbage collector the heap
+ * only grows, so this is Runtime.totalMemory (and freeMemory is 0). */
+extern _Atomic int64_t jabs_heap_bytes;
+
+/* Runtime locks (jabs_thread.c) for the tables every thread shares: the Class registry, the
+ * String intern table and the sorting of the frame table. A holder never runs Java code, never
+ * raises an exception and never takes another runtime lock, so these cannot deadlock. */
+enum { JABS_LOCK_CLASSES, JABS_LOCK_STRINGS, JABS_LOCK_FRAMES, JABS_LOCK_COUNT };
+void jabs_lock(int which);
+void jabs_unlock(int which);
 /* Class (internal name) that called the @CallerSensitive method now running; see
  * Reflection.getCallerClass. Set at each call site of such a method. */
 extern _Thread_local const char *jabs_caller;
+
+/* A class's initialization state (JVMS 5.5), one per class, zero-initialized. `state` is read
+ * without a lock only on the fast path (an acquire load that sees JABS_CLASS_INITIALIZED, paired
+ * with the release store that ends initialization); every change to it, and `owner` (the thread
+ * running the initialization), happens in jabs_thread.c under the class-initialization lock. */
+enum { JABS_CLASS_UNINITIALIZED, JABS_CLASS_INITIALIZING, JABS_CLASS_INITIALIZED, JABS_CLASS_ERRONEOUS };
+typedef struct { _Atomic int32_t state; const void *owner; } jabs_class_init;
+static inline bool jabs_class_initialized(jabs_class_init *c) {
+    return atomic_load_explicit(&c->state, memory_order_acquire) == JABS_CLASS_INITIALIZED;
+}
+/* What the caller of jabs_class_init_begin does next: run the initialization (and then call
+ * jabs_class_init_end), return success (initialized, or this thread is already initializing it),
+ * or fail (erroneous: NoClassDefFoundError is pending). Another thread's initialization in
+ * progress is waited for inside jabs_class_init_begin. */
+enum { JABS_INIT_RUN, JABS_INIT_DONE, JABS_INIT_FAILED };
+int jabs_class_init_begin(jabs_class_init *c);
+void jabs_class_init_end(jabs_class_init *c, bool ok);
+
+/* Threads (jabs_thread.c). The java.lang.Thread of the calling thread: threads JABS started know
+ * theirs from the start; the main thread's is built on first request (jabs_main_thread, generated),
+ * which then calls jabs_thread_attach_main. */
+jabs_object *jabs_current_thread(void);
+void jabs_thread_attach_main(jabs_object *thread);
+/* Thread.start0: mark the thread alive and RUNNABLE, then run it on a new OS thread. */
+void jabs_thread_start(jabs_object *thread);
+/* What the java launcher does once main has returned (its uncaught exception, if any, already
+ * reported and cleared by the caller): end the main thread like any other (Thread.exit, then
+ * TERMINATED and join() waiters woken), then wait until no non-daemon thread runs
+ * (DestroyJavaVM). Daemon threads still running die with the process. */
+void jabs_destroy_java_vm(void);
+/* Thread.sleepNanos0: sleep, ending early with InterruptedException("sleep interrupted") when
+ * the thread is or becomes interrupted (the interrupt clears). 0 yields. */
+void jabs_thread_sleep(int64_t nanos);
+/* Thread.interrupt0: wake the thread if it sleeps (Thread.interrupt already set the flag). */
+void jabs_thread_interrupt(jabs_object *thread);
+/* Thread.clearInterruptEvent: the caller cleared the Java interrupt status; drop the monitors'
+ * pending interrupt mark too, so a later Object.wait does not see a stale interrupt. */
+void jabs_thread_clear_interrupt_event(void);
+/* Object.wait reported JABS_WAIT_INTERRUPTED: clear the interrupt status and raise
+ * InterruptedException, as HotSpot's ObjectMonitor::wait does. */
+void jabs_thread_wait_interrupted(void);
+void jabs_thread_yield(void);
+/* Name the calling OS thread (debuggers, ps); best effort, as in HotSpot. UTF-8. */
+void jabs_thread_set_native_name(const char *name);
+/* Processors this process may run on (Runtime.availableProcessors). */
+int32_t jabs_thread_processor_count(void);
+/* Generated glue the thread runtime uses (thread_glue_functions in cgen.rs): the main Thread, and
+ * where Thread.eetop lives (the JVM's "alive" marker: non-zero exactly while the thread runs). */
+jabs_object *jabs_main_thread(void);
+int64_t *jabs_thread_eetop_slot(jabs_object *thread);
+/* holder.threadStatus (NULL when the Thread has no holder) and holder.daemon. */
+int32_t *jabs_thread_status_slot(jabs_object *thread);
+bool jabs_thread_is_daemon(jabs_object *thread);
+/* Thread.interrupted, the interrupt status Thread.interrupt sets. */
+uint8_t *jabs_thread_interrupted_slot(jabs_object *thread);
+/* thread.run() (virtual), Thread.dispatchUncaughtException and Thread.exit. The last two return
+ * false when the method was not compiled into the program. */
+void jabs_thread_run_java(jabs_object *thread);
+bool jabs_thread_dispatch_uncaught(jabs_object *thread, jabs_object *uncaught);
+bool jabs_thread_exit_java(jabs_object *thread);
+/* Raise a VM exception with a message when the unit can build Strings, else without one. */
+void jabs_thread_raise(int kind, const char *message);
+/* The monitor a static synchronized method of class `name` locks: its Class object, as
+ * synchronized (X.class) does; `fallback` when the program has no Class registry (then nothing
+ * else can name the class's monitor). NULL with an exception pending if creating it failed. */
+jabs_object *jabs_static_monitor(const char *name, jabs_object *fallback);
 
 /* Exception a failed static initializer reports (JVMS 5.5 step 11): Errors pass through,
  * anything else becomes ExceptionInInitializerError. */
@@ -189,13 +266,15 @@ static inline int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == 
 
 /* System properties from the command line, as `java -Dkey=value` gives them: each entry is
  * "key=value" ("key" alone means an empty value). Call before jabs_vm_startup; the strings must
- * outlive the program (argv does). Returns 0, or -1 if an entry has an empty key. */
+ * outlive the program (argv does). Returns 0, or -1 if an entry has an empty key. Written once
+ * before any second thread exists, read-only afterwards. */
 int jabs_set_command_line_properties(int count, const char *const *defines);
 extern int jabs_define_count;
 extern const char *const *jabs_defines;
 
-/* Set by programs whose class registry can name Java frames (jabs_vm_startup does it): prints
- * the Java methods on the current stack to stderr before an uncompiled method stops the program. */
+/* Set by programs whose class registry can name Java frames (jabs_vm_startup does it, before any
+ * second thread exists): prints the Java methods on the current stack to stderr before an
+ * uncompiled method stops the program. */
 extern void (*jabs_on_not_compiled)(void);
 void jabs_print_java_stack(void);
 /* Throwable.fillInStackTrace(int) and StackTraceElement.initStackTraceElements: the stack as the
@@ -472,7 +551,7 @@ static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, i
         return NULL;
     }
     jabs_array *a = (jabs_array *)calloc(1, header + (size_t)length * element_size);
-    if (a) jabs_heap_bytes += (int64_t)(header + (size_t)length * element_size);
+    if (a) atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)(header + (size_t)length * element_size), memory_order_relaxed);
     if (!a) {
         jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
@@ -590,7 +669,7 @@ static inline void (*jabs_itable_find(const jabs_object *o, uint64_t selector))(
 
 static inline jabs_object *jabs_new(const jabs_class *cls) {
     jabs_object *o = (jabs_object *)calloc(1, cls->size);
-    if (o) jabs_heap_bytes += (int64_t)cls->size;
+    if (o) atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)cls->size, memory_order_relaxed);
     if (!o) {
         jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
@@ -601,16 +680,20 @@ static inline jabs_object *jabs_new(const jabs_class *cls) {
 
 /* ---- Native methods implemented by the runtime (JVM intrinsics) ---- */
 
-/* Identity hash: stable per object, never 0, distinct for consecutive requests. */
-extern uint32_t jabs_hash_next;
+/* Identity hash: stable per object, never 0, distinct for consecutive requests on one thread.
+ * Each thread has its own xorshift state (as HotSpot's default hashCode mode does), so threads
+ * never contend on it; the first value stored in the object wins if two threads race. */
+extern _Thread_local uint32_t jabs_hash_next;
 static inline int32_t jabs_identity_hash(jabs_object *o) {
-    if (o->hash == 0) {
-        jabs_hash_next ^= jabs_hash_next << 13;
-        jabs_hash_next ^= jabs_hash_next >> 17;
-        jabs_hash_next ^= jabs_hash_next << 5;
-        o->hash = jabs_hash_next ? (jabs_hash_next & 0x7fffffffu) | 1u : 1u;
-    }
-    return (int32_t)o->hash;
+    uint32_t hash = atomic_load_explicit(&o->hash, memory_order_relaxed);
+    if (hash != 0) return (int32_t)hash;
+    jabs_hash_next ^= jabs_hash_next << 13;
+    jabs_hash_next ^= jabs_hash_next >> 17;
+    jabs_hash_next ^= jabs_hash_next << 5;
+    uint32_t mine = jabs_hash_next ? (jabs_hash_next & 0x7fffffffu) | 1u : 1u;
+    uint32_t expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&o->hash, &expected, mine, memory_order_relaxed, memory_order_relaxed)) return (int32_t)mine;
+    return (int32_t)expected;
 }
 
 /* Size in bytes of one element of an array, from its descriptor. */
@@ -679,11 +762,11 @@ static inline jabs_object *jabs_clone(jabs_object *o) {
         size = o->cls->size;
     }
     jabs_object *copy = (jabs_object *)malloc(size);
-    if (copy) jabs_heap_bytes += (int64_t)size;
+    if (copy) atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)size, memory_order_relaxed);
     if (!copy) { jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }
     memcpy(copy, o, size);
     copy->monitor = 0;
-    copy->hash = 0;
+    atomic_store_explicit(&copy->hash, 0, memory_order_relaxed);
     return copy;
 }
 

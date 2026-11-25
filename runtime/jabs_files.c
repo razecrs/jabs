@@ -14,7 +14,8 @@
 #endif
 #include "jabs_unit.h"
 
-static char error_text[512];
+/* Per thread, like errno: a thread reads the reason for its own last failure. */
+static _Thread_local char error_text[512];
 
 const char *jabs_files_error(void) { return error_text; }
 

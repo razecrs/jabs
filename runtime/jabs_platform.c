@@ -20,11 +20,14 @@ static char *utf8_from_wide(const wchar_t *w) {
     return s;
 }
 
-/* An environment variable as UTF-8, or NULL. */
+/* An environment variable as UTF-8, or NULL. The buffer is per call: threads may ask at once. */
 static char *env_utf8(const wchar_t *name) {
-    static wchar_t buffer[32768];
+    wchar_t *buffer = (wchar_t *)malloc(32768 * sizeof(wchar_t));
+    if (!buffer) return NULL;
     DWORD n = GetEnvironmentVariableW(name, buffer, 32768);
-    return n == 0 || n >= 32768 ? NULL : utf8_from_wide(buffer);
+    char *value = n == 0 || n >= 32768 ? NULL : utf8_from_wide(buffer);
+    free(buffer);
+    return value;
 }
 
 /* Windows version numbers without the compatibility shims GetVersionEx applies. */
@@ -84,12 +87,15 @@ const char *jabs_platform_value(int which) {
     case JABS_PLATFORM_LIBRARY_PREFIX: return "";
     case JABS_PLATFORM_LIBRARY_SUFFIX: return ".dll";
     case JABS_PLATFORM_EXE_DIR: {
-        static wchar_t path[32768];
+        wchar_t *path = (wchar_t *)malloc(32768 * sizeof(wchar_t));
+        if (!path) return NULL;
         DWORD n = GetModuleFileNameW(NULL, path, 32768);
-        if (n == 0 || n >= 32768) return NULL;
+        if (n == 0 || n >= 32768) { free(path); return NULL; }
         wchar_t *slash = wcsrchr(path, L'\\');
         if (slash) *slash = 0;
-        return utf8_from_wide(path);
+        char *dir = utf8_from_wide(path);
+        free(path);
+        return dir;
     }
     default: break;
     }
@@ -138,13 +144,14 @@ int64_t jabs_nano_time(void) {
 
 /* The CRT opens the standard streams in text mode, which turns every LF written to them into
    CR LF; Java already writes its own line separator, so the JVM writes them raw. Switch each to
-   binary once, flushing C stdio's buffered text first so nothing written before changes. */
+   binary once, flushing C stdio's buffered text first so nothing written before changes.
+   Threads may race to switch the same stream; switching it twice is harmless. */
 static void jabs_std_binary(int32_t fd) {
-    static int done[3];
-    if (fd < 0 || fd > 2 || done[fd]) return;
+    static _Atomic int done[3];
+    if (fd < 0 || fd > 2 || atomic_load_explicit(&done[fd], memory_order_acquire)) return;
     if (fd == 1) fflush(stdout);
     if (fd == 2) fflush(stderr);
-    if (_setmode(fd, _O_BINARY) != -1) done[fd] = 1;
+    if (_setmode(fd, _O_BINARY) != -1) atomic_store_explicit(&done[fd], 1, memory_order_release);
 }
 
 int64_t jabs_platform_write(int32_t fd, const void *data, size_t length) {
@@ -164,19 +171,28 @@ int64_t jabs_platform_write(int32_t fd, const void *data, size_t length) {
 #include <sys/utsname.h>
 #include <unwind.h>
 
+/* A malloc'd copy, so no buffer is shared between threads; NULL for NULL or no memory. */
+static char *copy_text(const char *text) {
+    if (!text) return NULL;
+    size_t n = strlen(text) + 1;
+    char *s = (char *)malloc(n);
+    if (s) memcpy(s, text, n);
+    return s;
+}
+
 const char *jabs_platform_value(int which) {
-    static char cwd[4096];
-    static struct utsname host;
+    char cwd[4096];
+    struct utsname host;
     switch (which) {
     case JABS_PLATFORM_FILE_SEPARATOR: return "/";
     case JABS_PLATFORM_LINE_SEPARATOR: return "\n";
     case JABS_PLATFORM_PATH_SEPARATOR: return ":";
     case JABS_PLATFORM_TMPDIR: return "/tmp";
-    case JABS_PLATFORM_OS_NAME: return uname(&host) == 0 ? host.sysname : NULL;
-    case JABS_PLATFORM_OS_VERSION: return uname(&host) == 0 ? host.release : NULL;
+    case JABS_PLATFORM_OS_NAME: return uname(&host) == 0 ? copy_text(host.sysname) : NULL;
+    case JABS_PLATFORM_OS_VERSION: return uname(&host) == 0 ? copy_text(host.release) : NULL;
     case JABS_PLATFORM_NATIVE_ENCODING:
     case JABS_PLATFORM_JNU_ENCODING: return "UTF-8";
-    case JABS_PLATFORM_USER_DIR: return getcwd(cwd, sizeof cwd);
+    case JABS_PLATFORM_USER_DIR: return getcwd(cwd, sizeof cwd) ? copy_text(cwd) : NULL;
     case JABS_PLATFORM_USER_HOME: return getenv("HOME");
     case JABS_PLATFORM_USER_NAME: return getenv("USER");
     case JABS_PLATFORM_LANGUAGE: return "en";
