@@ -17,20 +17,34 @@ The architecture and rollout are in [PLAN.md](PLAN.md).
   C11 with Java semantics: primitive arithmetic and control flow, static
   fields and class initialization across classes (superclass first, JVMS 5.5),
   objects with inheritance (constructors, fields, vtables with Java's override
-  rules, `super` calls), `instanceof`/checkcast, and null checks. A bytecode
-  verifier proves every path type-correct against the class hierarchy before
-  any pointer code is emitted. Classes outside the unit (the JDK, other jars)
-  are opaque. A vtable slot whose implementation did not compile holds a stub
-  that stops with a diagnostic (abstract slots throw `AbstractMethodError`), so
-  a class's generated code never depends on which subclasses exist and stays
-  cacheable per class. Every uncompiled method is listed with its reason. No
-  garbage collector yet. A differential test runs 2,903 cases on the reference
-  JVM and as native code and requires bit-identical results.
+  rules, `super` calls), `instanceof`/checkcast, null checks, arrays, exception
+  handlers and `synchronized` methods (monitors are single-threaded).
+  `invokedynamic` is translated at compile time for lambdas and method
+  references, string concatenation, records' `equals`/`hashCode`/`toString` and
+  pattern switches; other bootstraps leave the method unsupported, with the
+  reason. A bytecode verifier proves every path type-correct against the class
+  hierarchy before any pointer code is emitted. Classes outside the unit are
+  opaque; with `--jdk`, the JDK's `java.base` is compiled into the unit. A vtable
+  slot whose implementation did not compile holds a stub that stops with a
+  diagnostic (abstract slots throw `AbstractMethodError`), so a class's generated
+  code never depends on which subclasses exist and stays cacheable per class.
+  Every uncompiled method is listed with its reason. No garbage collector or
+  threads yet. A differential test runs every fixture case on the reference JVM
+  and as native code and requires bit-identical results.
+- `coverage`: compiles a whole jar (optionally with `java.base`) without writing C
+  and ranks what blocks the rest. For each blocker category it reports the
+  methods unsupported for that reason, the compiled methods that can reach it,
+  and the ones it alone keeps from being self-contained, most unlocked first.
 - `run`: launches a vanilla **server** profile on the JVM after rehashing every
   artifact, with the main class from the jar manifest and a required exact Java
   version. `--until-ready` reports wall-clock time to the server's `Done` line and
   stops it cleanly. JABS never accepts the Minecraft EULA for you: the server's
   `eula.txt` must already say `eula=true`.
+- `client`: installs and launches a vanilla client on the JVM the way the official
+  launcher does, checking every file against Mojang's published SHA-1, or launches a
+  CurseForge instance through the mod loader version that launcher installed
+  (used read-only, its libraries verified). Sign-in is offline only, so servers
+  must have `online-mode=false`.
 
 Launch optimizations (each opt-in per profile under `launch.optimizations`, and
 reported per run):
@@ -47,8 +61,8 @@ reported per run):
 Measured results live in [`benchmarks/`](benchmarks/), one dated report per run with
 method, raw numbers, machine and caveats. See `examples/server-profile.json`.
 
-JABS **does not launch clients or mod loaders yet, verify bytecode, compile object-using Java,
-or execute mods natively**. `prepare` caches integrity
+JABS **does not run threads, collect garbage, or execute Minecraft or mods natively
+yet**: `run` and `client` launch them on the JVM. `prepare` caches integrity
 metadata only. It reports zero compiled units. `run` requires a `launch` section.
 No performance advantage has been measured.
 
@@ -112,7 +126,9 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Tests use temporary synthetic artifacts, not Minecraft files. They cover pinned
 identity, profile validation, cache reuse/invalidation, corrupted records,
-percentile definitions, invalid timings and CLI failure behavior.
+percentile definitions, invalid timings and CLI failure behavior. The
+differential test also needs `javac`, `java` (21 or later) and `clang` on PATH and
+is skipped without them; set `JABS_REQUIRE_TOOLS` to make a missing tool an error.
 
 Next: typed IR from method bytecode, wiring `inspect-jar` into profile
-inspection, then baseline capture and reference-JVM conformance testing.
+inspection, then baseline capture.

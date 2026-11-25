@@ -301,8 +301,9 @@ fn execute(cli: Cli) -> Result<()> {
             print_json(
                 serde_json::json!({ "schema_version": 1, "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH, "tools": tools,
-                "capabilities": ["profile_integrity", "metadata_cache", "measurement_summary", "jar_inventory", "single_class_compilation_with_objects", "vanilla_server_launch"],
-                "unimplemented": ["mod_loader_launch", "class_loaders", "threads", "unsafe", "invokedynamic", "cross_class_compilation", "arrays", "garbage_collection", "exception_handlers", "benchmark_capture"],
+                "capabilities": ["profile_integrity", "metadata_cache", "measurement_summary", "jar_inventory", "unit_compilation", "objects", "arrays", "exception_handlers", "synchronized_single_threaded", "invokedynamic_lambdas_concat_records_switches", "java_base_compilation", "coverage_blast_radius", "vanilla_server_launch", "vanilla_client_launch", "mod_loader_launch_on_jvm"],
+                "partial": ["unsafe", "reflection", "class_loaders"],
+                "unimplemented": ["threads", "garbage_collection", "runtime_class_definition", "native_minecraft_execution", "benchmark_capture"],
                 "note": "tool discovery does not establish target or Java-version compatibility" }),
             )
         }
