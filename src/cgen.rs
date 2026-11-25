@@ -535,6 +535,15 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "(void)a3; return jabs_class_for_name(a0, a1, a2);",
         needs_classes: true,
     },
+    Intrinsic {
+        key: (
+            "java/lang/ClassLoader",
+            "findBootstrapClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+        ),
+        body: "return jabs_find_bootstrap_class(a0);",
+        needs_classes: true,
+    },
     // jabs.rt.Natives: the app class loader's view of compiled-in classes and embedded resources.
     Intrinsic {
         key: (
@@ -5634,6 +5643,28 @@ jabs_object *jabs_class_for_name(jabs_object *binary, int32_t initialize, jabs_o
             jabs_not_compiled(message);
         }}
         if (e->init() != 0) return NULL;
+    }}
+    return jabs_class_object(name);
+}}
+
+/* ClassLoader.findBootstrapClass(name): the boot loader's class of that binary name without
+ * initializing it, or null when it has none. Callers probe candidate names (resource bundles try
+ * FormatData_en_US and its fallbacks), so a missing class is null, not an exception, and the
+ * application's classes are invisible to the boot loader. A JDK class in the unit that was not
+ * compiled in stops instead of answering null, which would quietly change what the program does. */
+jabs_object *jabs_find_bootstrap_class(jabs_object *binary) {{
+    char name[1024];
+    if (!binary) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    if (!jabs_string_to_ascii(binary, name, sizeof name)) return NULL;
+    for (char *p = name; *p; p++) if (*p == '.') *p = '/';
+    if (name[0] == '[') return jabs_class_object(name);
+    const char *key = name;
+    if (!bsearch(&key, jabs_unit_class_names, {known_count}, sizeof(char *), jabs_compare_names)) return NULL;
+    if (jabs_is_app_class(name)) return NULL;
+    if (!jabs_record_named(name)) {{
+        char message[1100];
+        snprintf(message, sizeof message, "ClassLoader.findBootstrapClass(\"%s\") (the class was not compiled into this program)", name);
+        jabs_not_compiled(message);
     }}
     return jabs_class_object(name);
 }}

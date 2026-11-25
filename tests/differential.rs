@@ -206,7 +206,7 @@ const FIXTURE_SOURCES: [&str; 17] = [
 ];
 
 /// Whole programs from `Programs.java`: (class, `-D` properties, arguments).
-const PROGRAMS: [(&str, &[&str], &[&str]); 28] = [
+const PROGRAMS: [(&str, &[&str], &[&str]); 29] = [
     ("EchoArgs", &[], &[]),
     ("EchoArgs", &[], &["one", "two words", ""]),
     ("ExitCode", &[], &[]),
@@ -224,6 +224,7 @@ const PROGRAMS: [(&str, &[&str], &[&str]); 28] = [
         &["-Dnot.a.property"],
     ),
     ("Traces", &[], &[]),
+    ("BootstrapClasses", &[], &[]),
     // Threads.java: one mechanism each; where to look when one differs is in THREAD_PROGRAMS.
     ("StartRunsOnOwnThread", &[], &[]),
     ("StartTwiceThrows", &[], &[]),
@@ -386,6 +387,12 @@ fn run_program(cmd: &mut Command, prefix: &str, what: &str) -> Outcome {
             String::from_utf8_lossy(&stdout)
         );
     };
+    // A native program that reached code JABS does not compile prints "jabs: ..." and the Java
+    // stack before stopping; show it, since the mismatch message points here and stderr is
+    // otherwise only scanned for uncaught exceptions.
+    if stderr.lines().any(|line| line.starts_with("jabs:")) {
+        eprintln!("{what}: the program stopped in JABS; its stderr:\n{stderr}");
+    }
     let mut uncaught = None;
     for line in stderr.lines() {
         let Some(rest) = line.strip_prefix(prefix) else {
@@ -458,7 +465,7 @@ fn look_for(class: &str) -> &'static str {
 }
 
 /// Fixtures that need a newer language level (records, pattern switches, indy string concat).
-const MODERN_FIXTURE_SOURCES: [&str; 3] = ["Indy", "Views", "Atomics"];
+const MODERN_FIXTURE_SOURCES: [&str; 4] = ["Indy", "Views", "Atomics", "BootstrapClasses"];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
