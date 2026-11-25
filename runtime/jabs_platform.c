@@ -136,10 +136,8 @@ int64_t jabs_nano_time(void) {
     return (int64_t)ns;
 }
 
-/* The CRT opens the standard streams in text mode, which turns every "
-" written to them into
-   "
-"; Java already writes its own line separator, so the JVM writes them raw. Switch each to
+/* The CRT opens the standard streams in text mode, which turns every LF written to them into
+   CR LF; Java already writes its own line separator, so the JVM writes them raw. Switch each to
    binary once, flushing C stdio's buffered text first so nothing written before changes. */
 static void jabs_std_binary(int32_t fd) {
     static int done[3];
