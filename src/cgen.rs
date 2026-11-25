@@ -116,12 +116,20 @@ const INTRINSICS: &[Intrinsic] = &[
     },
     Intrinsic {
         key: ("java/lang/Object", "notify", "()V"),
-        body: "if (!jabs_monitor_holds(self)) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
+        body: "if (!jabs_monitor_notify(self)) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/Object", "notifyAll", "()V"),
-        body: "if (!jabs_monitor_holds(self)) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
+        body: "if (!jabs_monitor_notify_all(self)) jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE);",
+        needs_classes: false,
+    },
+    // Object.wait has already rejected a negative timeout. An interrupt needs Thread.interrupt
+    // and InterruptedException wired to jabs_sync_interrupt, which the threads work owns: until
+    // then nothing can interrupt a wait, and a reported interrupt stops rather than guess.
+    Intrinsic {
+        key: ("java/lang/Object", "wait0", "(J)V"),
+        body: "switch (jabs_monitor_wait(self, a0)) { case JABS_WAIT_NOT_OWNER: jabs_pending = jabs_vm_throwable(JABS_VM_ILLEGAL_MONITOR_STATE); return; case JABS_WAIT_INTERRUPTED: jabs_not_compiled(\"java/lang/Object.wait0 interrupted (InterruptedException is not wired to thread interruption yet)\"); default: return; }",
         needs_classes: false,
     },
     Intrinsic {

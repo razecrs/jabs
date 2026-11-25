@@ -180,6 +180,222 @@ static void monitor_blocks_until_owner_exits(void) {
     CHECK(h.other_result == 1, ENTER_EXIT, "another thread entered while the owner still held the monitor (expected to block until the final exit)");
 }
 
+/* ---- wait / notify ---- */
+
+#define WAIT_NOTIFY "jabs_monitor_wait/jabs_monitor_notify in runtime/jabs_sync.c"
+
+/* Lock `o` and come back once `ready` reached `count`. Waiters bump `ready` while they own the
+ * monitor and only release it by waiting, so owning it with ready == count means every one of
+ * them is in the wait set. Returns owning the monitor. */
+static void enter_when_waiting(jabs_object *o, int *ready, int count) {
+    for (;;) {
+        jabs_monitor_enter(o);
+        if (__atomic_load_n(ready, __ATOMIC_SEQ_CST) == count) return;
+        jabs_monitor_exit(o);
+        harness_sleep_ms(1);
+    }
+}
+
+typedef struct {
+    jabs_object *lock;
+    int ready;
+    int woke;
+    int results[8];
+    int other_held; /* the second thread saw itself as owner while the first waited */
+    jabs_sync_thread *waiter;
+} waiting;
+
+static void notifier_while_waiting(void *p) {
+    waiting *w = (waiting *)p;
+    enter_when_waiting(w->lock, &w->ready, 1);
+    w->other_held = jabs_monitor_holds(w->lock);
+    CHECK(jabs_monitor_notify(w->lock) == 1, WAIT_NOTIFY, "notify by the owner was refused");
+    CHECK(jabs_monitor_exit(w->lock) == 1, ENTER_EXIT, "exit after notify was refused");
+}
+
+static void wait_releases_all_levels_and_restores_count(void) {
+    waiting w = { fresh_object(), 0, 0, { 0 }, 0, NULL };
+    for (int i = 0; i < 3; i++) jabs_monitor_enter(w.lock);
+    harness_thread *t = harness_spawn(notifier_while_waiting, &w);
+    __atomic_store_n(&w.ready, 1, __ATOMIC_SEQ_CST);
+    int r = jabs_monitor_wait(w.lock, 0);
+    harness_join(t);
+    CHECK(w.other_held == 1, WAIT_NOTIFY, "another thread could not own the monitor while its owner waited with 3 levels entered (wait must release every level)");
+    CHECK(r == JABS_WAIT_NOTIFIED, WAIT_NOTIFY, "wait woken by notify: expected JABS_WAIT_NOTIFIED (%d), got %d", JABS_WAIT_NOTIFIED, r);
+    for (int i = 3; i > 0; i--) {
+        CHECK(jabs_monitor_holds(w.lock), WAIT_NOTIFY, "after wait the monitor was released with %d level(s) left (count not restored)", i);
+        CHECK(jabs_monitor_exit(w.lock) == 1, WAIT_NOTIFY, "exit %d after wait refused (count not restored)", 4 - i);
+    }
+    CHECK(jabs_monitor_exit(w.lock) == 0, WAIT_NOTIFY, "a fourth exit after wait succeeded: wait restored more levels than it released");
+}
+
+static void foreign_wait(void *p) {
+    waiting *w = (waiting *)p;
+    w->results[0] = jabs_monitor_wait(w->lock, 1);
+    w->results[1] = jabs_monitor_notify(w->lock);
+    w->results[2] = jabs_monitor_notify_all(w->lock);
+}
+
+static void wait_and_notify_need_ownership(void) {
+    jabs_object *never = fresh_object();
+    int r = jabs_monitor_wait(never, 1);
+    CHECK(r == JABS_WAIT_NOT_OWNER, WAIT_NOTIFY, "wait on a never-locked object: expected JABS_WAIT_NOT_OWNER, got %d", r);
+    CHECK(jabs_monitor_notify(never) == 0, WAIT_NOTIFY, "notify on a never-locked object: expected 0, got 1");
+    CHECK(jabs_monitor_notify_all(never) == 0, WAIT_NOTIFY, "notifyAll on a never-locked object: expected 0, got 1");
+    waiting w = { fresh_object(), 0, 0, { -1, -1, -1 }, 0, NULL };
+    jabs_monitor_enter(w.lock);
+    harness_join(harness_spawn(foreign_wait, &w));
+    CHECK(w.results[0] == JABS_WAIT_NOT_OWNER, WAIT_NOTIFY, "wait by a thread that does not own the monitor: expected JABS_WAIT_NOT_OWNER, got %d", w.results[0]);
+    CHECK(w.results[1] == 0 && w.results[2] == 0, WAIT_NOTIFY, "notify/notifyAll by a non-owner: expected 0/0, got %d/%d", w.results[1], w.results[2]);
+    CHECK(jabs_monitor_holds(w.lock), WAIT_NOTIFY, "the owner lost the monitor when another thread tried to wait on it");
+    jabs_monitor_exit(w.lock);
+    CHECK(jabs_monitor_wait(w.lock, 1) == JABS_WAIT_NOT_OWNER, WAIT_NOTIFY, "wait after the final exit was allowed");
+}
+
+static void timed_wait_times_out_after_the_limit(void) {
+    jabs_object *o = fresh_object();
+    jabs_monitor_enter(o);
+    jabs_monitor_enter(o);
+    int64_t start = harness_now_ms();
+    int r = jabs_monitor_wait(o, 50);
+    int64_t took = harness_now_ms() - start;
+    CHECK(r == JABS_WAIT_TIMED_OUT, WAIT_NOTIFY, "unnotified wait(50): expected JABS_WAIT_TIMED_OUT (%d), got %d", JABS_WAIT_TIMED_OUT, r);
+    /* GetTickCount64 ticks in ~16 ms steps; one step of slack, never more. */
+    CHECK(took >= 50 - 16, WAIT_NOTIFY, "wait(50) returned after %lld ms (too early: the deadline in jabs_monitor_wait)", (long long)took);
+    CHECK(jabs_monitor_exit(o) == 1 && jabs_monitor_exit(o) == 1, WAIT_NOTIFY, "a timed-out wait did not restore both levels");
+}
+
+static void notify_before_wait_is_not_remembered(void) {
+    jabs_object *o = fresh_object();
+    jabs_monitor_enter(o);
+    CHECK(jabs_monitor_notify(o) == 1 && jabs_monitor_notify_all(o) == 1, WAIT_NOTIFY, "notify with an empty wait set was refused");
+    int r = jabs_monitor_wait(o, 30);
+    CHECK(r == JABS_WAIT_TIMED_OUT, WAIT_NOTIFY, "a notify before the wait woke it: expected JABS_WAIT_TIMED_OUT, got %d", r);
+    jabs_monitor_exit(o);
+}
+
+enum { NOTIFY_WAITERS = 4 };
+
+static void counted_waiter(void *p) {
+    waiting *w = (waiting *)p;
+    jabs_monitor_enter(w->lock);
+    int me = __atomic_fetch_add(&w->ready, 1, __ATOMIC_SEQ_CST);
+    w->results[me] = jabs_monitor_wait(w->lock, 0);
+    __atomic_add_fetch(&w->woke, 1, __ATOMIC_SEQ_CST);
+    CHECK(jabs_monitor_holds(w->lock), WAIT_NOTIFY, "a waiter returned from wait without owning the monitor");
+    jabs_monitor_exit(w->lock);
+}
+
+static void notify_wakes_exactly_one_waiter(void) {
+    waiting w = { fresh_object(), 0, 0, { 0 }, 0, NULL };
+    harness_thread *t[NOTIFY_WAITERS];
+    for (int i = 0; i < NOTIFY_WAITERS; i++) t[i] = harness_spawn(counted_waiter, &w);
+    enter_when_waiting(w.lock, &w.ready, NOTIFY_WAITERS);
+    jabs_monitor_notify(w.lock);
+    jabs_monitor_exit(w.lock);
+    while (__atomic_load_n(&w.woke, __ATOMIC_SEQ_CST) < 1) harness_sleep_ms(1);
+    harness_sleep_ms(200); /* time for a wrongly woken second waiter to show up */
+    int woke = __atomic_load_n(&w.woke, __ATOMIC_SEQ_CST);
+    CHECK(woke == 1, WAIT_NOTIFY, "one notify with %d waiters: expected 1 to wake, %d woke", NOTIFY_WAITERS, woke);
+    jabs_monitor_enter(w.lock);
+    jabs_monitor_notify_all(w.lock);
+    jabs_monitor_exit(w.lock);
+    for (int i = 0; i < NOTIFY_WAITERS; i++) harness_join(t[i]);
+    for (int i = 0; i < NOTIFY_WAITERS; i++) {
+        CHECK(w.results[i] == JABS_WAIT_NOTIFIED, WAIT_NOTIFY, "waiter %d: expected JABS_WAIT_NOTIFIED, got %d", i, w.results[i]);
+    }
+}
+
+enum { ALL_WAITERS = 8 };
+
+static void notify_all_wakes_every_waiter(void) {
+    waiting w = { fresh_object(), 0, 0, { 0 }, 0, NULL };
+    harness_thread *t[ALL_WAITERS];
+    for (int i = 0; i < ALL_WAITERS; i++) t[i] = harness_spawn(counted_waiter, &w);
+    enter_when_waiting(w.lock, &w.ready, ALL_WAITERS);
+    CHECK(jabs_monitor_notify_all(w.lock) == 1, WAIT_NOTIFY, "notifyAll by the owner was refused");
+    jabs_monitor_exit(w.lock);
+    for (int i = 0; i < ALL_WAITERS; i++) harness_join(t[i]);
+    for (int i = 0; i < ALL_WAITERS; i++) {
+        CHECK(w.results[i] == JABS_WAIT_NOTIFIED, WAIT_NOTIFY, "waiter %d after notifyAll: expected JABS_WAIT_NOTIFIED, got %d", i, w.results[i]);
+    }
+}
+
+/* Two threads take turns through one monitor with plain notify. A lost wakeup leaves both
+ * waiting forever, which the watchdog turns into a failure. */
+enum { PING_PONG_ROUNDS = 20000 };
+typedef struct { jabs_object *lock; int turn; } ping_pong;
+typedef struct { ping_pong *game; int me; } player;
+
+static void play(void *p) {
+    player *pl = (player *)p;
+    ping_pong *g = pl->game;
+    for (int i = 0; i < PING_PONG_ROUNDS; i++) {
+        jabs_monitor_enter(g->lock);
+        for (int spins = 0; g->turn != pl->me; spins++) {
+            int r = jabs_monitor_wait(g->lock, 0);
+            CHECK(r == JABS_WAIT_NOTIFIED, WAIT_NOTIFY, "round %d: untimed wait ended with %d instead of a notification", i, r);
+            CHECK(spins < 2, WAIT_NOTIFY, "round %d: woken %d times without the turn changing (wakeup for the wrong thread)", i, spins + 1);
+        }
+        g->turn = 1 - pl->me;
+        jabs_monitor_notify(g->lock);
+        jabs_monitor_exit(g->lock);
+    }
+}
+
+static void wait_notify_ping_pong_loses_no_wakeups(void) {
+    ping_pong g = { fresh_object(), 0 };
+    player a = { &g, 0 }, b = { &g, 1 };
+    harness_thread *ta = harness_spawn(play, &a);
+    harness_thread *tb = harness_spawn(play, &b);
+    harness_join(ta);
+    harness_join(tb);
+}
+
+/* ---- the interrupt hook ---- */
+
+#define INTERRUPT "jabs_sync_interrupt and the wait loop in jabs_monitor_wait (runtime/jabs_sync.c)"
+
+static void interruptible_waiter(void *p) {
+    waiting *w = (waiting *)p;
+    jabs_monitor_enter(w->lock);
+    __atomic_store_n(&w->waiter, jabs_sync_current(), __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&w->ready, 1, __ATOMIC_SEQ_CST);
+    w->results[0] = jabs_monitor_wait(w->lock, 0);
+    w->results[1] = jabs_monitor_holds(w->lock);
+    w->results[2] = jabs_sync_clear_interrupt(jabs_sync_current());
+    jabs_monitor_exit(w->lock);
+}
+
+static void interrupt_wakes_a_waiting_thread(void) {
+    waiting w = { fresh_object(), 0, 0, { -1, -1, -1 }, 0, NULL };
+    harness_thread *t = harness_spawn(interruptible_waiter, &w);
+    enter_when_waiting(w.lock, &w.ready, 1);
+    jabs_monitor_exit(w.lock);
+    jabs_sync_interrupt(__atomic_load_n(&w.waiter, __ATOMIC_SEQ_CST));
+    harness_join(t);
+    CHECK(w.results[0] == JABS_WAIT_INTERRUPTED, INTERRUPT, "interrupted wait: expected JABS_WAIT_INTERRUPTED (%d), got %d", JABS_WAIT_INTERRUPTED, w.results[0]);
+    CHECK(w.results[1] == 1, INTERRUPT, "an interrupted wait returned without owning the monitor");
+    CHECK(w.results[2] == 0, INTERRUPT, "the interrupt was still pending after wait reported it (wait must consume it)");
+}
+
+static void interrupt_before_wait_returns_at_once(void) {
+    jabs_object *o = fresh_object();
+    jabs_monitor_enter(o);
+    jabs_sync_interrupt(jabs_sync_current());
+    int r = jabs_monitor_wait(o, 0);
+    CHECK(r == JABS_WAIT_INTERRUPTED, INTERRUPT, "wait with an interrupt already pending: expected JABS_WAIT_INTERRUPTED, got %d", r);
+    CHECK(jabs_monitor_holds(o), INTERRUPT, "wait refused for a pending interrupt but released the monitor");
+    jabs_sync_interrupt(jabs_sync_current());
+    CHECK(jabs_sync_clear_interrupt(jabs_sync_current()), INTERRUPT, "jabs_sync_clear_interrupt lost a pending interrupt");
+    r = jabs_monitor_wait(o, 20);
+    CHECK(r == JABS_WAIT_TIMED_OUT, INTERRUPT, "wait after the interrupt was cleared: expected JABS_WAIT_TIMED_OUT, got %d", r);
+    jabs_monitor_exit(o);
+    jabs_sync_interrupt(jabs_sync_current());
+    r = jabs_monitor_wait(o, 0);
+    CHECK(r == JABS_WAIT_NOT_OWNER, INTERRUPT, "wait without ownership and with an interrupt pending: expected JABS_WAIT_NOT_OWNER first (as the JVM), got %d", r);
+}
+
 typedef struct { const char *name; void (*run)(void); } harness_test;
 static const harness_test tests[] = {
     { "monitor_excludes_concurrent_owners", monitor_excludes_concurrent_owners },
@@ -188,6 +404,15 @@ static const harness_test tests[] = {
     { "monitor_unlocked_object_is_not_owned", monitor_unlocked_object_is_not_owned },
     { "monitor_exit_by_non_owner_is_refused", monitor_exit_by_non_owner_is_refused },
     { "monitor_blocks_until_owner_exits", monitor_blocks_until_owner_exits },
+    { "wait_releases_all_levels_and_restores_count", wait_releases_all_levels_and_restores_count },
+    { "wait_and_notify_need_ownership", wait_and_notify_need_ownership },
+    { "timed_wait_times_out_after_the_limit", timed_wait_times_out_after_the_limit },
+    { "notify_before_wait_is_not_remembered", notify_before_wait_is_not_remembered },
+    { "notify_wakes_exactly_one_waiter", notify_wakes_exactly_one_waiter },
+    { "notify_all_wakes_every_waiter", notify_all_wakes_every_waiter },
+    { "wait_notify_ping_pong_loses_no_wakeups", wait_notify_ping_pong_loses_no_wakeups },
+    { "interrupt_wakes_a_waiting_thread", interrupt_wakes_a_waiting_thread },
+    { "interrupt_before_wait_returns_at_once", interrupt_before_wait_returns_at_once },
 };
 
 int main(int argc, char **argv) {

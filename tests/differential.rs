@@ -178,7 +178,7 @@ fn arith_cases() -> Vec<(&'static str, Vec<Arg>)> {
 }
 
 /// Fixture sources; every class they define is compiled together as one unit.
-const FIXTURE_SOURCES: [&str; 13] = [
+const FIXTURE_SOURCES: [&str; 14] = [
     "Arith",
     "Statics",
     "BadInit",
@@ -189,6 +189,7 @@ const FIXTURE_SOURCES: [&str; 13] = [
     "Ifaces",
     "Exceptions",
     "Sync",
+    "Monitors",
     "Natives",
     "StackOps",
     "Programs",
@@ -538,6 +539,26 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     for x in [0, 7, -123] {
         out.push(("Indy", "concatConstants", vec![I(x)]));
     }
+    // wait/notify on one thread.
+    for name in [
+        "timedWaitReturnsOwningTheLock",
+        "monitorReentryRestoresCountAfterWait",
+        "waitWithNanosReturns",
+        "notifyBeforeWaitIsNotRemembered",
+        "synchronizedMethodWaits",
+        "waitWithoutLockThrows",
+        "waitForeverWithoutLockThrows",
+        "waitAfterExitThrows",
+        "waitOnOtherObjectThrows",
+        "waitNegativeWithoutLockThrows",
+        "waitNegativeThrows",
+        "waitBadNanosThrows",
+        "notifyOnOtherObjectThrows",
+        "notifyAllAfterExitThrows",
+        "waitOnNullThrows",
+    ] {
+        out.push(("Monitors", name, vec![]));
+    }
     // Byte-array view VarHandles: every view type and byte order at the first, an unaligned,
     // the last legal and the first illegal offset (10-byte array), plus -1.
     for (method, size) in [
@@ -651,6 +672,10 @@ fn where_to_look(class: &str) -> &'static str {
         "Views" => {
             " (byte-array view VarHandles: jabs_vh_address/jabs_var_handle_byte_view and \
              byte_view_access in src/cgen.rs, jabs_vh_view_load/store in runtime/jabs_rt.h)"
+        }
+        "Monitors" => {
+            " (wait/notify: jabs_monitor_wait/jabs_monitor_notify in runtime/jabs_sync.c, the \
+             Object.wait0/notify/notifyAll intrinsics in src/cgen.rs)"
         }
         "Sync" => {
             " (monitors: runtime/jabs_sync.c; monitorenter/monitorexit, emit_synchronized_wrapper \
@@ -974,6 +999,18 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         reference[at("Sync", "arrayKinds", Some(0))],
         format!("I {:08x}", 111)
+    );
+    assert_eq!(
+        reference[at("Monitors", "monitorReentryRestoresCountAfterWait", None)],
+        format!("I {:08x}", 110)
+    );
+    assert_eq!(
+        reference[at("Monitors", "waitForeverWithoutLockThrows", None)],
+        "throw java/lang/IllegalMonitorStateException"
+    );
+    assert_eq!(
+        reference[at("Monitors", "waitNegativeWithoutLockThrows", None)],
+        "throw java/lang/IllegalArgumentException"
     );
     assert_eq!(
         reference[at("Sync", "holdsLockFollowsLevels", None)],

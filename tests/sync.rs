@@ -189,3 +189,48 @@ fn monitor_exit_by_non_owner_is_refused() {
 fn monitor_blocks_until_owner_exits() {
     run("monitor_blocks_until_owner_exits");
 }
+
+#[test]
+fn wait_releases_all_levels_and_restores_count() {
+    run("wait_releases_all_levels_and_restores_count");
+}
+
+#[test]
+fn wait_and_notify_need_ownership() {
+    run("wait_and_notify_need_ownership");
+}
+
+#[test]
+fn timed_wait_times_out_after_the_limit() {
+    run("timed_wait_times_out_after_the_limit");
+}
+
+#[test]
+fn notify_before_wait_is_not_remembered() {
+    run("notify_before_wait_is_not_remembered");
+}
+
+#[test]
+fn notify_wakes_exactly_one_waiter() {
+    run("notify_wakes_exactly_one_waiter");
+}
+
+#[test]
+fn notify_all_wakes_every_waiter() {
+    run("notify_all_wakes_every_waiter");
+}
+
+#[test]
+fn wait_notify_ping_pong_loses_no_wakeups() {
+    run("wait_notify_ping_pong_loses_no_wakeups");
+}
+
+#[test]
+fn interrupt_wakes_a_waiting_thread() {
+    run("interrupt_wakes_a_waiting_thread");
+}
+
+#[test]
+fn interrupt_before_wait_returns_at_once() {
+    run("interrupt_before_wait_returns_at_once");
+}

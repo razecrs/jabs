@@ -520,10 +520,35 @@ void jabs_monitor_enter(jabs_object *o);
 int jabs_monitor_exit(jabs_object *o);
 /* Whether this thread owns the monitor (Thread.holdsLock). */
 int jabs_monitor_holds(jabs_object *o);
+/* notify / notifyAll: 1 = done (also when nobody waits; a notification is never remembered);
+ * 0 = this thread does not own the monitor (IllegalMonitorStateException). notify wakes the
+ * longest-waiting thread. */
+int jabs_monitor_notify(jabs_object *o);
+int jabs_monitor_notify_all(jabs_object *o);
+/* Object.wait: release the monitor completely, sleep until notified, interrupted or `millis`
+ * passed (0 = no limit; negative stops the program, Object.wait rejects it first), then own the
+ * monitor again at the same recursion depth. Never returns spuriously. Results: */
+enum {
+    JABS_WAIT_NOT_OWNER = 0,   /* nothing happened: IllegalMonitorStateException */
+    JABS_WAIT_NOTIFIED = 1,    /* woken by notify/notifyAll */
+    JABS_WAIT_TIMED_OUT = 2,   /* the time passed */
+    JABS_WAIT_INTERRUPTED = 3  /* an interrupt was pending or arrived (and is now consumed):
+                                  InterruptedException. A thread notified and interrupted at once
+                                  returns NOTIFIED and keeps the interrupt pending (JLS 17.2.4). */
+};
+int jabs_monitor_wait(jabs_object *o, int64_t millis);
 /* The calling OS thread as the monitors know it: created on first use, never freed, so the
  * pointer stays valid after the thread ends. */
 typedef struct jabs_sync_thread jabs_sync_thread;
 jabs_sync_thread *jabs_sync_current(void);
+/* The interrupt hook for the threads code. jabs_sync_interrupt marks the thread interrupted and
+ * wakes it if it is in jabs_monitor_wait (which then returns JABS_WAIT_INTERRUPTED); if it is
+ * not waiting, its next wait returns that at once. The mark is consumed by that wait or by
+ * jabs_sync_clear_interrupt, which returns whether it was set. Thread.interrupt should call the
+ * first after setting the Java `interrupted` field, and clearing that field the second (as
+ * Thread.clearInterruptEvent). Any thread may call either for any record. */
+void jabs_sync_interrupt(jabs_sync_thread *t);
+bool jabs_sync_clear_interrupt(jabs_sync_thread *t);
 
 /* invokeinterface: binary search the receiver's interface table; NULL if the class does not
  * implement a method with this selector (IncompatibleClassChangeError). */
