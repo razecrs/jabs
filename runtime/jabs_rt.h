@@ -10,6 +10,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -120,6 +121,9 @@ static inline jabs_object *jabs_initializer_failure(jabs_object *thrown) {
 /* Reinterpret raw IEEE bits as float/double (exact, including NaN payloads). */
 static inline float jabs_fbits(uint32_t bits) { float f; memcpy(&f, &bits, 4); return f; }
 static inline double jabs_dbits(uint64_t bits) { double d; memcpy(&d, &bits, 8); return d; }
+/* And back: the raw bits of a float/double (floatToRawIntBits: NaN payloads kept). */
+static inline uint32_t jabs_float_raw_bits(float f) { uint32_t bits; memcpy(&bits, &f, 4); return bits; }
+static inline uint64_t jabs_double_raw_bits(double d) { uint64_t bits; memcpy(&bits, &d, 8); return bits; }
 
 /* int */
 static inline int32_t jabs_iadd(int32_t a, int32_t b) { return (int32_t)((uint32_t)a + (uint32_t)b); }
@@ -277,12 +281,38 @@ int64_t jabs_platform_std_handle(int32_t fd);
 /* Write all bytes to a file descriptor; -1 on failure. */
 int64_t jabs_platform_write(int32_t fd, const void *data, size_t length);
 /* A VarHandle made by the runtime: what it reaches and the value type ('I', 'J', ..., 'L').
- * shape: 0 static field (address), 1 instance field (offset from the object), 2 array element. */
-typedef struct { char kind; uint8_t shape; int32_t scale; int64_t offset; void *address; } jabs_vh;
+ * shape: 0 static field (address), 1 instance field (offset from the object), 2 array element,
+ * 3 byte[] viewed as an array of `kind` (MethodHandles.byteArrayViewVarHandle): the index is a
+ * byte offset, `scale` the view type's size and `big_endian` its byte order. */
+enum { JABS_VH_STATIC = 0, JABS_VH_FIELD = 1, JABS_VH_ELEMENT = 2, JABS_VH_BYTE_VIEW = 3 };
+typedef struct { char kind; uint8_t shape; bool big_endian; int32_t scale; int64_t offset; void *address; } jabs_vh;
 /* The handle data of a runtime-made VarHandle; NULL for any other object. */
 const jabs_vh *jabs_vh_of(jabs_object *o);
-/* The accessed address; NULL with NullPointerException/ArrayIndexOutOfBounds pending. */
+/* The accessed address; NULL with NullPointerException, ClassCastException (a byte view given
+ * something other than a byte[]) or ArrayIndexOutOfBoundsException pending. */
 void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index);
+
+/* A byte view's element as raw bits, assembled byte by byte in the handle's order, so neither
+ * the host's byte order nor the element's alignment matters (views allow any byte offset). */
+static inline uint64_t jabs_vh_view_load(const jabs_vh *h, const void *p) {
+    if (h->scale < 1 || h->scale > 8) jabs_not_compiled("byte-array view VarHandle with a bad element size");
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t bits = 0;
+    for (int32_t i = 0; i < h->scale; i++) {
+        int32_t at = h->big_endian ? i : h->scale - 1 - i;
+        bits = (bits << 8) | b[at];
+    }
+    return bits;
+}
+static inline void jabs_vh_view_store(const jabs_vh *h, void *p, uint64_t bits) {
+    if (h->scale < 1 || h->scale > 8) jabs_not_compiled("byte-array view VarHandle with a bad element size");
+    uint8_t *b = (uint8_t *)p;
+    for (int32_t i = 0; i < h->scale; i++) {
+        int32_t at = h->big_endian ? h->scale - 1 - i : i;
+        b[at] = (uint8_t)bits;
+        bits >>= 8;
+    }
+}
 int32_t jabs_array_scale(jabs_object *array_class);
 
 /* Generated glue the java.io natives use (see io_accessor_functions in cgen.rs). */

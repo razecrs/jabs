@@ -600,6 +600,14 @@ const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
         "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
         "return jabs_var_handle_array(a0);",
     ),
+    // byte[] seen as an array of a wider primitive, in either byte order (jdk.internal.util's
+    // ByteArray and ByteArrayLittleEndian read DataInputStream's numbers through these).
+    (
+        "java/lang/invoke/VarHandles",
+        "byteArrayViewHandle",
+        "(Ljava/lang/Class;Z)Ljava/lang/invoke/VarHandle;",
+        "return jabs_var_handle_byte_view(a0, a1);",
+    ),
     // The JDK's version goes through Constructor objects and method handles; the effect is the
     // same: run the public no-arg constructor (its exceptions propagate unwrapped).
     // Not yet checked: the caller's access to the class and constructor.
@@ -3423,10 +3431,73 @@ fn var_handle_access(mode: &str, descriptor: &str, d: usize, exit: &str, npe: &s
         ),
         _ => return stop("an access mode this type does not support"),
     };
+    let view = byte_view_access(mode, op, value_ty, coordinates, base, handle, exit)
+        .unwrap_or_else(|| stop("only plain get and set reach a byte-array view handle"));
     format!(
-        "{{ if (!s[{handle}].a) {npe} const jabs_vh *h = jabs_vh_of(s[{handle}].a); if (!h || h->shape != {coordinates} || h->kind != '{kind}') {} {c} *p = ({c} *)jabs_vh_address(h, {object}, {index}); if (!p) {exit} {body} }}",
+        "{{ if (!s[{handle}].a) {npe} const jabs_vh *h = jabs_vh_of(s[{handle}].a); if (h && h->shape == JABS_VH_BYTE_VIEW) {{ {view} }} else {{ if (!h || h->shape != {coordinates} || h->kind != '{kind}') {} {c} *p = ({c} *)jabs_vh_address(h, {object}, {index}); if (!p) {exit} {body} }} }}",
         stop("a handle whose shape or type differs from the call site")
     )
+}
+
+/// The C for a plain get or set through a byte-array view handle (`JABS_VH_BYTE_VIEW`), or None
+/// when this call site cannot reach one that way: views have an array and an index as
+/// coordinates and a primitive wider than a byte as value. Accesses with a memory order
+/// (Volatile, Acquire, ...) and atomic updates need the JVM's alignment check and are not
+/// compiled yet.
+#[allow(clippy::too_many_arguments)]
+fn byte_view_access(
+    mode: &str,
+    op: VarHandleOp,
+    value_ty: char,
+    coordinates: usize,
+    base: usize,
+    handle: usize,
+    exit: &str,
+) -> Option<String> {
+    if coordinates != 2 || !matches!(mode, "get" | "set") {
+        return None;
+    }
+    // Raw bits to the Java value (sign- or zero-extended as the type requires), and back.
+    let (from_bits, to_bits) = match value_ty {
+        'C' => ("(int32_t)(uint16_t)bits", "(uint64_t)(uint16_t)v"),
+        'S' => ("(int32_t)(int16_t)(uint16_t)bits", "(uint64_t)(uint16_t)v"),
+        'I' => ("(int32_t)(uint32_t)bits", "(uint64_t)(uint32_t)v"),
+        'J' => ("(int64_t)bits", "(uint64_t)v"),
+        'F' => (
+            "jabs_fbits((uint32_t)bits)",
+            "(uint64_t)jabs_float_raw_bits(v)",
+        ),
+        'D' => ("jabs_dbits(bits)", "jabs_double_raw_bits(v)"),
+        _ => return None,
+    };
+    let mismatch = format!(
+        "jabs_not_compiled(\"VarHandle.{mode} (a byte-array view of another type than the call site's)\");"
+    );
+    let address = format!(
+        "if (h->kind != '{value_ty}') {mismatch} uint8_t *p = (uint8_t *)jabs_vh_address(h, s[{base}].a, s[{}].i); if (!p) {exit}",
+        base + 1
+    );
+    let slot = field(kind_of(value_ty)?);
+    match op {
+        VarHandleOp::Get => Some(format!(
+            "{address} uint64_t bits = jabs_vh_view_load(h, p); s[{handle}].{slot} = {from_bits};"
+        )),
+        VarHandleOp::Set => {
+            let c = match value_ty {
+                'C' => "uint16_t",
+                'S' => "int16_t",
+                'I' => "int32_t",
+                'J' => "int64_t",
+                'F' => "float",
+                _ => "double",
+            };
+            Some(format!(
+                "{c} v = ({c})s[{}].{slot}; {address} jabs_vh_view_store(h, p, {to_bits});",
+                base + 2
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Whether a call targets a `@CallerSensitive` method: those ask `Reflection.getCallerClass`,
@@ -5592,7 +5663,8 @@ fn var_handle_functions(unit: &Unit, recorded: &[&ClassFile], inits: &BTreeSet<S
             "const jabs_vh *jabs_vh_of(jabs_object *o) { (void)o; return NULL; }\n\
 void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index) { (void)h; (void)o; (void)index; return NULL; }\n\
 jabs_object *jabs_var_handle_field(jabs_object *a, jabs_object *b, jabs_object *c, int32_t s) { (void)a; (void)b; (void)c; (void)s; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n\
-jabs_object *jabs_var_handle_array(jabs_object *a) { (void)a; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n",
+jabs_object *jabs_var_handle_array(jabs_object *a) { (void)a; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n\
+jabs_object *jabs_var_handle_byte_view(jabs_object *a, int32_t b) { (void)a; (void)b; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n",
         );
         return out;
     }
@@ -5623,14 +5695,14 @@ jabs_object *jabs_var_handle_array(jabs_object *a) { (void)a; jabs_not_compiled(
         r#"/* Where a handle's jabs_vh sits: after VarHandle's own (unused) fields. */
 static size_t jabs_vh_offset(void) {{ return ({record}.size + 15) & ~(size_t)15; }}
 
-static jabs_object *jabs_vh_new(char kind, uint8_t shape, int64_t offset, void *address, int32_t scale) {{
+static jabs_object *jabs_vh_new(char kind, uint8_t shape, int64_t offset, void *address, int32_t scale, bool big_endian) {{
     size_t at = jabs_vh_offset();
     jabs_object *o = (jabs_object *)calloc(1, at + sizeof(jabs_vh));
     if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
     jabs_heap_bytes += (int64_t)(at + sizeof(jabs_vh));
     o->cls = &{record};
     jabs_vh *h = (jabs_vh *)((char *)o + at);
-    h->kind = kind; h->shape = shape; h->offset = offset; h->address = address; h->scale = scale;
+    h->kind = kind; h->shape = shape; h->offset = offset; h->address = address; h->scale = scale; h->big_endian = big_endian;
     return o;
 }}
 
@@ -5640,17 +5712,33 @@ const jabs_vh *jabs_vh_of(jabs_object *o) {{
 
 void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index) {{
     switch (h->shape) {{
-    case 0: return h->address;
-    case 1:
+    case JABS_VH_STATIC: return h->address;
+    case JABS_VH_FIELD:
         if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
         return (char *)o + h->offset;
-    default: {{
+    case JABS_VH_ELEMENT: {{
         if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
         jabs_array *a = (jabs_array *)o;
         if (index < 0 || index >= a->length) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return NULL; }}
         return (char *)jabs_array_data(a) + (size_t)index * (size_t)h->scale;
     }}
+    case JABS_VH_BYTE_VIEW: {{
+        /* The JDK's ArrayHandle order: cast to byte[] (ClassCastException; null passes), read
+         * the length (NullPointerException), then Preconditions.checkIndex(index,
+         * length - (size - 1)) (ArrayIndexOutOfBoundsException). */
+        if (o && (o->cls != jabs_array_class() || strcmp(((jabs_array *)o)->descriptor, "[B") != 0)) {{
+            jabs_pending = jabs_vm_throwable(JABS_VM_CLASS_CAST);
+            return NULL;
+        }}
+        if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+        jabs_array *a = (jabs_array *)o;
+        int64_t limit = (int64_t)a->length - (int64_t)(h->scale - 1);
+        if (index < 0 || (int64_t)index >= limit) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return NULL; }}
+        return (char *)jabs_array_data(a) + (size_t)index;
     }}
+    default: break;
+    }}
+    jabs_not_compiled("VarHandle access through a handle of unknown shape");
 }}
 
 /* The descriptor character of a Class used as a value type: 'I' for int.class, 'L' otherwise. */
@@ -5667,7 +5755,7 @@ jabs_object *jabs_var_handle_field(jabs_object *declaring, jabs_object *name, ja
     char kind = jabs_value_kind(type);
     if (!is_static) {{
         int64_t offset = jabs_field_offset(declaring, name);
-        return jabs_pending ? NULL : jabs_vh_new(kind, 1, offset, NULL, 0);
+        return jabs_pending ? NULL : jabs_vh_new(kind, JABS_VH_FIELD, offset, NULL, 0, false);
     }}
     char field[256];
     jabs_class_entry *e = jabs_class_entry_of(declaring);
@@ -5675,7 +5763,7 @@ jabs_object *jabs_var_handle_field(jabs_object *declaring, jabs_object *name, ja
     const jabs_init_entry *i = (const jabs_init_entry *)bsearch(e->name, jabs_init_functions, sizeof jabs_init_functions / sizeof *jabs_init_functions - 1, sizeof *i, jabs_compare_init);
     if (i && i->init() != 0) return NULL;
     for (const jabs_static_field *f = jabs_static_fields; f->class_name; f++) {{
-        if (strcmp(f->class_name, e->name) == 0 && strcmp(f->field_name, field) == 0) return jabs_vh_new(kind, 0, 0, f->address, 0);
+        if (strcmp(f->class_name, e->name) == 0 && strcmp(f->field_name, field) == 0) return jabs_vh_new(kind, JABS_VH_STATIC, 0, f->address, 0, false);
     }}
     jabs_not_compiled("findStaticVarHandle for a static field of a class whose initialization was not compiled");
 }}
@@ -5686,7 +5774,23 @@ jabs_object *jabs_var_handle_array(jabs_object *array_class) {{
     if (!e) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
     if (e->name[0] != '[') jabs_not_compiled("arrayElementVarHandle of a non-array class (IllegalArgumentException)");
     char kind = (e->name[1] == 'L' || e->name[1] == '[') ? 'L' : e->name[1];
-    return jabs_vh_new(kind, 2, 0, NULL, jabs_array_scale(array_class));
+    return jabs_vh_new(kind, JABS_VH_ELEMENT, 0, NULL, jabs_array_scale(array_class), false);
+}}
+
+/* VarHandles.byteArrayViewHandle, behind MethodHandles.byteArrayViewVarHandle (which has
+ * already rejected a null ByteOrder and turned it into `big_endian`). */
+jabs_object *jabs_var_handle_byte_view(jabs_object *view_array_class, int32_t big_endian) {{
+    jabs_class_entry *e = view_array_class ? jabs_class_entry_of(view_array_class) : NULL;
+    if (!e) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
+    if (e->name[0] != '[') jabs_not_compiled("byteArrayViewVarHandle of a non-array class (IllegalArgumentException)");
+    int32_t size = 0;
+    switch (e->name[1]) {{
+    case 'C': case 'S': size = 2; break;
+    case 'I': case 'F': size = 4; break;
+    case 'J': case 'D': size = 8; break;
+    default: jabs_not_compiled("byteArrayViewVarHandle of boolean[], byte[] or a reference array (UnsupportedOperationException)");
+    }}
+    return jabs_vh_new(e->name[1], JABS_VH_BYTE_VIEW, 0, NULL, size, big_endian != 0);
 }}
 "#,
         record = class_record(VAR_HANDLE),

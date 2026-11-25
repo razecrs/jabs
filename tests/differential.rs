@@ -291,7 +291,7 @@ int main(int argc, char **argv) {{
 }
 
 /// Fixtures that need a newer language level (records, pattern switches, indy string concat).
-const MODERN_FIXTURE_SOURCES: [&str; 1] = ["Indy"];
+const MODERN_FIXTURE_SOURCES: [&str; 2] = ["Indy", "Views"];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
@@ -528,6 +528,52 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     for x in [0, 7, -123] {
         out.push(("Indy", "concatConstants", vec![I(x)]));
     }
+    // Byte-array view VarHandles: every view type and byte order at the first, an unaligned,
+    // the last legal and the first illegal offset (10-byte array), plus -1.
+    for (method, size) in [
+        ("viewShortBigEndianGet", 2),
+        ("viewShortBigEndianSet", 2),
+        ("viewShortLittleEndianGet", 2),
+        ("viewShortLittleEndianSet", 2),
+        ("viewCharBigEndianGet", 2),
+        ("viewCharBigEndianSet", 2),
+        ("viewCharLittleEndianGet", 2),
+        ("viewCharLittleEndianSet", 2),
+        ("viewIntBigEndianGet", 4),
+        ("viewIntBigEndianSet", 4),
+        ("viewIntLittleEndianGet", 4),
+        ("viewIntLittleEndianSet", 4),
+        ("viewLongBigEndianGet", 8),
+        ("viewLongBigEndianSet", 8),
+        ("viewLongLittleEndianGet", 8),
+        ("viewLongLittleEndianSet", 8),
+        ("viewFloatBigEndianGet", 4),
+        ("viewFloatBigEndianSet", 4),
+        ("viewFloatLittleEndianGet", 4),
+        ("viewFloatLittleEndianSet", 4),
+        ("viewDoubleBigEndianGet", 8),
+        ("viewDoubleBigEndianSet", 8),
+        ("viewDoubleLittleEndianGet", 8),
+        ("viewDoubleLittleEndianSet", 8),
+    ] {
+        for offset in [0, 1, 10 - size, 11 - size, -1] {
+            out.push(("Views", method, vec![I(offset)]));
+        }
+    }
+    out.push(("Views", "viewGetOnNullArray", vec![]));
+    for offset in [0, 100] {
+        out.push(("Views", "viewGetOnIntArray", vec![I(offset)]));
+    }
+    for offset in [0, -1] {
+        out.push(("Views", "viewIntGetOnTwoBytes", vec![I(offset)]));
+        out.push(("Views", "viewLongSetOnEmpty", vec![I(offset)]));
+    }
+    for seed in [0i64, 1, -1, 0x7fc0_0001, i64::MIN, 0x1234_5678_9abc_def0] {
+        out.push(("Views", "dataStreamRoundTrip", vec![J(seed)]));
+    }
+    for skip in [0, 1, 4] {
+        out.push(("Views", "dataStreamReadsPattern", vec![I(skip)]));
+    }
     // Kept last: the assertion below checks these two outputs.
     // First use: ExceptionInInitializerError. Every later use: NoClassDefFoundError.
     out.extend([("BadInit", "get", vec![]), ("BadInit", "get", vec![])]);
@@ -587,6 +633,16 @@ int main(void) { return (int)fmod(1.0, 2.0); }
     panic!(
         "clang cannot build a C program with <math.h> for any known target; set JABS_CLANG_ARGS"
     );
+}
+
+/// For fixtures that test one runtime mechanism: the code to look at when a case differs.
+fn where_to_look(class: &str) -> &'static str {
+    match class {
+        "Views" => {
+            " (byte-array view VarHandles: jabs_vh_address/jabs_var_handle_byte_view and              byte_view_access in src/cgen.rs, jabs_vh_view_load/store in runtime/jabs_rt.h)"
+        }
+        _ => "",
+    }
 }
 
 /// Name of the printer function (in both runners) for a return type.
@@ -921,6 +977,28 @@ fn native_matches_reference_jvm() {
         reference[at("Natives", "className", None)],
         format!("I {:08x}", 1602)
     );
+    // Byte-array views: a known big-endian read, and the JVM's exceptions for an offset past the
+    // last whole element, a non-byte[] array, a null array and a short stream.
+    assert_eq!(
+        reference[at("Views", "viewIntBigEndianGet", Some(0))],
+        "I 81a6cbf0"
+    );
+    assert_eq!(
+        reference[at("Views", "viewIntBigEndianGet", Some(7))],
+        "throw java/lang/ArrayIndexOutOfBoundsException"
+    );
+    assert_eq!(
+        reference[at("Views", "viewGetOnIntArray", Some(100))],
+        "throw java/lang/ClassCastException"
+    );
+    assert_eq!(
+        reference[at("Views", "viewGetOnNullArray", None)],
+        "throw java/lang/NullPointerException"
+    );
+    assert_eq!(
+        reference[at("Views", "dataStreamReadsPattern", Some(1))],
+        "throw java/io/EOFException"
+    );
     // Guard that the fixture really exercises the failed-initialization path on the JVM.
     assert_eq!(
         reference[reference.len() - 2..],
@@ -934,7 +1012,12 @@ fn native_matches_reference_jvm() {
         .zip(reference.iter().zip(&native))
         .filter(|(_, (r, n))| r != n)
         .take(20)
-        .map(|((class, name, _), (r, n))| format!("{class}.{name}: jvm `{r}` native `{n}`"))
+        .map(|((class, name, _), (r, n))| {
+            format!(
+                "{class}.{name}: jvm `{r}` native `{n}`{}",
+                where_to_look(class)
+            )
+        })
         .collect();
     assert!(
         mismatches.is_empty(),
