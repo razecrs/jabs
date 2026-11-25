@@ -6794,6 +6794,10 @@ const PLATFORM_C: &str = include_str!("../runtime/jabs_platform.c");
 const FILES_C: &str = include_str!("../runtime/jabs_files.c");
 /// java.io natives' Java-side glue (handwritten, OS-neutral; needs the class registry).
 const IO_C: &str = include_str!("../runtime/jabs_io.c");
+/// Monitors and atomic accesses (handwritten, OS-specific).
+const SYNC_C: &str = include_str!("../runtime/jabs_sync.c");
+/// Java threads on OS threads (handwritten, OS-specific).
+const THREAD_C: &str = include_str!("../runtime/jabs_thread.c");
 
 /// What a program needs beyond its classes.
 #[derive(Default)]
@@ -7217,6 +7221,8 @@ pub fn compile_unit_with(
             resources_file(&extras.resources).replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &PLATFORM_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &FILES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                + &SYNC_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                + &THREAD_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &(if registry_emitted {
                     IO_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 } else {
@@ -7238,6 +7244,8 @@ pub fn compile_unit_with(
             files.push(("resources.c".to_string(), resources_file(&extras.resources)));
             files.push(("jabs_platform.c".to_string(), PLATFORM_C.to_string()));
             files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
+            files.push(("jabs_sync.c".to_string(), SYNC_C.to_string()));
+            files.push(("jabs_thread.c".to_string(), THREAD_C.to_string()));
             if registry_emitted {
                 files.push(("jabs_io.c".to_string(), IO_C.to_string()));
             }
