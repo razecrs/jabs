@@ -73,6 +73,12 @@ typedef struct jabs_rnest {
     uint32_t class_name, host;
 } jabs_rnest;
 
+/* A proxy class generated at build time (src/proxy.rs): its internal name and its interface
+ * list (internal names, in the order Proxy.newProxyInstance is given them). */
+typedef struct jabs_rproxy {
+    uint32_t name, interfaces;
+} jabs_rproxy;
+
 /* Calls a compiled method of one C shape: `fn` with the receiver (ignored for static shapes)
  * and the arguments, storing the result. */
 typedef void (*jabs_rcaller)(void (*fn)(void), jabs_object *self, const jabs_value *args, jabs_value *result);
@@ -89,6 +95,11 @@ extern const jabs_rconst jabs_rconsts[];
 extern const jabs_rnest jabs_rnests[];
 extern const uint32_t jabs_rnest_count;
 extern const jabs_rcaller jabs_rcallers[];
+extern const jabs_rproxy jabs_rproxies[];
+extern const uint32_t jabs_rproxy_count;
+/* One per jabs_rproxies row: the proxy's Constructor, made on first use. The only table written
+ * at run time: each slot changes once, from NULL, by compare-and-swap. */
+extern jabs_object *jabs_rproxy_constructors[];
 extern const uint32_t jabs_rcaller_count;
 
 /* Value kinds in descriptor order of the boxes and accessors below: Z B C S I J F D, then L. */
@@ -118,6 +129,7 @@ enum {
     JABS_RF_FIELD_ANNOTATIONS,
     JABS_RF_CONSTANT_POOL_OOP,
     JABS_RF_ACCESSOR_FIELD,              /* FieldAccessorImpl.field */
+    JABS_RF_OVERRIDE,                    /* AccessibleObject.override (a boolean) */
     JABS_RF_BOX_VALUE,                   /* + JABS_RK_Z..JABS_RK_D: Boolean.value .. Double.value */
     JABS_RF_COUNT = JABS_RF_BOX_VALUE + 8
 };
@@ -181,6 +193,9 @@ jabs_object *jabs_reflect_cp_utf8(jabs_object *oop, int32_t index);
 jabs_object *jabs_reflect_invoke(jabs_object *method, jabs_object *receiver, jabs_object *args);
 jabs_object *jabs_reflect_new_instance(jabs_object *constructor, jabs_object *args);
 jabs_object *jabs_reflect_new_field_accessor(jabs_object *field, int32_t read_only);
+/* Proxy.getProxyConstructor and ProxyBuilder.isProxyClass, answered from jabs_rproxies. */
+jabs_object *jabs_reflect_proxy_constructor(jabs_object *loader, jabs_object *interfaces);
+int32_t jabs_reflect_is_proxy_class(jabs_object *c);
 /* Field accessor leaves (the JDK's MethodHandle<T>FieldAccessorImpl get/set of its own type). */
 void *jabs_reflect_field_slot(jabs_object *accessor, jabs_object *o, int32_t for_set, int32_t *is_volatile);
 int32_t jabs_reflect_field_refuse_set(jabs_object *accessor, jabs_object *o, int kind, jabs_value value);

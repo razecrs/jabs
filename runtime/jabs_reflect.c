@@ -931,6 +931,88 @@ void jabs_reflect_field_set_object(jabs_object *accessor, jabs_object *o, jabs_o
     else *p = value;
 }
 
+/* ---- Proxies (classes generated at build time by src/proxy.rs) ----
+ *
+ * The JVM spins a proxy class per (class loader, interface list) at run time. JABS generated
+ * one per interface list the build could foresee; jabs_rproxies lists those compiled in. The
+ * class loader does not take part: a JABS program has one definition of every interface. */
+
+/* Whether row `p` is the proxy of exactly these interfaces, in this order. */
+static int proxy_row_matches(const jabs_rproxy *p, jabs_object *interfaces, int32_t count) {
+    uint32_t listed = p->interfaces ? jabs_rlists[p->interfaces] : 0;
+    if (count < 0 || listed != (uint32_t)count) return 0;
+    for (int32_t i = 0; i < count; i++) {
+        const char *name = name_of(elements(interfaces)[i], "Proxy interface list with a Class the registry did not make");
+        if (strcmp(name, jabs_rstrings + jabs_rlists[p->interfaces + 1 + (uint32_t)i]) != 0) return 0;
+    }
+    return 1;
+}
+
+/* Stop: the program asked for a proxy of a list the build did not generate. The message names
+ * the interfaces as Class.getName spells them. */
+static _Noreturn void proxy_not_generated(jabs_object *interfaces, int32_t count) {
+    static char message[2048];
+    size_t at = 0;
+    int n = snprintf(message, sizeof message, "java.lang.reflect.Proxy for interfaces [");
+    if (n > 0) at = (size_t)n;
+    for (int32_t i = 0; i < count && at < sizeof message; i++) {
+        const char *name = name_of(elements(interfaces)[i], "Proxy interface list with a Class the registry did not make");
+        n = snprintf(message + at, sizeof message - at, "%s%s", i ? ", " : "", name);
+        if (n < 0) break;
+        at += (size_t)n;
+    }
+    if (at < sizeof message) {
+        snprintf(message + at, sizeof message - at,
+                 "] (no proxy class was generated for this interface list at build time; src/proxy.rs decides the lists)");
+    }
+    for (char *p = message; *p; p++) if (*p == '/') *p = '.';
+    jabs_not_compiled(message);
+}
+
+/* Proxy.getProxyConstructor(loader, interfaces): the generated class's (InvocationHandler)
+ * constructor, made accessible as ProxyBuilder.build makes it. The same Constructor is
+ * returned every time, as the JDK's cache does. */
+jabs_object *jabs_reflect_proxy_constructor(jabs_object *loader, jabs_object *interfaces) {
+    (void)loader;
+    if (!interfaces) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }
+    int32_t count = ((jabs_array *)interfaces)->length;
+    /* ProxyBuilder reads every interface's name first: a null element is a NullPointerException. */
+    for (int32_t i = 0; i < count; i++) {
+        if (!elements(interfaces)[i]) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }
+    }
+    for (uint32_t r = 0; r < jabs_rproxy_count; r++) {
+        const jabs_rproxy *p = &jabs_rproxies[r];
+        if (!proxy_row_matches(p, interfaces, count)) continue;
+        jabs_object *cached = __atomic_load_n(&jabs_rproxy_constructors[r], __ATOMIC_ACQUIRE);
+        if (cached) return cached;
+        jabs_object *c = jabs_class_object(jabs_rstrings + p->name);
+        jabs_object *constructors = c ? jabs_reflect_declared_constructors(c, 0) : NULL;
+        if (!constructors) return NULL;
+        if (((jabs_array *)constructors)->length != 1) {
+            jabs_not_compiled_class("a generated proxy class without exactly one constructor", jabs_rstrings + p->name);
+        }
+        jabs_object *constructor = elements(constructors)[0];
+        *(uint8_t *)jabs_rf(constructor, JABS_RF_OVERRIDE) = 1;
+        /* Two threads may build one at once: the first stored is the one everybody gets. */
+        jabs_object *expected = NULL;
+        if (!__atomic_compare_exchange_n(&jabs_rproxy_constructors[r], &expected, constructor, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return expected;
+        }
+        return constructor;
+    }
+    proxy_not_generated(interfaces, count);
+}
+
+/* ProxyBuilder.isProxyClass(c): whether c is one of the generated proxy classes. */
+int32_t jabs_reflect_is_proxy_class(jabs_object *c) {
+    if (!c) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; }
+    const char *name = name_of(c, "ProxyBuilder.isProxyClass on a Class the registry did not make");
+    for (uint32_t r = 0; r < jabs_rproxy_count; r++) {
+        if (strcmp(name, jabs_rstrings + jabs_rproxies[r].name) == 0) return 1;
+    }
+    return 0;
+}
+
 #endif /* JABS_HAVE_REFLECTION */
 
 /* Keeps this file a valid translation unit in programs without reflection. */

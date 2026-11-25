@@ -1376,7 +1376,6 @@ pub struct CompiledUnit {
 
 /// Definitions of the runtime's globals; exactly one file of a program contains them.
 const RUNTIME_GLOBALS: &str = "_Thread_local jabs_object *jabs_pending;\n\
-const jabs_class jabs_array_class_record = { \"[\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 };\n\
 _Thread_local uint32_t jabs_hash_next = 0x9e3779b9u;\n\
 _Thread_local const char *jabs_where = \"\";\n\
 _Atomic int64_t jabs_heap_bytes;\n\
@@ -2712,6 +2711,12 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             frame
                 .stack
                 .push(VType::Obj(unit.intern(&format!("[{element}"))));
+        }
+        Op::MultiANewArray { class, dimensions } => {
+            for _ in 0..*dimensions {
+                frame.pop_prim(Kind::I, pc)?;
+            }
+            frame.stack.push(VType::Obj(unit.intern(class)));
         }
         Op::ArrayLength => {
             let array = frame.pop(pc)?;
@@ -4180,6 +4185,32 @@ fn emit_method(
                     c_escape(&element)
                 )
             }
+            Op::MultiANewArray {
+                class: descriptor,
+                dimensions,
+            } => {
+                let dimensions = usize::from(*dimensions);
+                let base = d - dimensions;
+                let counts: Vec<String> = (base..d).map(|i| format!("s[{i}].i")).collect();
+                let negative: Vec<String> = counts.iter().map(|c| format!("{c} < 0")).collect();
+                // The innermost element class's record: stores into the leaf arrays (and into
+                // rows of a one-level reference row type) are checked against it.
+                let element = descriptor.trim_start_matches('[');
+                let record = match element.strip_prefix('L').and_then(|e| e.strip_suffix(';')) {
+                    Some(e) if e != OBJECT && unit.get(e).is_some() && unit.chain(e).is_ok() => {
+                        format!("&{}", class_record(e))
+                    }
+                    _ => "NULL".to_string(),
+                };
+                // JVMS 6.5: every count is checked before anything is allocated.
+                format!(
+                    "if ({}) {} {{ const int32_t counts[{dimensions}] = {{ {} }}; s[{base}].a = jabs_multi_new_array(\"{}\", {dimensions}, counts, {record}); }} if (!s[{base}].a) {exit}",
+                    negative.join(" || "),
+                    throw("java/lang/NegativeArraySizeException", exit),
+                    counts.join(", "),
+                    c_escape(descriptor)
+                )
+            }
             Op::ArrayLength => {
                 let r = d - 1;
                 format!("if (!s[{r}].a) {npe} s[{r}].i = ((jabs_array *)s[{r}].a)->length;")
@@ -4630,10 +4661,45 @@ fn emit_stubs(
 }
 
 /// Emit the runtime record of an interface (used by instanceof, checkcast and array stores).
-fn emit_interface_record(out: &mut String, iface: &ClassFile) {
+/// An interface's runtime record. It lists every superinterface (transitively, as class records
+/// do), so an interface type is assignable to its superinterfaces: an `AnnTag[]` is an
+/// `Annotation[]`. Only superinterfaces that have records themselves are listed (all of them do
+/// when the unit has them: records include every superinterface of a recorded type).
+fn emit_interface_record(
+    out: &mut String,
+    unit: &Unit,
+    iface: &ClassFile,
+    recorded: &BTreeSet<&str>,
+) {
+    let supers: Vec<String> = unit
+        .superinterfaces(&iface.name)
+        .unwrap_or_default()
+        .iter()
+        .filter(|i| i.name != iface.name && recorded.contains(i.name.as_str()))
+        .map(|i| class_record(&i.name))
+        .collect();
+    let (list, count) = if supers.is_empty() {
+        ("NULL".to_string(), 0)
+    } else {
+        // Records are defined in name order: declare the ones this list points at first.
+        for s in &supers {
+            let _ = writeln!(out, "extern const jabs_class {s};");
+        }
+        let name = mangled("jn_", &[&iface.name]);
+        let _ = writeln!(
+            out,
+            "static const jabs_class *const {name}[] = {{ {} }};",
+            supers
+                .iter()
+                .map(|s| format!("&{s}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        (name, supers.len())
+    };
     let _ = writeln!(
         out,
-        "const jabs_class {} = {{ \"{}\", 0, NULL, NULL, NULL, 0, NULL, 0, 1, {} }};",
+        "const jabs_class {} = {{ \"{}\", 0, NULL, NULL, NULL, 0, {list}, {count}, 1, {} }};",
         class_record(&iface.name),
         c_escape(&iface.name),
         iface.access
@@ -4823,6 +4889,8 @@ struct RegistryInputs<'a> {
     /// Classes generated for invokedynamic (lambda proxies): hidden classes on the JVM, so their
     /// frames never appear in stack traces.
     hidden: &'a BTreeSet<String>,
+    /// Proxy classes generated at build time (proxy.rs).
+    proxies: &'a [crate::proxy::Generated],
 }
 
 fn emit_class_registry(
@@ -4838,6 +4906,7 @@ fn emit_class_registry(
         methods,
         interfaces,
         hidden,
+        proxies,
     } = *inputs;
     let class_struct = object_struct(CLASS);
     let string_struct = object_struct(STRING);
@@ -5202,6 +5271,7 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
             interfaces,
             methods,
             inits,
+            proxies,
         },
     ));
     out.push('\n');
@@ -5614,7 +5684,9 @@ jabs_object *jabs_reflect_new_array(jabs_object *component, int32_t length) {{
         }}
         return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ARRAY, element, stable, row);
     }}
-    if (e->record && !e->record->is_interface)
+    /* Interfaces too, as compiled anewarray does: jabs_is_instance answers for interface
+     * records (AnnotationParser makes Annotation[] and arrays of annotation types this way). */
+    if (e->record)
         return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_CLASS, e->record, stable, NULL);
     return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_UNCHECKED, NULL, stable, NULL);
 }}
@@ -7041,6 +7113,14 @@ struct Emission {
     inits: BTreeSet<String>,
 }
 
+/// Where reachability starts, and what it needs beyond the compiled methods.
+struct ReachFrom<'a> {
+    roots: &'a BTreeSet<String>,
+    extras: &'a UnitExtras,
+    /// What reflection and proxies add (src/cgen/reflect.rs).
+    reflect: reflect::ReachInputs<'a>,
+}
+
 /// Everything reachable from the root classes. `new K` makes K's compiled vtable implementations
 /// reachable, since virtual calls may now dispatch to them; vtables of classes never
 /// instantiated hold stubs, which no call can reach because no such object exists.
@@ -7050,9 +7130,13 @@ fn reachable(
     results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
     intrinsics: &HashMap<MethodKey, (String, bool)>,
     initializable: &BTreeSet<String>,
-    roots: &BTreeSet<String>,
-    extras: &UnitExtras,
+    from: &ReachFrom,
 ) -> Emission {
+    let ReachFrom {
+        roots,
+        extras,
+        reflect: reach_inputs,
+    } = from;
     let loaded = &extras.loaded_classes;
     let startup = extras.startup;
     let compiled = |k: &MethodKey| matches!(results.get(k), Some(Ok(_)));
@@ -7213,17 +7297,21 @@ fn reachable(
         let Some(key) = work.pop() else {
             // Reflection reaches code that no instruction names (src/cgen/reflect.rs): add it,
             // and stop only when it adds nothing.
-            let (classes, keys) = reflect::reach(
+            let reached = reflect::reach(
                 unit,
                 &out.records,
                 &out.instantiated,
                 &out.methods,
                 &compiled,
+                reach_inputs,
             );
-            if classes.is_empty() && keys.is_empty() {
+            if reached.is_empty() {
                 break;
             }
-            for class in classes {
+            for class in &reached.recorded {
+                add_records(class, &mut out.records);
+            }
+            for class in reached.instantiated {
                 add_records(&class, &mut out.records);
                 pending_inits.push(class.clone());
                 if out.instantiated.insert(class.clone()) {
@@ -7234,7 +7322,7 @@ fn reachable(
                     );
                 }
             }
-            work.extend(keys);
+            work.extend(reached.methods);
             continue;
         };
         if !out.methods.insert(key.clone()) {
@@ -7359,6 +7447,13 @@ fn reachable(
                         add_records(&c, &mut out.records);
                     }
                 }
+                Op::MultiANewArray { class, .. } => {
+                    if let Some(c) = element_class(class)
+                        .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
+                    {
+                        add_records(&c, &mut out.records);
+                    }
+                }
                 Op::ANewArray { class } | Op::CheckCast { class } | Op::InstanceOf { class }
                     if !class.starts_with('[') && unit.get(class).is_some() =>
                 {
@@ -7452,6 +7547,9 @@ pub fn compile_unit_with(
     // invokedynamic call sites become calls into generated classes (see indy.rs).
     let mut owned = classes.to_vec();
     let indy = crate::indy::desugar(&mut owned);
+    // java.lang.reflect.Proxy classes, generated for every interface list the program can ask
+    // for (see proxy.rs).
+    let proxies = crate::proxy::generate(&mut owned);
     let classes: &[ClassFile] = &owned;
     // A generated class is defined by its call site's class loader. desugar records the call
     // site of each one; the class name is not parsed, so no kind can be missed and no input
@@ -7460,6 +7558,17 @@ pub fn compile_unit_with(
     for (generated, call_site) in &indy.defined_by {
         if extras.app_classes.contains(call_site) {
             app_classes.insert(generated.clone());
+        }
+    }
+    // The JVM defines a proxy in the loader Proxy.newProxyInstance is given, which must see
+    // every interface: the app loader when one of them is an application class.
+    for proxy in &proxies.proxies {
+        if proxy
+            .interfaces
+            .iter()
+            .any(|i| extras.app_classes.contains(i))
+        {
+            app_classes.insert(proxy.name.clone());
         }
     }
     let unit = Unit::new(classes);
@@ -7582,8 +7691,14 @@ pub fn compile_unit_with(
             &results,
             &intrinsics,
             &initializable,
-            roots,
-            extras,
+            &ReachFrom {
+                roots,
+                extras,
+                reflect: reflect::ReachInputs {
+                    proxies: &proxies.proxies,
+                    annotation_loads: &crate::proxy::loaded_by_annotations(classes),
+                },
+            },
         ),
         None => Emission {
             methods: compiled.clone(),
@@ -7684,12 +7799,28 @@ pub fn compile_unit_with(
         }
     }
     for name in &interface_records {
-        emit_interface_record(&mut source, unit.get(name).unwrap());
+        emit_interface_record(
+            &mut source,
+            &unit,
+            unit.get(name).unwrap(),
+            &interface_records,
+        );
     }
     let recorded_names: BTreeSet<&str> = recorded.iter().map(|c| c.name.as_str()).collect();
     for class in &recorded {
         emit_class_record(&mut source, &unit, class, &live);
     }
+    // Arrays inherit Object's methods: a virtual call of hashCode, equals or toString on an
+    // array (an Object-typed receiver, as in HashMap.hash) dispatches through Object's vtable.
+    let array_vtable = if recorded_names.contains(OBJECT) {
+        mangled("jv_", &[OBJECT])
+    } else {
+        "NULL".to_string()
+    };
+    let _ = writeln!(
+        source,
+        "const jabs_class jabs_array_class_record = {{ \"[\", 0, {array_vtable}, NULL, NULL, 0, NULL, 0, 0, 0 }};"
+    );
     emit_vm_throwables(&mut source, &recorded_names);
     let mut literals: BTreeSet<Vec<u16>> = emission
         .methods
@@ -7714,10 +7845,12 @@ pub fn compile_unit_with(
         have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING);
     let registry_emitted = registry;
     emit_literals(&mut source, &literals, registry);
+    // Generated classes are left out of stack traces, as the JVM leaves out hidden classes.
     let hidden_classes: BTreeSet<String> = indy
         .defined_by
         .iter()
         .map(|(generated, _)| generated.clone())
+        .chain(proxies.proxies.iter().map(|p| p.name.clone()))
         .collect();
     if registry {
         emit_class_registry(
@@ -7731,6 +7864,7 @@ pub fn compile_unit_with(
                 methods: &emission.methods,
                 interfaces: &interface_records,
                 hidden: &hidden_classes,
+                proxies: &proxies.proxies,
             },
         );
     }

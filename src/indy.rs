@@ -99,7 +99,7 @@ enum Kind {
 }
 
 /// Start offsets of every instruction in a method's bytecode (empty if it is malformed).
-fn instruction_starts(code: &[u8]) -> Vec<usize> {
+pub(crate) fn instruction_starts(code: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();
     let mut pc = 0usize;
     let read_i32 = |at: usize| -> Option<i32> {
@@ -174,7 +174,7 @@ fn instruction_starts(code: &[u8]) -> Vec<usize> {
 }
 
 /// Utf8 text at a pool index.
-fn utf8(class: &ClassFile, index: u16) -> Option<&str> {
+pub(crate) fn utf8(class: &ClassFile, index: u16) -> Option<&str> {
     match class.pool.get(index as usize)? {
         Constant::Utf8(s) => Some(s),
         _ => None,
@@ -182,7 +182,7 @@ fn utf8(class: &ClassFile, index: u16) -> Option<&str> {
 }
 
 /// (name, descriptor) of a NameAndType constant.
-fn name_and_type(class: &ClassFile, index: u16) -> Option<(&str, &str)> {
+pub(crate) fn name_and_type(class: &ClassFile, index: u16) -> Option<(&str, &str)> {
     match class.pool.get(index as usize)? {
         Constant::NameAndType { name, descriptor } => {
             Some((utf8(class, *name)?, utf8(class, *descriptor)?))
@@ -192,7 +192,7 @@ fn name_and_type(class: &ClassFile, index: u16) -> Option<(&str, &str)> {
 }
 
 /// Internal name of a Class constant.
-fn class_name(class: &ClassFile, index: u16) -> Option<&str> {
+pub(crate) fn class_name(class: &ClassFile, index: u16) -> Option<&str> {
     match class.pool.get(index as usize)? {
         Constant::Class(n) => utf8(class, *n),
         _ => None,
@@ -334,7 +334,7 @@ fn translate(
 // ---- Descriptors ----
 
 /// Field-type descriptors of a method descriptor's parameters, and its return type.
-fn split_method(descriptor: &str) -> Option<(Vec<String>, String)> {
+pub(crate) fn split_method(descriptor: &str) -> Option<(Vec<String>, String)> {
     let inner = descriptor.strip_prefix('(')?;
     let close = inner.find(')')?;
     let (params, ret) = (&inner[..close], &inner[close + 1..]);
@@ -357,16 +357,16 @@ fn split_method(descriptor: &str) -> Option<(Vec<String>, String)> {
 }
 
 /// Local-variable slots a type takes.
-fn slots(ty: &str) -> u16 {
+pub(crate) fn slots(ty: &str) -> u16 {
     if ty == "J" || ty == "D" { 2 } else { 1 }
 }
 
-fn is_reference(ty: &str) -> bool {
+pub(crate) fn is_reference(ty: &str) -> bool {
     ty.starts_with('L') || ty.starts_with('[')
 }
 
 /// The class a reference descriptor names, for checkcast ("Ljava/lang/String;" -> "java/lang/String").
-fn reference_class(ty: &str) -> String {
+pub(crate) fn reference_class(ty: &str) -> String {
     if let Some(name) = ty.strip_prefix('L').and_then(|t| t.strip_suffix(';')) {
         name.to_string()
     } else {
@@ -375,7 +375,7 @@ fn reference_class(ty: &str) -> String {
 }
 
 /// The wrapper class of a primitive and the wrapper of a wrapper descriptor.
-fn wrapper_of(primitive: &str) -> Option<&'static str> {
+pub(crate) fn wrapper_of(primitive: &str) -> Option<&'static str> {
     Some(match primitive {
         "Z" => "java/lang/Boolean",
         "B" => "java/lang/Byte",
@@ -406,25 +406,25 @@ fn primitive_of_wrapper(ty: &str) -> Option<&'static str> {
 // ---- Constant pool and bytecode for generated classes ----
 
 /// A constant pool under construction, with exact UTF-16 text for String constants.
-struct Pool {
-    entries: Vec<Constant>,
+pub(crate) struct Pool {
+    pub(crate) entries: Vec<Constant>,
     utf8: HashMap<String, u16>,
-    string_units: HashMap<u16, Vec<u16>>,
+    pub(crate) string_units: HashMap<u16, Vec<u16>>,
 }
 
 impl Pool {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Pool {
             entries: vec![Constant::Unusable],
             utf8: HashMap::new(),
             string_units: HashMap::new(),
         }
     }
-    fn push(&mut self, c: Constant) -> u16 {
+    pub(crate) fn push(&mut self, c: Constant) -> u16 {
         self.entries.push(c);
         (self.entries.len() - 1) as u16
     }
-    fn utf8(&mut self, s: &str) -> u16 {
+    pub(crate) fn utf8(&mut self, s: &str) -> u16 {
         if let Some(&i) = self.utf8.get(s) {
             return i;
         }
@@ -432,18 +432,24 @@ impl Pool {
         self.utf8.insert(s.to_string(), i);
         i
     }
-    fn class(&mut self, name: &str) -> u16 {
+    pub(crate) fn class(&mut self, name: &str) -> u16 {
         let n = self.utf8(name);
         self.push(Constant::Class(n))
     }
-    fn nat(&mut self, name: &str, descriptor: &str) -> u16 {
+    pub(crate) fn nat(&mut self, name: &str, descriptor: &str) -> u16 {
         let (n, d) = (self.utf8(name), self.utf8(descriptor));
         self.push(Constant::NameAndType {
             name: n,
             descriptor: d,
         })
     }
-    fn method(&mut self, owner: &str, name: &str, descriptor: &str, interface: bool) -> u16 {
+    pub(crate) fn method(
+        &mut self,
+        owner: &str,
+        name: &str,
+        descriptor: &str,
+        interface: bool,
+    ) -> u16 {
         let (c, nt) = (self.class(owner), self.nat(name, descriptor));
         self.push(if interface {
             Constant::InterfaceMethodRef {
@@ -457,7 +463,7 @@ impl Pool {
             }
         })
     }
-    fn field(&mut self, owner: &str, name: &str, descriptor: &str) -> u16 {
+    pub(crate) fn field(&mut self, owner: &str, name: &str, descriptor: &str) -> u16 {
         let (c, nt) = (self.class(owner), self.nat(name, descriptor));
         self.push(Constant::FieldRef {
             class: c,
@@ -465,13 +471,13 @@ impl Pool {
         })
     }
     /// A String constant with exact UTF-16 contents (its own Utf8 entry, so lone surrogates survive).
-    fn string(&mut self, units: Vec<u16>) -> u16 {
+    pub(crate) fn string(&mut self, units: Vec<u16>) -> u16 {
         let text = self.push(Constant::Utf8(String::from_utf16_lossy(&units)));
         self.string_units.insert(text, units);
         self.push(Constant::String(text))
     }
     /// Copy a loadable constant (String, Integer, Long, Float, Double, Class) from another class.
-    fn copy_constant(&mut self, from: &ClassFile, index: u16) -> Option<(u16, char)> {
+    pub(crate) fn copy_constant(&mut self, from: &ClassFile, index: u16) -> Option<(u16, char)> {
         Some(match from.pool.get(index as usize)? {
             Constant::String(text) => {
                 let units =
@@ -500,21 +506,21 @@ impl Pool {
 
 /// Bytecode under construction.
 #[derive(Default)]
-struct Asm {
-    code: Vec<u8>,
+pub(crate) struct Asm {
+    pub(crate) code: Vec<u8>,
 }
 
 impl Asm {
-    fn op(&mut self, op: u8) -> &mut Self {
+    pub(crate) fn op(&mut self, op: u8) -> &mut Self {
         self.code.push(op);
         self
     }
-    fn u16(&mut self, v: u16) -> &mut Self {
+    pub(crate) fn u16(&mut self, v: u16) -> &mut Self {
         self.code.extend(v.to_be_bytes());
         self
     }
     /// Load local `slot` of type `ty` (wide form past 255).
-    fn load(&mut self, ty: &str, slot: u16) -> &mut Self {
+    pub(crate) fn load(&mut self, ty: &str, slot: u16) -> &mut Self {
         let op = match ty {
             "J" => 0x16,
             "F" => 0x17,
@@ -524,7 +530,7 @@ impl Asm {
         };
         self.local(op, slot)
     }
-    fn local(&mut self, op: u8, slot: u16) -> &mut Self {
+    pub(crate) fn local(&mut self, op: u8, slot: u16) -> &mut Self {
         if slot <= 255 {
             self.op(op).op(slot as u8)
         } else {
@@ -532,7 +538,7 @@ impl Asm {
         }
     }
     /// The return instruction for a type ("V" for void).
-    fn ret(&mut self, ty: &str) -> &mut Self {
+    pub(crate) fn ret(&mut self, ty: &str) -> &mut Self {
         self.op(match ty {
             "V" => 0xb1,
             "J" => 0xad,
@@ -542,33 +548,33 @@ impl Asm {
             _ => 0xac,
         })
     }
-    fn checkcast(&mut self, pool: &mut Pool, class: &str) -> &mut Self {
+    pub(crate) fn checkcast(&mut self, pool: &mut Pool, class: &str) -> &mut Self {
         let c = pool.class(class);
         self.op(0xc0).u16(c)
     }
-    fn invoke(&mut self, op: u8, index: u16, arg_slots: u16) -> &mut Self {
+    pub(crate) fn invoke(&mut self, op: u8, index: u16, arg_slots: u16) -> &mut Self {
         self.op(op).u16(index);
         if op == 0xb9 {
             self.op((arg_slots + 1) as u8).op(0);
         }
         self
     }
-    fn ldc(&mut self, index: u16, wide: bool) -> &mut Self {
+    pub(crate) fn ldc(&mut self, index: u16, wide: bool) -> &mut Self {
         self.op(if wide { 0x14 } else { 0x13 }).u16(index)
     }
     /// Emit a branch with a placeholder offset; returns its position for `land`.
-    fn branch(&mut self, op: u8) -> usize {
+    pub(crate) fn branch(&mut self, op: u8) -> usize {
         let at = self.code.len();
         self.op(op).u16(0);
         at
     }
     /// Point the branch at `at` to the current position.
-    fn land(&mut self, at: usize) {
+    pub(crate) fn land(&mut self, at: usize) {
         let offset = (self.code.len() as i64 - at as i64) as i16;
         self.code[at + 1..at + 3].copy_from_slice(&offset.to_be_bytes());
     }
     /// An int constant (iconst, bipush, sipush or ldc).
-    fn int(&mut self, pool: &mut Pool, v: i32) -> &mut Self {
+    pub(crate) fn int(&mut self, pool: &mut Pool, v: i32) -> &mut Self {
         match v {
             -1..=5 => self.op((0x03 + v) as u8),
             -128..=127 => self.op(0x10).op(v as i8 as u8),

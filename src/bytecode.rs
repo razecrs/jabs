@@ -202,6 +202,12 @@ pub enum Op {
     ANewArray {
         class: String,
     },
+    /// `multianewarray`: an array of type `class` (an array descriptor with at least
+    /// `dimensions` levels), its first `dimensions` levels allocated from as many counts.
+    MultiANewArray {
+        class: String,
+        dimensions: u8,
+    },
     ArrayLength,
     /// Throw ClassCastException unless the reference is null or an instance of `class`.
     CheckCast {
@@ -479,6 +485,16 @@ fn decode_one(class: &ClassFile, c: &mut Cursor, pc: u32, len: usize) -> Result<
             class: class.class_name(c.u16()?)?.into(),
         },
         0xbe => ArrayLength,
+        0xc5 => {
+            let class: String = class.class_name(c.u16()?)?.into();
+            let dimensions = c.u8()?;
+            // JVMS 6.5 multianewarray: at least one dimension, and no more than the type has.
+            let levels = class.bytes().take_while(|b| *b == b'[').count();
+            if dimensions == 0 || usize::from(dimensions) > levels {
+                bail!("multianewarray of {class} with {dimensions} dimensions");
+            }
+            MultiANewArray { class, dimensions }
+        }
         0xbf => AThrow,
         0xc2 => MonitorEnter,
         0xc3 => MonitorExit,

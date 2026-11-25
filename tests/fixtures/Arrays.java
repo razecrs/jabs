@@ -80,6 +80,43 @@ public class Arrays {
         rows[0] = which == 0 ? new String[2] : new Object[3]; // both are Object[]
         return rows[0].length;
     }
+    // multianewarray: every level allocated at once, a partial last level, the leaf element
+    // type checked on stores, and every count checked before anything is allocated.
+    static long matrix(int a, int b) {
+        long[][] m = new long[a][b];
+        long t = m.length * 100L;
+        for (int i = 0; i < a; i++) for (int j = 0; j < b; j++) { m[i][j] = i * 7L + j; t += m[i][j] + m[i].length; }
+        return t;
+    }
+    static int partialCube(int a, int b) {
+        int[][][] c = new int[a][b][];
+        int nulls = 0;
+        for (int[][] plane : c) for (int[] row : plane) if (row == null) nulls++;
+        if (a > 0 && b > 0) c[0][0] = new int[] {5};
+        return nulls * 10 + (a > 0 && b > 0 ? c[0][0][0] : 0);
+    }
+    static int multiStore(int which) {
+        Object[][] g = new String[2][3];
+        if (which == 2) { g[1] = new Integer[1]; return -2; } // ArrayStoreException: Integer[] is no String[]
+        Object[] row = g[0];
+        row[1] = which == 0 ? "s" : new StringBuilder("b"); // ArrayStoreException for the StringBuilder
+        return g[0][1].toString().length() + g[1].length;
+    }
+    // Object's methods called virtually on arrays (an Object-typed receiver): arrays dispatch
+    // through Object's vtable. Identity hashes differ between runs, so only their use is checked.
+    static int objectMethodsOnArrays(int n) {
+        Object a = new int[n];
+        Object b = new String[n];
+        java.util.Set<Object> set = new java.util.HashSet<>();
+        set.add(a);
+        set.add(b);
+        int r = set.contains(a) && set.contains(b) && !set.contains(new int[n]) ? 1 : 0;
+        r += a.equals(a) && !a.equals(b) ? 10 : 0;
+        r += a.hashCode() == a.hashCode() ? 100 : 0;
+        r += a.toString().startsWith("[I@") && b.toString().startsWith("[Ljava.lang.String;@") ? 1000 : 0;
+        return r;
+    }
+    static int multiNegative(int a, int b) { return new int[a][b].length; }
     static int negative(int n) { return new int[n].length; }
     static int outOfBounds(int i) { int[] a = new int[3]; return a[i]; }
     static int nullArray(int i) { int[] a = i > 100 ? new int[1] : null; return a[0]; }

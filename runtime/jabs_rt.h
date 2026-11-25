@@ -579,6 +579,47 @@ static inline int jabs_array_store_ok(jabs_array *a, jabs_object *value) {
     return 0;
 }
 
+static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, int32_t kind, const jabs_class *component,
+                                          const char *descriptor, const char *component_descriptor);
+
+/* multianewarray: an array of type `descriptor` with its first `dimensions` levels allocated
+ * from `counts` (all already >= 0), each level checked as anewarray/newarray would make it.
+ * `element` is the record of the innermost element class, or NULL (Object, primitives, or a
+ * class outside the unit). Descriptors of the levels are suffixes of `descriptor`, which must
+ * outlive the program (a string literal). NULL with jabs_pending set when allocation fails.
+ * Recursion depth is at most `dimensions` (JVMS: at most 255). */
+static inline jabs_object *jabs_multi_new_array(const char *descriptor, int dimensions, const int32_t *counts,
+                                                const jabs_class *element) {
+    if (dimensions < 1 || dimensions > 255 || descriptor[0] != '[') jabs_not_compiled("multianewarray with a malformed type");
+    const char *component = descriptor + 1;
+    int32_t length = counts[0];
+    if (dimensions == 1) {
+        static const char codes[] = "ZBCSIJFD";
+        static const size_t sizes[] = { 1, 1, 2, 2, 4, 8, 4, 8 };
+        const char *code = component[0] ? strchr(codes, component[0]) : NULL;
+        if (code) return jabs_new_array(length, sizes[code - codes], JABS_COMPONENT_PRIMITIVE, NULL, descriptor, NULL);
+        if (component[0] == '[') {
+            /* Rows: a one-level reference row keeps its element's record (as anewarray does). */
+            const jabs_class *row_element = component[1] == 'L' ? element : NULL;
+            return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ARRAY, row_element, descriptor, component);
+        }
+        if (strcmp(component, "Ljava/lang/Object;") == 0)
+            return jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ANY, NULL, descriptor, NULL);
+        return jabs_new_array(length, sizeof(jabs_object *), element ? JABS_COMPONENT_CLASS : JABS_COMPONENT_UNCHECKED,
+                              element, descriptor, NULL);
+    }
+    if (component[0] != '[') jabs_not_compiled("multianewarray with more dimensions than its type");
+    const jabs_class *row_element = component[1] == 'L' ? element : NULL;
+    jabs_object *outer = jabs_new_array(length, sizeof(jabs_object *), JABS_COMPONENT_ARRAY, row_element, descriptor, component);
+    if (!outer) return NULL;
+    for (int32_t i = 0; i < length; i++) {
+        jabs_object *row = jabs_multi_new_array(component, dimensions - 1, counts + 1, element);
+        if (!row) return NULL;
+        ((jabs_object **)jabs_array_data((jabs_array *)outer))[i] = row;
+    }
+    return outer;
+}
+
 /* Allocate a zeroed array (zero bytes are every element's default); length is already >= 0. */
 static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, int32_t kind, const jabs_class *component,
                                           const char *descriptor, const char *component_descriptor) {

@@ -550,6 +550,18 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     for which in [0, 1] {
         out.push(("Arrays", "reflectRows", vec![I(which)]));
     }
+    // multianewarray: full and partial levels, leaf stores, and the counts checked first.
+    for (a, b) in [(0, 0), (0, 3), (3, 0), (2, 3), (4, 1)] {
+        out.push(("Arrays", "matrix", vec![I(a), I(b)]));
+        out.push(("Arrays", "partialCube", vec![I(a), I(b)]));
+    }
+    for which in [0, 1, 2] {
+        out.push(("Arrays", "multiStore", vec![I(which)]));
+    }
+    out.push(("Arrays", "objectMethodsOnArrays", vec![I(3)]));
+    for (a, b) in [(2, -1), (-1, 2), (0, -1), (2, 2)] {
+        out.push(("Arrays", "multiNegative", vec![I(a), I(b)]));
+    }
     for v in [0, 1, -1, 255, 70000, i32::MIN, i32::MAX] {
         for name in ["bytes", "booleans", "chars", "shorts"] {
             out.push(("Arrays", name, vec![I(v)]));

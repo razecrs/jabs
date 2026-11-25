@@ -247,17 +247,41 @@ fn parse_attributes(
 /// Deepest annotation nesting accepted (annotations inside arrays inside annotations...).
 const MAX_ANNOTATION_DEPTH: u32 = 64;
 
+/// What a constant-pool index inside an annotation attribute stands for (JVMS 4.7.16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationIndex {
+    /// type_index of an annotation: a field descriptor (`Lpkg/Ann;`).
+    AnnotationType,
+    /// element_name_index: the element's name.
+    ElementName,
+    /// const_value_index of a primitive or String element.
+    Constant,
+    /// type_name_index of an enum element: the enum's field descriptor.
+    EnumType,
+    /// const_name_index of an enum element: the constant's name.
+    EnumConstant,
+    /// class_info_index of a Class element: a return descriptor (`Ljava/lang/String;`, `[I`, `V`).
+    ClassValue,
+}
+
 /// Walk one element_value (JVMS 4.7.16.1), recursing into nested annotations and arrays, and
-/// hand every constant-pool index it names to `used`.
-fn walk_element_value(c: &mut Cursor, depth: u32, used: &mut dyn FnMut(u16)) -> Result<()> {
+/// hand every constant-pool index it names, with what it stands for, to `used`.
+fn walk_element_value(
+    c: &mut Cursor,
+    depth: u32,
+    used: &mut dyn FnMut(u16, AnnotationIndex),
+) -> Result<()> {
     if depth > MAX_ANNOTATION_DEPTH {
         bail!("annotation nesting too deep");
     }
     match c.u8()? {
-        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' | b'c' => used(c.u16()?),
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' => {
+            used(c.u16()?, AnnotationIndex::Constant)
+        }
+        b'c' => used(c.u16()?, AnnotationIndex::ClassValue),
         b'e' => {
-            used(c.u16()?);
-            used(c.u16()?);
+            used(c.u16()?, AnnotationIndex::EnumType);
+            used(c.u16()?, AnnotationIndex::EnumConstant);
         }
         b'@' => walk_annotation(c, depth + 1, used)?,
         b'[' => {
@@ -271,10 +295,14 @@ fn walk_element_value(c: &mut Cursor, depth: u32, used: &mut dyn FnMut(u16)) -> 
 }
 
 /// Walk one annotation structure (JVMS 4.7.16): type index, then (name index, value) pairs.
-fn walk_annotation(c: &mut Cursor, depth: u32, used: &mut dyn FnMut(u16)) -> Result<()> {
-    used(c.u16()?);
+fn walk_annotation(
+    c: &mut Cursor,
+    depth: u32,
+    used: &mut dyn FnMut(u16, AnnotationIndex),
+) -> Result<()> {
+    used(c.u16()?, AnnotationIndex::AnnotationType);
     for _ in 0..c.u16()? {
-        used(c.u16()?);
+        used(c.u16()?, AnnotationIndex::ElementName);
         walk_element_value(c, depth, used)?;
     }
     Ok(())
@@ -296,9 +324,22 @@ pub enum AnnotationAttribute {
 /// exactly the constants `Class.getConstantPool()` must answer for it. Fails on malformed or
 /// trailing bytes rather than guess.
 pub fn annotation_pool_indices(data: &[u8], kind: AnnotationAttribute) -> Result<Vec<u16>> {
+    Ok(annotation_references(data, kind)?
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect())
+}
+
+/// Every constant-pool index an annotation attribute's payload names, in order, with what it
+/// stands for: the build uses the annotation, enum and class types to decide which classes
+/// annotation parsing can load at run time. Fails on malformed or trailing bytes.
+pub fn annotation_references(
+    data: &[u8],
+    kind: AnnotationAttribute,
+) -> Result<Vec<(u16, AnnotationIndex)>> {
     let mut c = Cursor::new(data);
     let mut out = Vec::new();
-    let mut used = |i: u16| out.push(i);
+    let mut used = |i: u16, what: AnnotationIndex| out.push((i, what));
     match kind {
         AnnotationAttribute::Annotations => {
             for _ in 0..c.u16()? {
@@ -331,7 +372,7 @@ fn parse_annotation_types(data: &[u8], pool: &[Constant]) -> Result<Vec<String>>
         out.push(utf8(pool, c.u16()?)?.to_owned());
         for _ in 0..c.u16()? {
             c.u16()?;
-            walk_element_value(&mut c, 0, &mut |_| {})?;
+            walk_element_value(&mut c, 0, &mut |_, _| {})?;
         }
     }
     Ok(out)

@@ -10,3 +10,4 @@ pub mod jdk;
 pub mod launch;
 pub mod preparation;
 pub mod profile;
+pub mod proxy;

@@ -115,6 +115,11 @@ fn layout_fields() -> Vec<(String, &'static str, &'static str)> {
         "field",
         "Ljava/lang/reflect/Field;",
     ));
+    out.push((
+        "java/lang/reflect/AccessibleObject".to_string(),
+        "override",
+        "Z",
+    ));
     for k in &KINDS[..8] {
         out.push((k.1.to_string(), "value", k.0));
     }
@@ -191,10 +196,20 @@ fn runtime_calls(unit: &Unit) -> Vec<(String, Option<MethodKey>)> {
     out
 }
 
+const PROXY: &str = "java/lang/reflect/Proxy";
+const PROXY_BUILDER: &str = "java/lang/reflect/Proxy$ProxyBuilder";
+const GET_PROXY_CONSTRUCTOR: &str =
+    "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/reflect/Constructor;";
+/// Every annotation the JDK parses goes through this class (Class, Field, Executable and
+/// Method.getDefaultValue all call into it).
+const ANNOTATION_PARSER: &str = "sun/reflect/annotation/AnnotationParser";
+
 /// Whether the program uses reflection: one of the natives that hand out members, invoke them
-/// or make field accessors is reachable.
+/// or make field accessors is reachable, or the replaced Proxy.getProxyConstructor (which
+/// hands out a proxy class's Constructor).
 fn reflection_used(methods: &BTreeSet<MethodKey>) -> bool {
-    const TRIGGERS: [(&str, &str); 7] = [
+    const TRIGGERS: [(&str, &str); 8] = [
+        (PROXY, "getProxyConstructor"),
         (CLASS, "getDeclaredMethods0"),
         (CLASS, "getDeclaredFields0"),
         (CLASS, "getDeclaredConstructors0"),
@@ -214,10 +229,39 @@ fn reflection_used(methods: &BTreeSet<MethodKey>) -> bool {
         .any(|m| TRIGGERS.iter().any(|t| m.0 == t.0 && m.1 == t.1))
 }
 
+/// What reflection adds to the reachable set in one round.
+#[derive(Default)]
+pub(super) struct Reached {
+    /// Classes the runtime makes objects of.
+    pub instantiated: Vec<String>,
+    /// Classes loaded by name with no object made: the types annotation parsing loads.
+    pub recorded: Vec<String>,
+    /// Compiled methods the runtime calls.
+    pub methods: Vec<MethodKey>,
+}
+
+impl Reached {
+    pub fn is_empty(&self) -> bool {
+        self.instantiated.is_empty() && self.recorded.is_empty() && self.methods.is_empty()
+    }
+}
+
+/// What reach needs beyond the reachable set: decided once per unit.
+pub(super) struct ReachInputs<'a> {
+    /// The proxy classes src/proxy.rs generated.
+    pub proxies: &'a [crate::proxy::Generated],
+    /// For each class, the classes parsing its annotations loads (proxy::loaded_by_annotations).
+    pub annotation_loads: &'a BTreeMap<String, BTreeSet<String>>,
+}
+
 /// What reflection adds to a program's reachable set, given what is reachable so far: the
 /// classes the runtime instantiates (Method, the boxes, the field accessors, the exceptions it
 /// constructs) and the compiled methods it calls, and the `values()` of every enum with a
 /// record (EnumMap, EnumSet and Enum.valueOf find the constants by calling it reflectively).
+/// With annotation parsing reachable, the types the annotations of recorded classes name get
+/// records (AnnotationParser loads them by name); with proxies reachable, the generated proxy
+/// of every list whose interfaces all have records is instantiated (its constructor is called
+/// through Constructor.newInstance, which no instruction names).
 /// Returns only what is not already reachable; the caller loops until nothing is added.
 pub(super) fn reach(
     unit: &Unit,
@@ -225,9 +269,50 @@ pub(super) fn reach(
     instantiated: &BTreeSet<String>,
     methods: &BTreeSet<MethodKey>,
     compiled: &dyn Fn(&MethodKey) -> bool,
-) -> (Vec<String>, Vec<MethodKey>) {
-    let mut classes = Vec::new();
-    let mut keys = Vec::new();
+    inputs: &ReachInputs,
+) -> Reached {
+    let mut reached = Reached::default();
+    if methods.iter().any(|m| m.0 == ANNOTATION_PARSER) {
+        let mut added: BTreeSet<&str> = BTreeSet::new();
+        for name in records {
+            let Some(loads) = inputs.annotation_loads.get(name) else {
+                continue;
+            };
+            for load in loads {
+                if unit.get(load).is_some() && !records.contains(load) && added.insert(load) {
+                    reached.recorded.push(load.clone());
+                }
+            }
+        }
+    }
+    let proxy_key = (
+        PROXY.to_string(),
+        "getProxyConstructor".to_string(),
+        GET_PROXY_CONSTRUCTOR.to_string(),
+    );
+    if methods.contains(&proxy_key) {
+        for proxy in inputs.proxies {
+            let usable = proxy.interfaces.iter().all(|i| records.contains(i))
+                && unit.get(&proxy.name).is_some()
+                && unit.chain(&proxy.name).is_ok();
+            if !usable {
+                continue;
+            }
+            if !instantiated.contains(&proxy.name) {
+                reached.instantiated.push(proxy.name.clone());
+            }
+            let init = (
+                proxy.name.clone(),
+                "<init>".to_string(),
+                crate::proxy::CONSTRUCTOR.to_string(),
+            );
+            if compiled(&init) && !methods.contains(&init) {
+                reached.methods.push(init);
+            }
+        }
+    }
+    let classes = &mut reached.instantiated;
+    let keys = &mut reached.methods;
     for name in records {
         let Some(class) = unit.get(name) else {
             continue;
@@ -241,7 +326,7 @@ pub(super) fn reach(
         }
     }
     if !reflection_used(methods) {
-        return (classes, keys);
+        return reached;
     }
     for name in record_classes() {
         if unit.get(&name).is_some() && unit.chain(&name).is_ok() && !instantiated.contains(&name) {
@@ -272,7 +357,7 @@ pub(super) fn reach(
             keys.push(key);
         }
     }
-    (classes, keys)
+    reached
 }
 
 // ---- Natives and replaced methods ----
@@ -435,6 +520,20 @@ pub(super) fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(Str
 /// - `MethodHandle<T>FieldAccessorImpl.get<T>/set<T>` (and get/set for references): the leaf
 ///   accesses, which read or write the field's storage directly.
 pub(super) fn replacement(key: &MethodKey) -> Option<(String, bool)> {
+    // Proxy classes are generated at build time (src/proxy.rs): the JDK's lookup would spin
+    // one at run time (and, before the module system is up, throws InternalError instead).
+    // `Proxy.getProxyConstructor` finds the generated class of the list in a table, and
+    // `ProxyBuilder.isProxyClass` asks the same table (the JDK's answer lives in a cache
+    // that only its own spinning fills).
+    if key.0 == PROXY && key.1 == "getProxyConstructor" && key.2 == GET_PROXY_CONSTRUCTOR {
+        return Some((
+            "return jabs_reflect_proxy_constructor(a0, a1);".to_string(),
+            true,
+        ));
+    }
+    if key.0 == PROXY_BUILDER && key.1 == "isProxyClass" && key.2 == "(Ljava/lang/Class;)Z" {
+        return Some(("return jabs_reflect_is_proxy_class(a0);".to_string(), true));
+    }
     if key.0 == ACCESSOR_FACTORY {
         return match (key.1.as_str(), key.2.as_str()) {
             ("useNativeAccessor", "(Ljava/lang/reflect/Executable;)Z") => {
@@ -656,6 +755,8 @@ pub(super) struct MetadataInputs<'a> {
     pub interfaces: &'a BTreeSet<&'a str>,
     pub methods: &'a BTreeSet<MethodKey>,
     pub inits: &'a BTreeSet<String>,
+    /// The proxy classes src/proxy.rs generated; those compiled in get a jabs_rproxies row.
+    pub proxies: &'a [crate::proxy::Generated],
 }
 
 /// The metadata tables and the program-specific support functions (runtime/jabs_reflect.h).
@@ -853,6 +954,28 @@ pub(super) fn functions(unit: &Unit, inputs: &MetadataInputs) -> String {
             tables.string(host)
         );
     }
+    // Proxy classes a program can make: those with metadata (a record) and a compiled
+    // constructor. Nothing else can be made, so nothing else is listed.
+    let mut proxy_rows = String::new();
+    let mut proxy_count = 0usize;
+    for proxy in inputs.proxies {
+        let init = (
+            proxy.name.clone(),
+            "<init>".to_string(),
+            crate::proxy::CONSTRUCTOR.to_string(),
+        );
+        if !by_name.contains_key(proxy.name.as_str()) || !inputs.methods.contains(&init) {
+            continue;
+        }
+        let interfaces: Vec<&str> = proxy.interfaces.iter().map(String::as_str).collect();
+        let _ = writeln!(
+            proxy_rows,
+            "    {{ {}, {} }},",
+            tables.string(&proxy.name),
+            tables.list(&interfaces)
+        );
+        proxy_count += 1;
+    }
     out.push_str(&externs);
     out.push_str(&callers);
     // Every array keeps a sentinel element: C has no empty arrays.
@@ -904,6 +1027,13 @@ pub(super) fn functions(unit: &Unit, inputs: &MetadataInputs) -> String {
         out,
         "const jabs_rnest jabs_rnests[] = {{\n{nest_rows}    {{ 0, 0 }}\n}};\nconst uint32_t jabs_rnest_count = {};\n",
         nests.len()
+    );
+    // The constructor cache is the only table written at run time: each slot goes from NULL to
+    // one Constructor, once, by compare-and-swap (jabs_reflect_proxy_constructor).
+    let _ = write!(
+        out,
+        "const jabs_rproxy jabs_rproxies[] = {{\n{proxy_rows}    {{ 0, 0 }}\n}};\nconst uint32_t jabs_rproxy_count = {proxy_count};\njabs_object *jabs_rproxy_constructors[{}];\n",
+        proxy_count + 1
     );
     let names: Vec<String> = (0..shapes.len()).map(|i| format!("jabs_rc_{i}")).collect();
     let _ = write!(
