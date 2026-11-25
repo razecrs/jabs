@@ -1,0 +1,1691 @@
+{
+  "schema_version": 5,
+  "classes": 6632,
+  "unparsable_classes": 0,
+  "methods": 58671,
+  "compiled_methods": 58342,
+  "self_contained_methods": 37304,
+  "blockers": [
+    [
+      "superclass/interface outside the unit (JDK or other jars)",
+      196
+    ],
+    [
+      "instanceof/checkcast against an interface or outside class",
+      51
+    ],
+    [
+      "uses a class outside the unit (JDK or other jars)",
+      38
+    ],
+    [
+      "type relationship outside the unit",
+      14
+    ],
+    [
+      "opcode multianewarray",
+      11
+    ],
+    [
+      "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+      7
+    ],
+    [
+      "catch type javax/mail/MessagingException is outside the unit or not a Throwable",
+      3
+    ],
+    [
+      "catch type com/mongodb/MongoException is outside the unit or not a Throwable",
+      2
+    ],
+    [
+      "catch type java/sql/SQLException is outside the unit or not a Throwable",
+      2
+    ],
+    [
+      "catch type javax/naming/NameNotFoundException is outside the unit or not a Throwable",
+      2
+    ],
+    [
+      "catch type javax/jms/JMSException is outside the unit or not a Throwable",
+      1
+    ],
+    [
+      "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+      1
+    ],
+    [
+      "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+      1
+    ]
+  ],
+  "blast_radius": [
+    {
+      "category": "instanceof/checkcast against an interface or outside class",
+      "direct": 51,
+      "reaches": 4678,
+      "unlocks": 143
+    },
+    {
+      "category": "native method without a JABS implementation",
+      "direct": 0,
+      "reaches": 20781,
+      "unlocks": 38
+    },
+    {
+      "category": "uses a class outside the unit (JDK or other jars)",
+      "direct": 38,
+      "reaches": 3198,
+      "unlocks": 30
+    },
+    {
+      "category": "superclass/interface outside the unit (JDK or other jars)",
+      "direct": 196,
+      "reaches": 49,
+      "unlocks": 22
+    },
+    {
+      "category": "type relationship outside the unit",
+      "direct": 14,
+      "reaches": 20764,
+      "unlocks": 21
+    },
+    {
+      "category": "opcode multianewarray",
+      "direct": 11,
+      "reaches": 20759,
+      "unlocks": 18
+    },
+    {
+      "category": "static initializer not compiled",
+      "direct": 0,
+      "reaches": 20760,
+      "unlocks": 0
+    },
+    {
+      "category": "call inherited from outside the unit (e.g. Object methods)",
+      "direct": 0,
+      "reaches": 20737,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+      "direct": 7,
+      "reaches": 4,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+      "direct": 1,
+      "reaches": 4,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/jms/JMSException is outside the unit or not a Throwable",
+      "direct": 1,
+      "reaches": 2,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+      "direct": 1,
+      "reaches": 1,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/mail/MessagingException is outside the unit or not a Throwable",
+      "direct": 3,
+      "reaches": 0,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type com/mongodb/MongoException is outside the unit or not a Throwable",
+      "direct": 2,
+      "reaches": 0,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type java/sql/SQLException is outside the unit or not a Throwable",
+      "direct": 2,
+      "reaches": 0,
+      "unlocks": 0
+    },
+    {
+      "category": "catch type javax/naming/NameNotFoundException is outside the unit or not a Throwable",
+      "direct": 2,
+      "reaches": 0,
+      "unlocks": 0
+    }
+  ],
+  "jdk": {
+    "classes": 7367,
+    "methods": 61576,
+    "compiled_methods": 60778,
+    "self_contained_methods": 28527,
+    "blockers": [
+      [
+        "native method without a JABS implementation",
+        564
+      ],
+      [
+        "call inherited from outside the unit (e.g. Object methods)",
+        211
+      ],
+      [
+        "opcode multianewarray",
+        15
+      ],
+      [
+        "type relationship outside the unit",
+        7
+      ],
+      [
+        "constructor call shape",
+        1
+      ]
+    ],
+    "blast_radius": [
+      {
+        "category": "native method without a JABS implementation",
+        "direct": 564,
+        "reaches": 32142,
+        "unlocks": 357
+      },
+      {
+        "category": "type relationship outside the unit",
+        "direct": 7,
+        "reaches": 31850,
+        "unlocks": 66
+      },
+      {
+        "category": "call inherited from outside the unit (e.g. Object methods)",
+        "direct": 211,
+        "reaches": 31786,
+        "unlocks": 4
+      },
+      {
+        "category": "opcode multianewarray",
+        "direct": 15,
+        "reaches": 31822,
+        "unlocks": 0
+      },
+      {
+        "category": "static initializer not compiled",
+        "direct": 0,
+        "reaches": 31822,
+        "unlocks": 0
+      },
+      {
+        "category": "constructor call shape",
+        "direct": 1,
+        "reaches": 0,
+        "unlocks": 0
+      }
+    ]
+  },
+  "loaded": {
+    "classes_listed": 4215,
+    "classes_not_in_unit": 527,
+    "jar": {
+      "classes": 1718,
+      "methods": 14209,
+      "compiled_methods": 14159,
+      "self_contained_methods": 4740,
+      "blockers": [
+        [
+          "instanceof/checkcast against an interface or outside class",
+          15
+        ],
+        [
+          "superclass/interface outside the unit (JDK or other jars)",
+          11
+        ],
+        [
+          "uses a class outside the unit (JDK or other jars)",
+          11
+        ],
+        [
+          "opcode multianewarray",
+          5
+        ],
+        [
+          "catch type java/sql/SQLException is outside the unit or not a Throwable",
+          2
+        ],
+        [
+          "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+          2
+        ],
+        [
+          "type relationship outside the unit",
+          2
+        ],
+        [
+          "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+          1
+        ],
+        [
+          "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+          1
+        ]
+      ],
+      "blast_radius": [
+        {
+          "category": "instanceof/checkcast against an interface or outside class",
+          "direct": 15,
+          "reaches": 1303,
+          "unlocks": 81
+        },
+        {
+          "category": "uses a class outside the unit (JDK or other jars)",
+          "direct": 11,
+          "reaches": 931,
+          "unlocks": 20
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "direct": 0,
+          "reaches": 9289,
+          "unlocks": 12
+        },
+        {
+          "category": "type relationship outside the unit",
+          "direct": 2,
+          "reaches": 9284,
+          "unlocks": 7
+        },
+        {
+          "category": "opcode multianewarray",
+          "direct": 5,
+          "reaches": 9274,
+          "unlocks": 3
+        },
+        {
+          "category": "static initializer not compiled",
+          "direct": 0,
+          "reaches": 9290,
+          "unlocks": 0
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "direct": 0,
+          "reaches": 9271,
+          "unlocks": 0
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "direct": 11,
+          "reaches": 7,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+          "direct": 1,
+          "reaches": 2,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+          "direct": 1,
+          "reaches": 1,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type java/sql/SQLException is outside the unit or not a Throwable",
+          "direct": 2,
+          "reaches": 0,
+          "unlocks": 0
+        },
+        {
+          "category": "catch type javax/naming/NamingException is outside the unit or not a Throwable",
+          "direct": 2,
+          "reaches": 0,
+          "unlocks": 0
+        }
+      ]
+    },
+    "jdk": {
+      "classes": 1970,
+      "methods": 25695,
+      "compiled_methods": 25110,
+      "self_contained_methods": 11834,
+      "blockers": [
+        [
+          "native method without a JABS implementation",
+          417
+        ],
+        [
+          "call inherited from outside the unit (e.g. Object methods)",
+          161
+        ],
+        [
+          "opcode multianewarray",
+          3
+        ],
+        [
+          "type relationship outside the unit",
+          3
+        ],
+        [
+          "constructor call shape",
+          1
+        ]
+      ],
+      "blast_radius": [
+        {
+          "category": "native method without a JABS implementation",
+          "direct": 417,
+          "reaches": 13187,
+          "unlocks": 248
+        },
+        {
+          "category": "type relationship outside the unit",
+          "direct": 3,
+          "reaches": 12997,
+          "unlocks": 59
+        },
+        {
+          "category": "opcode multianewarray",
+          "direct": 3,
+          "reaches": 12967,
+          "unlocks": 0
+        },
+        {
+          "category": "static initializer not compiled",
+          "direct": 0,
+          "reaches": 12967,
+          "unlocks": 0
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "direct": 161,
+          "reaches": 12936,
+          "unlocks": 0
+        },
+        {
+          "category": "constructor call shape",
+          "direct": 1,
+          "reaches": 0,
+          "unlocks": 0
+        }
+      ]
+    }
+  },
+  "executed": {
+    "methods_traced": 15112,
+    "hidden_class_methods": 276,
+    "methods_not_in_unit": 1943,
+    "jar": {
+      "executed": 4258,
+      "compiled": 4235,
+      "self_contained": 1703,
+      "unsupported": 23,
+      "method_not_in_class": 0,
+      "abstract_in_unit": 0,
+      "blockers": [
+        [
+          "superclass/interface outside the unit (JDK or other jars)",
+          7
+        ],
+        [
+          "instanceof/checkcast against an interface or outside class",
+          5
+        ],
+        [
+          "uses a class outside the unit (JDK or other jars)",
+          5
+        ],
+        [
+          "opcode multianewarray",
+          4
+        ],
+        [
+          "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+          1
+        ],
+        [
+          "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+          1
+        ]
+      ],
+      "unsupported_methods": [
+        {
+          "category": "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable",
+          "class": "org/apache/logging/log4j/core/config/XMLConfiguration",
+          "name": "enableXInclude",
+          "descriptor": "(Ljavax/xml/parsers/DocumentBuilderFactory;)V",
+          "reason": "catch type javax/xml/parsers/ParserConfigurationException is outside the unit or not a Throwable"
+        },
+        {
+          "category": "catch type org/xml/sax/SAXException is outside the unit or not a Throwable",
+          "class": "org/apache/logging/log4j/core/config/XMLConfiguration",
+          "name": "<init>",
+          "descriptor": "(Lorg/apache/logging/log4j/core/config/ConfigurationFactory$ConfigurationSource;)V",
+          "reason": "catch type org/xml/sax/SAXException is outside the unit or not a Throwable"
+        },
+        {
+          "category": "instanceof/checkcast against an interface or outside class",
+          "class": "io/netty/util/internal/PlatformDependent0",
+          "name": "<clinit>",
+          "descriptor": "()V",
+          "reason": "pc 51: type test against sun/misc/Cleaner (outside the unit or an interface) is not compiled yet"
+        },
+        {
+          "category": "instanceof/checkcast against an interface or outside class",
+          "class": "io/netty/util/internal/logging/Slf4JLoggerFactory",
+          "name": "<init>",
+          "descriptor": "(Z)V",
+          "reason": "pc 74: type test against org/slf4j/helpers/NOPLoggerFactory (outside the unit or an interface) is not compiled yet"
+        },
+        {
+          "category": "instanceof/checkcast against an interface or outside class",
+          "class": "org/apache/logging/log4j/core/config/XMLConfiguration",
+          "name": "constructHierarchy",
+          "descriptor": "(Lorg/apache/logging/log4j/core/config/Node;Lorg/w3c/dom/Element;)V",
+          "reason": "pc 57: type test against org/w3c/dom/Element (outside the unit or an interface) is not compiled yet"
+        },
+        {
+          "category": "instanceof/checkcast against an interface or outside class",
+          "class": "org/apache/logging/log4j/core/config/XMLConfiguration",
+          "name": "getType",
+          "descriptor": "(Lorg/w3c/dom/Element;)Ljava/lang/String;",
+          "reason": "pc 37: type test against org/w3c/dom/Attr (outside the unit or an interface) is not compiled yet"
+        },
+        {
+          "category": "instanceof/checkcast against an interface or outside class",
+          "class": "org/apache/logging/log4j/core/config/XMLConfiguration",
+          "name": "processAttributes",
+          "descriptor": "(Lorg/apache/logging/log4j/core/config/Node;Lorg/w3c/dom/Element;)Ljava/util/Map;",
+          "reason": "pc 39: type test against org/w3c/dom/Attr (outside the unit or an interface) is not compiled yet"
+        },
+        {
+          "category": "opcode multianewarray",
+          "class": "aqz",
+          "name": "<init>",
+          "descriptor": "(Lahb;JZ)V",
+          "reason": "pc 84: opcode multianewarray (0xc5) not supported yet"
+        },
+        {
+          "category": "opcode multianewarray",
+          "class": "ara",
+          "name": "<init>",
+          "descriptor": "(Lahb;J)V",
+          "reason": "pc 9: opcode multianewarray (0xc5) not supported yet"
+        },
+        {
+          "category": "opcode multianewarray",
+          "class": "ard",
+          "name": "a",
+          "descriptor": "()V",
+          "reason": "pc 76: opcode multianewarray (0xc5) not supported yet"
+        },
+        {
+          "category": "opcode multianewarray",
+          "class": "net/minecraft/server/MinecraftServer",
+          "name": "a",
+          "descriptor": "(Ljava/lang/String;Ljava/lang/String;JLahm;Ljava/lang/String;)V",
+          "reason": "pc 27: opcode multianewarray (0xc5) not supported yet"
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/StatusLoggerAdmin",
+          "name": "<init>",
+          "descriptor": "(Ljava/util/concurrent/Executor;)V",
+          "reason": "class hierarchy incomplete: javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/StatusLoggerAdmin",
+          "name": "createNotificationInfo",
+          "descriptor": "()Ljavax/management/MBeanNotificationInfo;",
+          "reason": "class hierarchy incomplete: javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/StatusLoggerAdmin",
+          "name": "getObjectName",
+          "descriptor": "()Ljavax/management/ObjectName;",
+          "reason": "class hierarchy incomplete: javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/StatusLoggerAdmin",
+          "name": "getStatusLevel",
+          "descriptor": "()Lorg/apache/logging/log4j/Level;",
+          "reason": "class hierarchy incomplete: javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/StatusLoggerAdmin",
+          "name": "log",
+          "descriptor": "(Lorg/apache/logging/log4j/status/StatusData;)V",
+          "reason": "class hierarchy incomplete: javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/StatusLoggerAdmin",
+          "name": "nextSeqNo",
+          "descriptor": "()J",
+          "reason": "class hierarchy incomplete: javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "superclass/interface outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/StatusLoggerAdmin",
+          "name": "now",
+          "descriptor": "()J",
+          "reason": "class hierarchy incomplete: javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "uses a class outside the unit (JDK or other jars)",
+          "class": "io/netty/util/internal/logging/JdkLogger",
+          "name": "log",
+          "descriptor": "(Ljava/lang/String;Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
+          "reason": "pc 0: new java/util/logging/LogRecord: class is not in the compilation unit"
+        },
+        {
+          "category": "uses a class outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/LoggerContext",
+          "name": "setConfiguration",
+          "descriptor": "(Lorg/apache/logging/log4j/core/config/Configuration;)Lorg/apache/logging/log4j/core/config/Configuration;",
+          "reason": "pc 100: new java/beans/PropertyChangeEvent: class is not in the compilation unit"
+        },
+        {
+          "category": "uses a class outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/ContextSelectorAdmin",
+          "name": "<init>",
+          "descriptor": "(Lorg/apache/logging/log4j/core/selector/ContextSelector;)V",
+          "reason": "pc 18: new javax/management/ObjectName: class is not in the compilation unit"
+        },
+        {
+          "category": "uses a class outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/Server",
+          "name": "registerContexts",
+          "descriptor": "(Ljava/util/List;Ljavax/management/MBeanServer;Ljava/util/concurrent/Executor;)V",
+          "reason": "javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        },
+        {
+          "category": "uses a class outside the unit (JDK or other jars)",
+          "class": "org/apache/logging/log4j/core/jmx/Server",
+          "name": "registerStatusLogger",
+          "descriptor": "(Ljavax/management/MBeanServer;Ljava/util/concurrent/Executor;)V",
+          "reason": "javax/management/NotificationBroadcasterSupport is not in the compilation unit"
+        }
+      ]
+    },
+    "jdk": {
+      "executed": 8911,
+      "compiled": 8721,
+      "self_contained": 4267,
+      "unsupported": 149,
+      "method_not_in_class": 41,
+      "abstract_in_unit": 0,
+      "blockers": [
+        [
+          "native method without a JABS implementation",
+          124
+        ],
+        [
+          "call inherited from outside the unit (e.g. Object methods)",
+          20
+        ],
+        [
+          "opcode multianewarray",
+          3
+        ],
+        [
+          "constructor call shape",
+          1
+        ],
+        [
+          "type relationship outside the unit",
+          1
+        ]
+      ],
+      "unsupported_methods": [
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/BootstrapMethodInvoker",
+          "name": "invoke",
+          "descriptor": "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Class;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.invoke(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/BootstrapMethodInvoker",
+          "name": "widenAndCast",
+          "descriptor": "(Ljava/lang/Object;Ljava/lang/Class;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.invoke(Ljava/lang/Object;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/BoundMethodHandle$Species_L",
+          "name": "copyWithExtendL",
+          "descriptor": "(Ljava/lang/invoke/MethodType;Ljava/lang/invoke/LambdaForm;Ljava/lang/Object;)Ljava/lang/invoke/BoundMethodHandle;",
+          "reason": "java/lang/invoke/MethodHandle.invokeBasic(Ljava/lang/invoke/MethodType;Ljava/lang/invoke/LambdaForm;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/invoke/BoundMethodHandle; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/InnerClassLambdaMetafactory",
+          "name": "buildCallSite",
+          "descriptor": "()Ljava/lang/invoke/CallSite;",
+          "reason": "java/lang/invoke/MethodHandle.invokeBasic()Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/StringConcatFactory$InlineHiddenClassStrategy",
+          "name": "generate",
+          "descriptor": "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/invoke/MethodType;[Ljava/lang/String;)Ljava/lang/invoke/MethodHandle;",
+          "reason": "java/lang/invoke/MethodHandle.invokeBasic(Ljava/lang/Object;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LII_V",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;IILjava/lang/invoke/VarHandle$AccessDescriptor;)V",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;IILjava/lang/invoke/MemberName;)V is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LII_Z",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;IILjava/lang/invoke/VarHandle$AccessDescriptor;)Z",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;IILjava/lang/invoke/MemberName;)Z is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LIJ_V",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;IJLjava/lang/invoke/VarHandle$AccessDescriptor;)V",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;IJLjava/lang/invoke/MemberName;)V is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LILL_L",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/VarHandle$AccessDescriptor;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/MemberName;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LI_I",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/invoke/VarHandle$AccessDescriptor;)I",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/invoke/MemberName;)I is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LI_J",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/invoke/VarHandle$AccessDescriptor;)J",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/invoke/MemberName;)J is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LI_L",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/invoke/VarHandle$AccessDescriptor;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;ILjava/lang/invoke/MemberName;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LJJ_Z",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;JJLjava/lang/invoke/VarHandle$AccessDescriptor;)Z",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;JJLjava/lang/invoke/MemberName;)Z is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LLL_Z",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/VarHandle$AccessDescriptor;)Z",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/MemberName;)Z is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LL_L",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/VarHandle$AccessDescriptor;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/MemberName;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/lang/invoke/VarHandleGuards",
+          "name": "guard_LL_V",
+          "descriptor": "(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/VarHandle$AccessDescriptor;)V",
+          "reason": "java/lang/invoke/MethodHandle.linkToStatic(Ljava/lang/invoke/VarHandle;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/invoke/MemberName;)V is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "java/util/ImmutableCollections$Set12",
+          "name": "spliterator",
+          "descriptor": "()Ljava/util/Spliterator;",
+          "reason": "java/util/ImmutableCollections$AbstractImmutableSet.spliterator()Ljava/util/Spliterator; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "jdk/internal/reflect/DirectConstructorHandleAccessor",
+          "name": "invokeImpl",
+          "descriptor": "([Ljava/lang/Object;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.invokeExact(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "jdk/internal/reflect/DirectMethodHandleAccessor",
+          "name": "invokeImpl",
+          "descriptor": "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.invokeExact(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "call inherited from outside the unit (e.g. Object methods)",
+          "class": "jdk/internal/reflect/MethodHandleObjectFieldAccessorImpl",
+          "name": "get",
+          "descriptor": "(Ljava/lang/Object;)Ljava/lang/Object;",
+          "reason": "java/lang/invoke/MethodHandle.invokeExact()Ljava/lang/Object; is inherited from outside the unit (e.g. java/lang/Object)"
+        },
+        {
+          "category": "constructor call shape",
+          "class": "java/lang/Object",
+          "name": "<init>",
+          "descriptor": "()V",
+          "reason": "pc 0: constructor returns before calling a superclass constructor"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getConstantPool",
+          "descriptor": "()Ljdk/internal/reflect/ConstantPool;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getDeclaredConstructors0",
+          "descriptor": "(Z)[Ljava/lang/reflect/Constructor;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getDeclaredFields0",
+          "descriptor": "(Z)[Ljava/lang/reflect/Field;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getDeclaredMethods0",
+          "descriptor": "(Z)[Ljava/lang/reflect/Method;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getDeclaringClass0",
+          "descriptor": "()Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getEnclosingMethod0",
+          "descriptor": "()[Ljava/lang/Object;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getGenericSignature0",
+          "descriptor": "()Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getInterfaces0",
+          "descriptor": "()[Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getPermittedSubclasses0",
+          "descriptor": "()[Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Class",
+          "name": "getRawAnnotations",
+          "descriptor": "()[B",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ClassLoader",
+          "name": "defineClass0",
+          "descriptor": "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ClassLoader",
+          "name": "defineClass1",
+          "descriptor": "(Ljava/lang/ClassLoader;Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ClassLoader",
+          "name": "defineClass2",
+          "descriptor": "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/nio/ByteBuffer;IILjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ClassLoader",
+          "name": "findBootstrapClass",
+          "descriptor": "(Ljava/lang/String;)Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ClassLoader",
+          "name": "findLoadedClass0",
+          "descriptor": "(Ljava/lang/String;)Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Module",
+          "name": "addExports0",
+          "descriptor": "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Module",
+          "name": "addExportsToAll0",
+          "descriptor": "(Ljava/lang/Module;Ljava/lang/String;)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Module",
+          "name": "addReads0",
+          "descriptor": "(Ljava/lang/Module;Ljava/lang/Module;)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Module",
+          "name": "defineModule0",
+          "descriptor": "(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Object",
+          "name": "wait0",
+          "descriptor": "(J)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ProcessEnvironment",
+          "name": "environmentBlock",
+          "descriptor": "()Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/StackStreamFactory",
+          "name": "checkStackWalkModes",
+          "descriptor": "()Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/StackStreamFactory$AbstractStackWalker",
+          "name": "callStackWalk",
+          "descriptor": "(IILjdk/internal/vm/ContinuationScope;Ljdk/internal/vm/Continuation;II[Ljava/lang/Object;)Ljava/lang/Object;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/StackStreamFactory$AbstractStackWalker",
+          "name": "fetchStackFrames",
+          "descriptor": "(IJIII[Ljava/lang/Object;)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/StackTraceElement",
+          "name": "initStackTraceElements",
+          "descriptor": "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/Thread",
+          "name": "start0",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/invoke/LambdaProxyClassArchive",
+          "name": "findFromArchive",
+          "descriptor": "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MemberName;Ljava/lang/invoke/MethodType;)Ljava/lang/Class;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/invoke/MethodHandleNatives",
+          "name": "init",
+          "descriptor": "(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/invoke/MethodHandleNatives",
+          "name": "objectFieldOffset",
+          "descriptor": "(Ljava/lang/invoke/MemberName;)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/invoke/MethodHandleNatives",
+          "name": "resolve",
+          "descriptor": "(Ljava/lang/invoke/MemberName;Ljava/lang/Class;IZ)Ljava/lang/invoke/MemberName;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/invoke/MethodHandleNatives",
+          "name": "staticFieldBase",
+          "descriptor": "(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/invoke/MethodHandleNatives",
+          "name": "staticFieldOffset",
+          "descriptor": "(Ljava/lang/invoke/MemberName;)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ref/Reference",
+          "name": "getAndClearReferencePendingList",
+          "descriptor": "()Ljava/lang/ref/Reference;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/lang/ref/Reference",
+          "name": "waitForReferencePendingList",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/Inet4Address",
+          "name": "init",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/Inet6Address",
+          "name": "init",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/Inet6AddressImpl",
+          "name": "getLocalHostName",
+          "descriptor": "()Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/Inet6AddressImpl",
+          "name": "lookupAllHostAddr",
+          "descriptor": "(Ljava/lang/String;I)[Ljava/net/InetAddress;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/InetAddress",
+          "name": "init",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/InetAddress",
+          "name": "isIPv4Available",
+          "descriptor": "()Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/InetAddress",
+          "name": "isIPv6Supported",
+          "descriptor": "()Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/NetworkInterface",
+          "name": "getAll",
+          "descriptor": "()[Ljava/net/NetworkInterface;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/NetworkInterface",
+          "name": "getMacAddr0",
+          "descriptor": "([BLjava/lang/String;I)[B",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/NetworkInterface",
+          "name": "init",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/net/NetworkInterface",
+          "name": "isLoopback0",
+          "descriptor": "(Ljava/lang/String;I)Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/TimeZone",
+          "name": "getSystemTimeZoneID",
+          "descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Deflater",
+          "name": "deflateBytesBytes",
+          "descriptor": "(J[BII[BIIII)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Deflater",
+          "name": "end",
+          "descriptor": "(J)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Deflater",
+          "name": "init",
+          "descriptor": "(IIZ)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Inflater",
+          "name": "end",
+          "descriptor": "(J)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Inflater",
+          "name": "inflateBytesBytes",
+          "descriptor": "(J[BII[BII)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Inflater",
+          "name": "init",
+          "descriptor": "(Z)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Inflater",
+          "name": "initIDs",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "java/util/zip/Inflater",
+          "name": "reset",
+          "descriptor": "(J)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/jimage/NativeImageBuffer",
+          "name": "getNativeMap",
+          "descriptor": "(Ljava/lang/String;)Ljava/nio/ByteBuffer;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/loader/BootLoader",
+          "name": "getSystemPackageLocation",
+          "descriptor": "(Ljava/lang/String;)Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/loader/NativeLibrary",
+          "name": "findEntry0",
+          "descriptor": "(JLjava/lang/String;)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/PreviewFeatures",
+          "name": "isPreviewEnabled",
+          "descriptor": "()Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/Unsafe",
+          "name": "allocateInstance",
+          "descriptor": "(Ljava/lang/Class;)Ljava/lang/Object;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/Unsafe",
+          "name": "objectFieldOffset0",
+          "descriptor": "(Ljava/lang/reflect/Field;)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/Unsafe",
+          "name": "park",
+          "descriptor": "(ZJ)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/Unsafe",
+          "name": "shouldBeInitialized0",
+          "descriptor": "(Ljava/lang/Class;)Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/Unsafe",
+          "name": "staticFieldBase0",
+          "descriptor": "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/Unsafe",
+          "name": "staticFieldOffset0",
+          "descriptor": "(Ljava/lang/reflect/Field;)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/misc/Unsafe",
+          "name": "unpark",
+          "descriptor": "(Ljava/lang/Object;)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/perf/Perf",
+          "name": "createLong",
+          "descriptor": "(Ljava/lang/String;IIJ)Ljava/nio/ByteBuffer;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/reflect/ConstantPool",
+          "name": "getIntAt0",
+          "descriptor": "(Ljava/lang/Object;I)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/reflect/ConstantPool",
+          "name": "getUTF8At0",
+          "descriptor": "(Ljava/lang/Object;I)Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/reflect/Reflection",
+          "name": "areNestMates",
+          "descriptor": "(Ljava/lang/Class;Ljava/lang/Class;)Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/vm/Continuation",
+          "name": "pin",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "jdk/internal/vm/Continuation",
+          "name": "unpin",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/FileDispatcherImpl",
+          "name": "allocationGranularity0",
+          "descriptor": "()J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/FileDispatcherImpl",
+          "name": "maxDirectTransferSize0",
+          "descriptor": "()I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/FileDispatcherImpl",
+          "name": "read0",
+          "descriptor": "(Ljava/io/FileDescriptor;JI)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "configureBlocking",
+          "descriptor": "(Ljava/io/FileDescriptor;Z)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "drain",
+          "descriptor": "(I)Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "fdVal",
+          "descriptor": "(Ljava/io/FileDescriptor;)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "initIDs",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "iovMax",
+          "descriptor": "()I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "setfdVal",
+          "descriptor": "(Ljava/io/FileDescriptor;I)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "write1",
+          "descriptor": "(IB)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/IOUtil",
+          "name": "writevMax",
+          "descriptor": "()J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "bind0",
+          "descriptor": "(Ljava/io/FileDescriptor;ZZLjava/net/InetAddress;I)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "initIDs",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "isExclusiveBindAvailable",
+          "descriptor": "()I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "isIPv6Available0",
+          "descriptor": "()Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "isReusePortAvailable0",
+          "descriptor": "()Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "listen",
+          "descriptor": "(Ljava/io/FileDescriptor;I)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "localInetAddress",
+          "descriptor": "(Ljava/io/FileDescriptor;)Ljava/net/InetAddress;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "localPort",
+          "descriptor": "(Ljava/io/FileDescriptor;)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "pollconnValue",
+          "descriptor": "()S",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "pollerrValue",
+          "descriptor": "()S",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "pollhupValue",
+          "descriptor": "()S",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "pollinValue",
+          "descriptor": "()S",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "pollnvalValue",
+          "descriptor": "()S",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "polloutValue",
+          "descriptor": "()S",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/Net",
+          "name": "socket0",
+          "descriptor": "(ZZZZ)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/SocketDispatcher",
+          "name": "close0",
+          "descriptor": "(I)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/SocketDispatcher",
+          "name": "read0",
+          "descriptor": "(Ljava/io/FileDescriptor;JI)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/SocketDispatcher",
+          "name": "write0",
+          "descriptor": "(Ljava/io/FileDescriptor;JI)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/UnixDomainSockets",
+          "name": "accept0",
+          "descriptor": "(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;[Ljava/lang/Object;)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/UnixDomainSockets",
+          "name": "bind0",
+          "descriptor": "(Ljava/io/FileDescriptor;[B)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/UnixDomainSockets",
+          "name": "connect0",
+          "descriptor": "(Ljava/io/FileDescriptor;[B)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/UnixDomainSockets",
+          "name": "init",
+          "descriptor": "()Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/UnixDomainSockets",
+          "name": "localAddress0",
+          "descriptor": "(Ljava/io/FileDescriptor;)[B",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/UnixDomainSockets",
+          "name": "socket0",
+          "descriptor": "()I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/WEPoll",
+          "name": "create",
+          "descriptor": "()J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/WEPoll",
+          "name": "ctl",
+          "descriptor": "(JIJI)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/WEPoll",
+          "name": "dataOffset",
+          "descriptor": "()I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/WEPoll",
+          "name": "eventSize",
+          "descriptor": "()I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/WEPoll",
+          "name": "eventsOffset",
+          "descriptor": "()I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/ch/WEPoll",
+          "name": "wait",
+          "descriptor": "(JJII)I",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "CloseHandle",
+          "descriptor": "(J)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "CreateFile0",
+          "descriptor": "(JIIJII)J",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "DeleteFile0",
+          "descriptor": "(J)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "DeviceIoControlGetReparsePoint",
+          "descriptor": "(JJI)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "FindClose",
+          "descriptor": "(J)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "FindFirstFile0",
+          "descriptor": "(JLsun/nio/fs/WindowsNativeDispatcher$FirstFile;)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "FindNextFile0",
+          "descriptor": "(JJ)Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "GetFileAttributesEx0",
+          "descriptor": "(JJ)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "GetFileInformationByHandle0",
+          "descriptor": "(JJ)V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "GetFullPathName0",
+          "descriptor": "(J)Ljava/lang/String;",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/nio/fs/WindowsNativeDispatcher",
+          "name": "initIDs",
+          "descriptor": "()V",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "native method without a JABS implementation",
+          "class": "sun/security/provider/NativeSeedGenerator",
+          "name": "nativeGenerateSeed",
+          "descriptor": "([B)Z",
+          "reason": "native method without a JABS implementation"
+        },
+        {
+          "category": "opcode multianewarray",
+          "class": "java/lang/invoke/LambdaForm",
+          "name": "<clinit>",
+          "descriptor": "()V",
+          "reason": "pc 41: opcode multianewarray (0xc5) not supported yet"
+        },
+        {
+          "category": "opcode multianewarray",
+          "class": "java/lang/invoke/StringConcatFactory",
+          "name": "<clinit>",
+          "descriptor": "()V",
+          "reason": "pc 175: opcode multianewarray (0xc5) not supported yet"
+        },
+        {
+          "category": "opcode multianewarray",
+          "class": "java/lang/reflect/Executable",
+          "name": "sharedGetParameterAnnotations",
+          "descriptor": "([Ljava/lang/Class;[B)[[Ljava/lang/annotation/Annotation;",
+          "reason": "pc 9: opcode multianewarray (0xc5) not supported yet"
+        },
+        {
+          "category": "type relationship outside the unit",
+          "class": "java/lang/Class",
+          "name": "getGenericInterfaces",
+          "descriptor": "()[Ljava/lang/reflect/Type;",
+          "reason": "pc 20: expected a [Ljava/lang/reflect/Type; reference, found java/lang/Object (or its hierarchy is outside the unit)"
+        }
+      ]
+    }
+  }
+}
