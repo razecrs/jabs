@@ -7016,6 +7016,8 @@ const IO_C: &str = include_str!("../runtime/jabs_io.c");
 const SYNC_C: &str = include_str!("../runtime/jabs_sync.c");
 /// Java threads on OS threads (handwritten, OS-specific).
 const THREAD_C: &str = include_str!("../runtime/jabs_thread.c");
+/// Reflection: member listings and reflective calls (handwritten).
+const REFLECT_C: &str = include_str!("../runtime/jabs_reflect.c");
 
 /// What a program needs beyond its classes.
 #[derive(Default)]
@@ -7441,6 +7443,7 @@ pub fn compile_unit_with(
                 + &FILES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &SYNC_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &THREAD_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                + &REFLECT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &(if registry_emitted {
                     IO_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 } else {
@@ -7464,6 +7467,7 @@ pub fn compile_unit_with(
             files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
             files.push(("jabs_sync.c".to_string(), SYNC_C.to_string()));
             files.push(("jabs_thread.c".to_string(), THREAD_C.to_string()));
+            files.push(("jabs_reflect.c".to_string(), REFLECT_C.to_string()));
             if registry_emitted {
                 files.push(("jabs_io.c".to_string(), IO_C.to_string()));
             }
