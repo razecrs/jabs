@@ -174,8 +174,17 @@ const INTRINSICS: &[Intrinsic] = &[
             "fillInStackTrace",
             "(I)Ljava/lang/Throwable;",
         ),
-        body: "return self; /* stack traces are not captured yet */",
-        needs_classes: false,
+        body: "(void)a0; return jabs_fill_in_stack_trace(self);",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "java/lang/StackTraceElement",
+            "initStackTraceElements",
+            "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V",
+        ),
+        body: "jabs_init_stack_trace_elements(a0, a1, a2);",
+        needs_classes: true,
     },
     Intrinsic {
         key: (
@@ -4555,6 +4564,9 @@ struct RegistryInputs<'a> {
     inits: &'a BTreeSet<String>,
     methods: &'a BTreeSet<MethodKey>,
     interfaces: &'a BTreeSet<&'a str>,
+    /// Classes generated for invokedynamic (lambda proxies): hidden classes on the JVM, so their
+    /// frames never appear in stack traces.
+    hidden: &'a BTreeSet<String>,
 }
 
 fn emit_class_registry(
@@ -4569,6 +4581,7 @@ fn emit_class_registry(
         inits,
         methods,
         interfaces,
+        hidden,
     } = *inputs;
     let class_struct = object_struct(CLASS);
     let string_struct = object_struct(STRING);
@@ -4863,7 +4876,8 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
     ));
     out.push_str(&for_name_function(unit, inits));
     out.push_str(&var_handle_functions(unit, recorded, inits));
-    out.push_str(&stack_functions(methods));
+    out.push_str(&stack_functions(methods, hidden));
+    out.push_str(&stack_trace_functions(unit, recorded));
     out.push_str(&new_instance_function(unit, recorded, methods));
     out.push_str(&main_thread_function(unit, recorded));
     out.push('\n');
@@ -5365,22 +5379,24 @@ jabs_object *jabs_class_new_instance(jabs_object *c) {{
 /// Stack walking: which compiled method each native frame belongs to. Every emitted method's
 /// function start is listed with its class; frames whose function is not listed (runtime C
 /// helpers, class initialization wrappers) are not Java frames and are skipped.
-fn stack_functions(methods: &BTreeSet<MethodKey>) -> String {
+fn stack_functions(methods: &BTreeSet<MethodKey>, hidden: &BTreeSet<String>) -> String {
     let mut out = String::from(
-        "typedef struct { const void *start; const char *class_name; const char *method; } jabs_frame_entry;\nstatic jabs_frame_entry jabs_frames[] = {\n",
+        "/* hidden: left out of stack traces, as the JVM leaves out hidden classes' frames. */\ntypedef struct { const void *start; const char *class_name; const char *name; const char *descriptor; int hidden; } jabs_frame_entry;\nstatic jabs_frame_entry jabs_frames[] = {\n",
     );
     for (class, name, descriptor) in methods {
         let _ = writeln!(
             out,
-            "    {{ (const void *)&{}, \"{}\", \"{}{}\" }},",
+            "    {{ (const void *)&{}, \"{}\", \"{}\", \"{}\", {} }},",
             symbol(class, name, descriptor),
             c_escape(class),
             c_escape(name),
-            c_escape(descriptor)
+            c_escape(descriptor),
+            i32::from(hidden.contains(class))
         );
     }
-    // Runtime functions that stand in for a Java method keep that method's class.
-    out.push_str("    { (const void *)&jabs_class_new_instance, \"java/lang/Class\", \"newInstance()Ljava/lang/Object;\" },\n    { NULL, NULL, NULL }\n};\n");
+    // Runtime functions that stand in for a Java method keep that method's class, for
+    // getClassContext; in stack traces the compiled Java method already has its own frame.
+    out.push_str("    { (const void *)&jabs_class_new_instance, \"java/lang/Class\", \"newInstance\", \"()Ljava/lang/Object;\", 1 },\n    { NULL, NULL, NULL, NULL, 0 }\n};\n");
     out.push_str(
         r#"static int jabs_compare_frames(const void *a, const void *b) {
     uintptr_t x = (uintptr_t)((const jabs_frame_entry *)a)->start, y = (uintptr_t)((const jabs_frame_entry *)b)->start;
@@ -5394,7 +5410,7 @@ static const jabs_frame_entry *jabs_frame_of(const void *start) {
         while (jabs_frames[count].start) count++;
         qsort(jabs_frames, count, sizeof *jabs_frames, jabs_compare_frames);
     }
-    jabs_frame_entry key = { start, NULL, NULL };
+    jabs_frame_entry key = { start, NULL, NULL, NULL, 0 };
     return (const jabs_frame_entry *)bsearch(&key, jabs_frames, count, sizeof key, jabs_compare_frames);
 }
 
@@ -5413,7 +5429,7 @@ void jabs_print_java_stack(void) {
     for (int i = 0; i < n; i++) {
         const jabs_frame_entry *e = starts[i] ? jabs_frame_of(starts[i]) : NULL;
         if (!e) continue;
-        fprintf(stderr, "    at %s.%s\n", e->class_name, e->method);
+        fprintf(stderr, "    at %s.%s%s\n", e->class_name, e->name, e->descriptor);
         shown++;
     }
     if (!shown) fprintf(stderr, "    (no compiled Java frames found on the stack)\n");
@@ -5449,6 +5465,122 @@ jabs_object *jabs_class_context(const void *from) {
 "#,
     );
     out
+}
+
+/// `Throwable.fillInStackTrace(int)` and `StackTraceElement.initStackTraceElements`, the way
+/// HotSpot fills them: the backtrace is a `long[]` of frame-table entries, innermost first, at most
+/// 1024 (the JVM's default MaxJavaStackTraceDepth); `fillInStackTrace` frames and then the
+/// `<init>` frames of the throwable's own class and superclasses are left out, as are hidden
+/// classes' frames. Elements get the class, its `Class`, the method name, no file name and line
+/// -1 (JABS keeps no line tables yet, so `toString` says "Unknown Source").
+fn stack_trace_functions(unit: &Unit, recorded: &[&ClassFile]) -> String {
+    let throwable = "java/lang/Throwable";
+    let element = "java/lang/StackTraceElement";
+    let has_field = |class: &str, name: &str, descriptor: &str| {
+        unit.get(class).is_some_and(|c| {
+            c.fields
+                .iter()
+                .any(|f| f.name == name && f.descriptor == descriptor && f.access & ACC_STATIC == 0)
+        })
+    };
+    let recorded_class = |c: &str| recorded.iter().any(|r| r.name == c);
+    let throwable_ok = recorded_class(throwable)
+        && has_field(throwable, "backtrace", "Ljava/lang/Object;")
+        && has_field(throwable, "depth", "I");
+    let element_ok = recorded_class(element)
+        && [
+            ("declaringClassObject", "Ljava/lang/Class;"),
+            ("declaringClass", "Ljava/lang/String;"),
+            ("methodName", "Ljava/lang/String;"),
+            ("fileName", "Ljava/lang/String;"),
+            ("lineNumber", "I"),
+        ]
+        .iter()
+        .all(|(name, descriptor)| has_field(element, name, descriptor));
+    if !throwable_ok || !element_ok {
+        // Without StackTraceElement nothing can read a trace, so recording none is exact; a
+        // Throwable or element layout JABS does not know stops instead of guessing.
+        let fill = if recorded_class(element) {
+            "jabs_not_compiled(\"Throwable.fillInStackTrace (unknown Throwable or StackTraceElement layout)\");"
+        } else {
+            "return throwable;"
+        };
+        return format!(
+            "jabs_object *jabs_fill_in_stack_trace(jabs_object *throwable) {{ {fill} }}\n\
+void jabs_init_stack_trace_elements(jabs_object *elements, jabs_object *backtrace, int32_t depth) {{ (void)elements; (void)backtrace; (void)depth; jabs_not_compiled(\"StackTraceElement.initStackTraceElements (unknown layout)\"); }}\n"
+        );
+    }
+    let t = object_struct(throwable);
+    let e = object_struct(element);
+    format!(
+        r#"
+#define JABS_MAX_TRACE 1024
+jabs_object *jabs_fill_in_stack_trace(jabs_object *throwable) {{
+    const void *starts[JABS_MAX_TRACE];
+    const jabs_frame_entry *frames[JABS_MAX_TRACE];
+    int n = jabs_platform_stack_functions(starts, JABS_MAX_TRACE);
+    const jabs_class *base = jabs_record_named("{throwable}");
+    int count = 0, skipping_fill = 1, skipping_init = 1;
+    for (int i = 0; i < n && count < JABS_MAX_TRACE; i++) {{
+        const jabs_frame_entry *e = starts[i] ? jabs_frame_of(starts[i]) : NULL;
+        if (!e || e->hidden) continue;
+        const jabs_class *holder = jabs_record_named(e->class_name);
+        if (skipping_fill) {{
+            if (strcmp(e->name, "fillInStackTrace") == 0 && holder && base && jabs_class_assignable(holder, base)) continue;
+            skipping_fill = 0;
+        }}
+        if (skipping_init) {{
+            if (strcmp(e->name, "<init>") == 0 && holder && jabs_class_assignable(throwable->cls, holder)) continue;
+            skipping_init = 0;
+        }}
+        frames[count++] = e;
+    }}
+    jabs_object *backtrace = jabs_new_array(count, sizeof(int64_t), JABS_COMPONENT_PRIMITIVE, NULL, "[J", NULL);
+    if (!backtrace) return NULL;
+    int64_t *slots = (int64_t *)jabs_array_data((jabs_array *)backtrace);
+    for (int i = 0; i < count; i++) slots[i] = (int64_t)(intptr_t)frames[i];
+    (({t} *)throwable)->{backtrace} = backtrace;
+    (({t} *)throwable)->{depth} = count;
+    return throwable;
+}}
+
+void jabs_init_stack_trace_elements(jabs_object *elements, jabs_object *backtrace, int32_t depth) {{
+    if (!elements || !backtrace) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }}
+    jabs_array *a = (jabs_array *)elements, *b = (jabs_array *)backtrace;
+    /* The backtrace is only ever the long[] jabs_fill_in_stack_trace made. */
+    if (backtrace->cls != jabs_array_class() || strcmp(b->descriptor, "[J") != 0) jabs_not_compiled("StackTraceElement.initStackTraceElements with a backtrace JABS did not record");
+    if (depth < 0 || depth > a->length || depth > b->length) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return; }}
+    const int64_t *slots = (const int64_t *)jabs_array_data(b);
+    for (int32_t i = 0; i < depth; i++) {{
+        const jabs_frame_entry *f = (const jabs_frame_entry *)(intptr_t)slots[i];
+        jabs_object *ste = ((jabs_object **)jabs_array_data(a))[i];
+        if (!ste) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }}
+        jabs_object *cls = jabs_class_object(f->class_name);
+        if (!cls) return;
+        size_t length = strlen(f->class_name);
+        char *dotted = (char *)malloc(length + 1);
+        if (!dotted) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return; }}
+        for (size_t k = 0; k <= length; k++) dotted[k] = f->class_name[k] == '/' ? '.' : f->class_name[k];
+        jabs_object *class_name = jabs_string_from_utf8(dotted);
+        free(dotted);
+        jabs_object *method_name = jabs_string_from_utf8(f->name);
+        if (!class_name || !method_name) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return; }}
+        (({e} *)ste)->{class_object} = cls;
+        (({e} *)ste)->{declaring} = class_name;
+        (({e} *)ste)->{method} = method_name;
+        (({e} *)ste)->{file} = NULL;
+        (({e} *)ste)->{line} = -1;
+    }}
+}}
+"#,
+        backtrace = instance_field("backtrace"),
+        depth = instance_field("depth"),
+        class_object = instance_field("declaringClassObject"),
+        declaring = instance_field("declaringClass"),
+        method = instance_field("methodName"),
+        file = instance_field("fileName"),
+        line = instance_field("lineNumber"),
+    )
 }
 
 /// Runtime half of VarHandles: creating handles (instances of VarHandle's record followed by
@@ -6953,6 +7085,11 @@ pub fn compile_unit_with(
         have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING);
     let registry_emitted = registry;
     emit_literals(&mut source, &literals, registry);
+    let hidden_classes: BTreeSet<String> = indy
+        .defined_by
+        .iter()
+        .map(|(generated, _)| generated.clone())
+        .collect();
     if registry {
         emit_class_registry(
             &mut source,
@@ -6964,6 +7101,7 @@ pub fn compile_unit_with(
                 inits: &emission.inits,
                 methods: &emission.methods,
                 interfaces: &interface_records,
+                hidden: &hidden_classes,
             },
         );
     }

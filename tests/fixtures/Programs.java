@@ -58,3 +58,34 @@ class Props {
         System.out.println(args.length + " " + (args.length > 0 ? args[0] : ""));
     }
 }
+
+// Stack traces as the JVM records them: innermost first, without fillInStackTrace or the
+// throwable's own constructor frames, without lambda proxy frames, ending at main.
+class Traces {
+    static class Oops extends RuntimeException {
+        Oops() { super("x"); }
+    }
+
+    static String frame(Throwable t, int depth) {
+        StackTraceElement e = t.getStackTrace()[depth];
+        return e.getClassName() + "." + e.getMethodName();
+    }
+
+    static String where(int depth) { return frame(new Throwable(), depth); }
+
+    static String nested(int depth) { return where(depth); }
+
+    public static void main(String[] args) {
+        for (int d = 0; d < 3; d++) System.out.println(nested(d));
+        System.out.println(frame(new Oops(), 0));
+        System.out.println(new Throwable().getStackTrace().length);
+        Runnable r = () -> System.out.println(frame(new Throwable(), 1));
+        r.run();
+        try {
+            Integer.parseInt("x");
+        } catch (NumberFormatException e) {
+            System.out.println(frame(e, 0));
+            System.out.println(e.getStackTrace()[e.getStackTrace().length - 1].getMethodName());
+        }
+    }
+}

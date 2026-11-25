@@ -195,7 +195,7 @@ const FIXTURE_SOURCES: [&str; 13] = [
 ];
 
 /// Whole programs from `Programs.java`: (class, `-D` properties, arguments).
-const PROGRAMS: [(&str, &[&str], &[&str]); 8] = [
+const PROGRAMS: [(&str, &[&str], &[&str]); 9] = [
     ("EchoArgs", &[], &[]),
     ("EchoArgs", &[], &["one", "two words", ""]),
     ("ExitCode", &[], &[]),
@@ -212,6 +212,7 @@ const PROGRAMS: [(&str, &[&str], &[&str]); 8] = [
         ],
         &["-Dnot.a.property"],
     ),
+    ("Traces", &[], &[]),
 ];
 
 /// The prefix the JVM's launcher puts before an exception that escaped `main`.
@@ -1014,6 +1015,21 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         jvm_runs[7].stdout,
         "a=b c\n[]\ntrue\ndefault\n1 -Dnot.a.property\n"
+    );
+    // Every trace rule is exercised: depths, a constructor chain, main as the last frame, a
+    // lambda proxy that must stay hidden, and an exception thrown inside the JDK.
+    assert_eq!(
+        jvm_runs[8].stdout,
+        concat!(
+            "Traces.where\n",
+            "Traces.nested\n",
+            "Traces.main\n",
+            "Traces.main\n",
+            "1\n",
+            "Traces.main\n",
+            "java.lang.NumberFormatException.forInputString\n",
+            "main\n"
+        )
     );
     eprintln!(
         "{} programs identical between the JVM and native code: {:.1?}",
