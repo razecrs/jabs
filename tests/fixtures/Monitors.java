@@ -33,15 +33,19 @@ public class Monitors {
         synchronized (o) { o.wait(0, 500000); }
         return 1;
     }
-    /** A notify with nobody waiting is not remembered: the next timed wait still times out. */
+    /** A notify with nobody waiting is not remembered: the next timed wait still times out.
+     *  A remembered notify would return within well under a millisecond, so waiting 50 ms and
+     *  requiring half of it proves the point. Requiring the full timeout was flaky: a timed wait
+     *  lasts only about its timeout, and HotSpot on a loaded Windows machine woke a 20 ms wait
+     *  a little early (the JVM answered 0) while JABS, which rounds up, did not. */
     static int notifyBeforeWaitIsNotRemembered() throws InterruptedException {
         Object o = new Object();
         synchronized (o) {
             o.notify();
             o.notifyAll();
             long start = System.nanoTime();
-            o.wait(20);
-            return System.nanoTime() - start >= 20_000_000L ? 1 : 0;
+            o.wait(50);
+            return System.nanoTime() - start >= 25_000_000L ? 1 : 0;
         }
     }
     /** wait in a synchronized method waits on the receiver's monitor. */

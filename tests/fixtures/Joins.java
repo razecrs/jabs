@@ -151,6 +151,16 @@ class NotifyWakesOne {
         synchronized (lock) {
             lock.notify();
         }
+        // Wait until the notified waiter has really run, then give any wrongly woken extra
+        // waiter time to show. A bare sleep was load-sensitive: on a busy machine the woken
+        // thread might not run within it, on either the JVM or natively, and read as 0. Now load
+        // can only hide a wrong extra wake-up, never invent a failure.
+        for (int spins = 0; spins < 10000; spins++) {
+            synchronized (lock) {
+                if (woken > 0) break;
+            }
+            Thread.sleep(1);
+        }
         Thread.sleep(200);
         int afterOne;
         synchronized (lock) {
