@@ -234,3 +234,18 @@ fn interrupt_wakes_a_waiting_thread() {
 fn interrupt_before_wait_returns_at_once() {
     run("interrupt_before_wait_returns_at_once");
 }
+
+#[test]
+fn atomic_float_add_loses_no_updates() {
+    run("atomic_float_add_loses_no_updates");
+}
+
+#[test]
+fn atomic_compare_and_set_loses_no_updates() {
+    run("atomic_compare_and_set_loses_no_updates");
+}
+
+#[test]
+fn volatile_long_is_never_torn() {
+    run("volatile_long_is_never_torn");
+}

@@ -1133,7 +1133,9 @@ const UNSAFE: &str = "jdk/internal/misc/Unsafe";
 
 /// Bodies for jdk.internal.misc.Unsafe natives. Offsets are byte offsets from the object pointer
 /// (our struct layouts and array data start), or raw addresses when the object is null, as in
-/// HotSpot. With a single thread, volatile accesses, fences and compare-and-set are plain.
+/// HotSpot. Volatile accesses and compare-and-set/exchange are sequentially consistent atomics
+/// (Java volatile), on naturally aligned addresses only: an atomic access to a misaligned one
+/// stops rather than tear or trap. Plain get/put stay ordinary loads and stores.
 fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
     const TYPES: [(&str, &str, &str); 9] = [
         ("Int", "I", "int32_t"),
@@ -1147,23 +1149,45 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
         ("Double", "D", "double"),
     ];
     let at = |ty: &str| format!("(*({ty} *)((char *)a0 + a1))");
+    // The address of an atomic access, checked for natural alignment.
+    let atomic_at = |ty: &str| {
+        format!(
+            "{ty} *p = ({ty} *)((char *)a0 + a1); if ((uintptr_t)p % sizeof *p != 0) jabs_not_compiled(\"jdk/internal/misc/Unsafe.{name} at a misaligned address\");"
+        )
+    };
     for (word, code, ty) in TYPES {
-        for suffix in ["", "Volatile"] {
-            if name == format!("get{word}{suffix}")
-                && descriptor == format!("(Ljava/lang/Object;J){code}")
-            {
-                return Some((format!("return {};", at(ty)), false));
-            }
-            if name == format!("put{word}{suffix}")
-                && descriptor == format!("(Ljava/lang/Object;J{code})V")
-            {
-                let value = if code == "Z" {
-                    "(uint8_t)(a2 & 1)".to_string()
-                } else {
-                    format!("({ty})a2")
-                };
-                return Some((format!("{} = {value};", at(ty)), false));
-            }
+        let value = if code == "Z" {
+            "(uint8_t)(a2 & 1)".to_string()
+        } else {
+            format!("({ty})a2")
+        };
+        if name == format!("get{word}") && descriptor == format!("(Ljava/lang/Object;J){code}") {
+            return Some((format!("return {};", at(ty)), false));
+        }
+        if name == format!("put{word}") && descriptor == format!("(Ljava/lang/Object;J{code})V") {
+            return Some((format!("{} = {value};", at(ty)), false));
+        }
+        if name == format!("get{word}Volatile")
+            && descriptor == format!("(Ljava/lang/Object;J){code}")
+        {
+            return Some((
+                format!(
+                    "{} {ty} v; __atomic_load(p, &v, __ATOMIC_SEQ_CST); return v;",
+                    atomic_at(ty)
+                ),
+                false,
+            ));
+        }
+        if name == format!("put{word}Volatile")
+            && descriptor == format!("(Ljava/lang/Object;J{code})V")
+        {
+            return Some((
+                format!(
+                    "{} {ty} v = {value}; __atomic_store(p, &v, __ATOMIC_SEQ_CST);",
+                    atomic_at(ty)
+                ),
+                false,
+            ));
         }
         if matches!(word, "Int" | "Long" | "Reference") {
             if name == format!("compareAndSet{word}")
@@ -1171,8 +1195,8 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
             {
                 return Some((
                     format!(
-                        "{ty} *p = &{}; if (*p != a2) return 0; *p = a3; return 1;",
-                        at(ty)
+                        "{} {ty} e = a2; {ty} n = a3; return __atomic_compare_exchange(p, &e, &n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);",
+                        atomic_at(ty)
                     ),
                     false,
                 ));
@@ -1182,8 +1206,8 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
             {
                 return Some((
                     format!(
-                        "{ty} *p = &{}; {ty} old = *p; if (old == a2) *p = a3; return old;",
-                        at(ty)
+                        "{} {ty} e = a2; {ty} n = a3; (void)__atomic_compare_exchange(p, &e, &n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e;",
+                        atomic_at(ty)
                     ),
                     false,
                 ));
@@ -1191,9 +1215,9 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
         }
     }
     let body = match (name, descriptor) {
-        ("fullFence" | "loadFence" | "storeFence", "()V") => {
-            "/* single-threaded: program order is enough */"
-        }
+        ("fullFence", "()V") => "__atomic_thread_fence(__ATOMIC_SEQ_CST);",
+        ("loadFence", "()V") => "__atomic_thread_fence(__ATOMIC_ACQUIRE);",
+        ("storeFence", "()V") => "__atomic_thread_fence(__ATOMIC_RELEASE);",
         ("throwException", "(Ljava/lang/Throwable;)V") => {
             "jabs_pending = a0 ? a0 : jabs_vm_throwable(JABS_VM_NULL_POINTER);"
         }
@@ -3283,7 +3307,25 @@ enum VarHandleOp {
     GetAndBitwise(char),
 }
 
-/// The access mode named `name` (all memory orders are equal with one thread).
+/// The C11 memory orders of an access mode, as (order, failure order of a compare-and-set), or
+/// None for the plain `get` and `set`, which compile to ordinary loads and stores. The bare
+/// atomic names (compareAndSet, getAndAdd, ...) are volatile, as their Javadoc says.
+fn var_handle_order(name: &str) -> Option<(&'static str, &'static str)> {
+    if matches!(name, "get" | "set") {
+        return None;
+    }
+    Some(if name.ends_with("Acquire") {
+        ("__ATOMIC_ACQUIRE", "__ATOMIC_ACQUIRE")
+    } else if name.ends_with("Release") {
+        ("__ATOMIC_RELEASE", "__ATOMIC_RELAXED")
+    } else if name.ends_with("Opaque") || name.ends_with("Plain") {
+        ("__ATOMIC_RELAXED", "__ATOMIC_RELAXED")
+    } else {
+        ("__ATOMIC_SEQ_CST", "__ATOMIC_SEQ_CST")
+    })
+}
+
+/// The access mode named `name`: what it does and how many values it takes.
 fn var_handle_mode(name: &str) -> Option<(VarHandleOp, usize)> {
     let base = name
         .strip_suffix("Acquire")
@@ -3378,14 +3420,6 @@ fn var_handle_access(mode: &str, descriptor: &str, d: usize, exit: &str, npe: &s
     } else {
         "0".into()
     };
-    // Equality as VarHandle defines it: bitwise for float and double.
-    let same = |a: &str, b: &str| {
-        if matches!(value_ty, 'F' | 'D') {
-            format!("memcmp(&{a}, &{b}, sizeof({c})) == 0")
-        } else {
-            format!("{a} == {b}")
-        }
-    };
     let store_check = |v: &str| {
         if coordinates == 2 && value_ty == 'L' {
             format!(
@@ -3402,41 +3436,70 @@ fn var_handle_access(mode: &str, descriptor: &str, d: usize, exit: &str, npe: &s
             format!("s[{handle}].{} = {expr};", field(kind_of(ret).unwrap()))
         }
     };
-    let body = match op {
-        VarHandleOp::Get => result("*p"),
-        VarHandleOp::Set => format!("{c} v = {}; {}*p = v;", value(0), store_check("v")),
-        VarHandleOp::CompareAndSet => format!(
-            "{c} e = {}; {c} n = {}; int32_t r = 0; if ({}) {{ {}*p = n; r = 1; }} {}",
+    // Every mode but plain get/set is an atomic access with its memory order. Reference-array
+    // stores are type-checked before the access, compare-and-set included, as the JDK's
+    // VarHandleReferences.Array does. Compare-and-set compares bytes, which is VarHandle's
+    // bitwise equality for float and double; the weak forms use the strong one (allowed: a weak
+    // compare-and-set may fail spuriously, it need not).
+    let (order, failure) = var_handle_order(mode).unwrap_or(("", ""));
+    let body = match (op, order.is_empty()) {
+        (VarHandleOp::Get, true) => result("*p"),
+        (VarHandleOp::Set, true) => format!("{c} v = {}; {}*p = v;", value(0), store_check("v")),
+        (VarHandleOp::Get, false) => {
+            format!("{c} v; __atomic_load(p, &v, {order}); {}", result("v"))
+        }
+        (VarHandleOp::Set, false) => format!(
+            "{c} v = {}; {}__atomic_store(p, &v, {order});",
+            value(0),
+            store_check("v")
+        ),
+        (VarHandleOp::CompareAndSet, false) => format!(
+            "{c} e = {}; {c} n = {}; {}int32_t r = __atomic_compare_exchange(p, &e, &n, 0, {order}, {failure}); {}",
             value(0),
             value(1),
-            same("(*p)", "e"),
             store_check("n"),
             result("r")
         ),
-        VarHandleOp::CompareAndExchange => format!(
-            "{c} e = {}; {c} n = {}; {c} old = *p; if ({}) {{ {}*p = n; }} {}",
+        (VarHandleOp::CompareAndExchange, false) => format!(
+            "{c} e = {}; {c} n = {}; {}(void)__atomic_compare_exchange(p, &e, &n, 0, {order}, {failure}); {}",
             value(0),
             value(1),
-            same("old", "e"),
             store_check("n"),
-            result("old")
+            result("e")
         ),
-        VarHandleOp::GetAndSet => format!(
-            "{c} v = {}; {c} old = *p; {}*p = v; {}",
+        (VarHandleOp::GetAndSet, false) => format!(
+            "{c} v = {}; {c} old; {}__atomic_exchange(p, &v, &old, {order}); {}",
             value(0),
             store_check("v"),
             result("old")
         ),
-        VarHandleOp::GetAndAdd if !matches!(value_ty, 'L' | 'Z') => format!(
-            "{c} v = {}; {c} old = *p; *p = ({c})(old + v); {}",
+        (VarHandleOp::GetAndAdd, false) if value_ty == 'F' => format!(
+            "{c} old = jabs_atomic_add_float(p, {}, {order}); {}",
             value(0),
             result("old")
         ),
-        VarHandleOp::GetAndBitwise(bit) if !matches!(value_ty, 'L' | 'F' | 'D') => format!(
-            "{c} v = {}; {c} old = *p; *p = ({c})(old {bit} v); {}",
+        (VarHandleOp::GetAndAdd, false) if value_ty == 'D' => format!(
+            "{c} old = jabs_atomic_add_double(p, {}, {order}); {}",
             value(0),
             result("old")
         ),
+        (VarHandleOp::GetAndAdd, false) if !matches!(value_ty, 'L' | 'Z') => format!(
+            "{c} old = __atomic_fetch_add(p, {}, {order}); {}",
+            value(0),
+            result("old")
+        ),
+        (VarHandleOp::GetAndBitwise(bit), false) if !matches!(value_ty, 'L' | 'F' | 'D') => {
+            let builtin = match bit {
+                '|' => "__atomic_fetch_or",
+                '&' => "__atomic_fetch_and",
+                _ => "__atomic_fetch_xor",
+            };
+            format!(
+                "{c} old = {builtin}(p, {}, {order}); {}",
+                value(0),
+                result("old")
+            )
+        }
         _ => return stop("an access mode this type does not support"),
     };
     let view = byte_view_access(mode, op, value_ty, coordinates, base, handle, exit)

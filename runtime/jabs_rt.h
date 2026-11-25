@@ -316,6 +316,31 @@ static inline void jabs_vh_view_store(const jabs_vh *h, void *p, uint64_t bits) 
 }
 int32_t jabs_array_scale(jabs_object *array_class);
 
+/* Atomic accesses (Unsafe, VarHandles, volatile fields) use the clang/GCC __atomic builtins:
+ * the memory they touch is declared without _Atomic, since the same field is also accessed
+ * plainly. VarHandle getAndAdd on a float/double is a compare-and-set loop (no CPU adds floats
+ * in memory atomically) and returns the old value. A loop that keeps losing this long means
+ * something else is broken, so it stops instead of spinning forever. */
+#define JABS_ATOMIC_ADD_RETRIES 100000000u
+static inline float jabs_atomic_add_float(float *p, float v, int order) {
+    float old;
+    __atomic_load(p, &old, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < JABS_ATOMIC_ADD_RETRIES; i++) {
+        float sum = old + v;
+        if (__atomic_compare_exchange(p, &old, &sum, 1, order, __ATOMIC_RELAXED)) return old;
+    }
+    jabs_not_compiled("VarHandle.getAndAdd on a float that never stopped changing");
+}
+static inline double jabs_atomic_add_double(double *p, double v, int order) {
+    double old;
+    __atomic_load(p, &old, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < JABS_ATOMIC_ADD_RETRIES; i++) {
+        double sum = old + v;
+        if (__atomic_compare_exchange(p, &old, &sum, 1, order, __ATOMIC_RELAXED)) return old;
+    }
+    jabs_not_compiled("VarHandle.getAndAdd on a double that never stopped changing");
+}
+
 /* Generated glue the java.io natives use (see io_accessor_functions in cgen.rs). */
 jabs_object *jabs_file_path_of(jabs_object *file);
 jabs_object **jabs_stream_fd_slot(jabs_object *stream);

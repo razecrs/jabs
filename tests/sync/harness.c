@@ -396,6 +396,85 @@ static void interrupt_before_wait_returns_at_once(void) {
     CHECK(r == JABS_WAIT_NOT_OWNER, INTERRUPT, "wait without ownership and with an interrupt pending: expected JABS_WAIT_NOT_OWNER first (as the JVM), got %d", r);
 }
 
+/* ---- atomics, as generated code uses them ---- */
+
+#define ATOMICS "jabs_atomic_add_float/double in runtime/jabs_rt.h, or the __atomic code var_handle_access and unsafe_intrinsic emit (src/cgen.rs)"
+
+enum { ADD_THREADS = 8, ADD_ROUNDS = 20000 };
+typedef struct { double d; float f; int arrived; } adds;
+
+static void adder(void *p) {
+    adds *a = (adds *)p;
+    arrive_and_wait(&a->arrived, ADD_THREADS);
+    for (int i = 0; i < ADD_ROUNDS; i++) {
+        jabs_atomic_add_double(&a->d, 1.0, __ATOMIC_SEQ_CST);
+        jabs_atomic_add_float(&a->f, 1.0f, __ATOMIC_ACQ_REL);
+    }
+}
+
+/* Sums stay exact far below 2^24 (float) and 2^53 (double), so a lost update shows. */
+static void atomic_float_add_loses_no_updates(void) {
+    adds a = { 0.0, 0.0f, 0 };
+    harness_thread *t[ADD_THREADS];
+    for (int i = 0; i < ADD_THREADS; i++) t[i] = harness_spawn(adder, &a);
+    for (int i = 0; i < ADD_THREADS; i++) harness_join(t[i]);
+    double want = (double)ADD_THREADS * ADD_ROUNDS;
+    CHECK(a.d == want, ATOMICS, "double getAndAdd under contention: expected %.0f, got %.0f", want, a.d);
+    CHECK(a.f == (float)want, ATOMICS, "float getAndAdd under contention: expected %.0f, got %.0f", want, (double)a.f);
+}
+
+enum { CAS_THREADS = 8, CAS_ROUNDS = 50000 };
+typedef struct { int64_t counter; int arrived; } cas_race;
+
+/* The compare-and-set Unsafe.compareAndSetLong compiles to, in a retry loop like
+ * AtomicLong.getAndIncrement's. */
+static void cas_worker(void *p) {
+    cas_race *c = (cas_race *)p;
+    arrive_and_wait(&c->arrived, CAS_THREADS);
+    for (int i = 0; i < CAS_ROUNDS; i++) {
+        int64_t e;
+        __atomic_load(&c->counter, &e, __ATOMIC_SEQ_CST);
+        for (;;) {
+            int64_t n = e + 1;
+            if (__atomic_compare_exchange(&c->counter, &e, &n, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+        }
+    }
+}
+
+static void atomic_compare_and_set_loses_no_updates(void) {
+    cas_race c = { 0, 0 };
+    harness_thread *t[CAS_THREADS];
+    for (int i = 0; i < CAS_THREADS; i++) t[i] = harness_spawn(cas_worker, &c);
+    for (int i = 0; i < CAS_THREADS; i++) harness_join(t[i]);
+    int64_t want = (int64_t)CAS_THREADS * CAS_ROUNDS;
+    CHECK(c.counter == want, ATOMICS, "compare-and-set increments: expected %lld, got %lld", (long long)want, (long long)c.counter);
+}
+
+/* A volatile long/double must be single-copy atomic: a reader never sees half of one write. */
+enum { TEAR_ROUNDS = 2000000 };
+typedef struct { int64_t value; int done; } tearing;
+
+static void tear_writer(void *p) {
+    tearing *t = (tearing *)p;
+    for (int i = 0; i < TEAR_ROUNDS; i++) {
+        int64_t v = (i & 1) ? -1 : 0;
+        __atomic_store(&t->value, &v, __ATOMIC_SEQ_CST);
+    }
+    __atomic_store_n(&t->done, 1, __ATOMIC_SEQ_CST);
+}
+
+static void volatile_long_is_never_torn(void) {
+    static tearing t;
+    harness_thread *w = harness_spawn(tear_writer, &t);
+    while (!__atomic_load_n(&t.done, __ATOMIC_SEQ_CST)) {
+        int64_t v;
+        __atomic_load(&t.value, &v, __ATOMIC_SEQ_CST);
+        CHECK(v == 0 || v == -1, ATOMICS,
+              "read a torn 64-bit value %016llx (expected 0 or -1)", (unsigned long long)v);
+    }
+    harness_join(w);
+}
+
 typedef struct { const char *name; void (*run)(void); } harness_test;
 static const harness_test tests[] = {
     { "monitor_excludes_concurrent_owners", monitor_excludes_concurrent_owners },
@@ -413,6 +492,9 @@ static const harness_test tests[] = {
     { "wait_notify_ping_pong_loses_no_wakeups", wait_notify_ping_pong_loses_no_wakeups },
     { "interrupt_wakes_a_waiting_thread", interrupt_wakes_a_waiting_thread },
     { "interrupt_before_wait_returns_at_once", interrupt_before_wait_returns_at_once },
+    { "atomic_float_add_loses_no_updates", atomic_float_add_loses_no_updates },
+    { "atomic_compare_and_set_loses_no_updates", atomic_compare_and_set_loses_no_updates },
+    { "volatile_long_is_never_torn", volatile_long_is_never_torn },
 };
 
 int main(int argc, char **argv) {

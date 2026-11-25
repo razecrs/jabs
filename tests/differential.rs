@@ -292,7 +292,7 @@ int main(int argc, char **argv) {{
 }
 
 /// Fixtures that need a newer language level (records, pattern switches, indy string concat).
-const MODERN_FIXTURE_SOURCES: [&str; 2] = ["Indy", "Views"];
+const MODERN_FIXTURE_SOURCES: [&str; 3] = ["Indy", "Views", "Atomics"];
 
 /// Every call in order as (class, method, args); order matters because static state persists across calls.
 fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
@@ -539,6 +539,29 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
     for x in [0, 7, -123] {
         out.push(("Indy", "concatConstants", vec![I(x)]));
     }
+    // Atomic accesses: Unsafe through java.util.concurrent.atomic, and VarHandle access modes.
+    for start in [0, 5, -1, i32::MAX] {
+        out.push(("Atomics", "atomicIntegerUpdates", vec![I(start)]));
+        out.push(("Atomics", "varHandleIntModes", vec![I(start)]));
+    }
+    for start in [0i64, 3, i64::MIN, -27] {
+        out.push(("Atomics", "atomicLongUpdates", vec![J(start)]));
+        out.push(("Atomics", "varHandleLongModes", vec![J(start)]));
+    }
+    for name in [
+        "atomicReferenceUpdates",
+        "atomicBooleanAndArray",
+        "varHandleNarrowModes",
+        "varHandleFloatingModes",
+        "varHandleReferenceModes",
+        "varHandleArrayStoreChecked",
+    ] {
+        out.push(("Atomics", name, vec![]));
+    }
+    for index in [1, 2, -1] {
+        out.push(("Atomics", "atomicIntegerArrayOutOfBounds", vec![I(index)]));
+        out.push(("Atomics", "varHandleArrayIndexChecked", vec![I(index)]));
+    }
     // wait/notify on one thread.
     for name in [
         "timedWaitReturnsOwningTheLock",
@@ -672,6 +695,10 @@ fn where_to_look(class: &str) -> &'static str {
         "Views" => {
             " (byte-array view VarHandles: jabs_vh_address/jabs_var_handle_byte_view and \
              byte_view_access in src/cgen.rs, jabs_vh_view_load/store in runtime/jabs_rt.h)"
+        }
+        "Atomics" => {
+            " (atomics: unsafe_intrinsic and var_handle_access/var_handle_order in src/cgen.rs, \
+             jabs_atomic_add_float/double in runtime/jabs_rt.h)"
         }
         "Monitors" => {
             " (wait/notify: jabs_monitor_wait/jabs_monitor_notify in runtime/jabs_sync.c, the \
@@ -999,6 +1026,14 @@ fn native_matches_reference_jvm() {
     assert_eq!(
         reference[at("Sync", "arrayKinds", Some(0))],
         format!("I {:08x}", 111)
+    );
+    assert_eq!(
+        reference[at("Atomics", "varHandleArrayStoreChecked", None)],
+        "throw java/lang/ArrayStoreException"
+    );
+    assert_eq!(
+        reference[at("Atomics", "varHandleArrayIndexChecked", Some(2))],
+        "throw java/lang/ArrayIndexOutOfBoundsException"
     );
     assert_eq!(
         reference[at("Monitors", "monitorReentryRestoresCountAfterWait", None)],
