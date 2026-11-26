@@ -478,7 +478,7 @@ const char *jabs_jab_java_home(void) {
     return NULL;
 }
 
-jabs_object *jabs_jab_path_string(void) { return jab.active ? jabs_string_from_utf8(jab.path) : NULL; }
+const char *jabs_jab_path(void) { return jab.active ? jab.path : NULL; }
 
 /* ---- Paths into the tree ---- */
 
@@ -818,35 +818,3 @@ int32_t jabs_vfs_close(int64_t d) {
     jabs_unlock(JABS_LOCK_JAB);
     return ok;
 }
-
-/* ---- java.util.zip.Inflater without zlib ----
- * ZipInputStream (and so JarInputStream) makes an Inflater even for STORED entries, which it
- * never inflates. A stream here is only a marker: init, reset, end and getAdler behave as zlib's
- * on a fresh stream; inflating stops the program (the Intrinsic in src/cgen.rs). */
-#define JABS_INFLATER_MAGIC 0x494E464Cu /* "INFL" */
-typedef struct { uint32_t magic; int32_t nowrap; } jabs_inflater;
-
-int64_t jabs_inflater_init(int32_t nowrap) {
-    jabs_inflater *z = (jabs_inflater *)malloc(sizeof *z);
-    if (!z) { jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return 0; }
-    z->magic = JABS_INFLATER_MAGIC;
-    z->nowrap = nowrap;
-    return (int64_t)(intptr_t)z;
-}
-
-static jabs_inflater *jabs_inflater_of(int64_t address) {
-    jabs_inflater *z = (jabs_inflater *)(intptr_t)address;
-    if (!z || z->magic != JABS_INFLATER_MAGIC) jabs_not_compiled("java.util.zip.Inflater with an address JABS never made (jabs_inflater_of, jabs_jab.c)");
-    return z;
-}
-
-void jabs_inflater_reset(int64_t address) { (void)jabs_inflater_of(address); }
-
-void jabs_inflater_end(int64_t address) {
-    jabs_inflater *z = jabs_inflater_of(address);
-    z->magic = 0;
-    free(z);
-}
-
-/* Adler-32 of no data, as zlib reports before any input (1). */
-int32_t jabs_inflater_adler(int64_t address) { (void)jabs_inflater_of(address); return 1; }

@@ -609,45 +609,8 @@ const INTRINSICS: &[Intrinsic] = &[
     },
     Intrinsic {
         key: ("jabs/rt/Natives", "jabPath", "()Ljava/lang/String;"),
-        body: "return jabs_jab_path_string();",
+        body: "const char *path = jabs_jab_path(); return path ? jabs_string_from_utf8(path) : NULL;",
         needs_classes: true,
-    },
-    // java.util.zip.Inflater: ZipInputStream (JarInputStream, log4j's plugin scan) creates one
-    // even for a jar of STORED entries, which it never inflates. JABS has no zlib: a stream
-    // exists so creating, resetting and ending one work, and inflating stops the program.
-    Intrinsic {
-        key: ("java/util/zip/Inflater", "initIDs", "()V"),
-        body: "/* no field IDs to cache */",
-        needs_classes: false,
-    },
-    Intrinsic {
-        key: ("java/util/zip/Inflater", "init", "(Z)J"),
-        body: "return jabs_inflater_init(a0);",
-        needs_classes: false,
-    },
-    Intrinsic {
-        key: ("java/util/zip/Inflater", "reset", "(J)V"),
-        body: "jabs_inflater_reset(a0);",
-        needs_classes: false,
-    },
-    Intrinsic {
-        key: ("java/util/zip/Inflater", "end", "(J)V"),
-        body: "jabs_inflater_end(a0);",
-        needs_classes: false,
-    },
-    Intrinsic {
-        key: ("java/util/zip/Inflater", "getAdler", "(J)I"),
-        body: "return jabs_inflater_adler(a0);",
-        needs_classes: false,
-    },
-    Intrinsic {
-        key: (
-            "java/util/zip/Inflater",
-            "inflateBytesBytes",
-            "(J[BII[BII)J",
-        ),
-        body: "(void)self; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; jabs_not_compiled(\"java.util.zip.Inflater (DEFLATE): JABS has no inflater; a .jab stores every entry uncompressed\");",
-        needs_classes: false,
     },
     Intrinsic {
         key: ("jabs/rt/Natives", "resourceCount", "(Ljava/lang/String;)I"),

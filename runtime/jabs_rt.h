@@ -793,11 +793,11 @@ extern const char jabs_jab_record_home[];
 extern const char jabs_jab_record_log[];
 /* Find and check the .jab before any Java code runs; a missing or damaged one stops the program. */
 int jabs_jab_start(void);
-/* java.class.path ("" without a .jab), java.home (NULL without a .jab), the .jab's path as a
- * String (null without one: jabs.rt.Natives.jabPath). */
+/* java.class.path ("" without a .jab), java.home (NULL without a .jab), the .jab's path
+ * (NULL without one; jabs.rt.Natives.jabPath makes the String). */
 const char *jabs_jab_class_path(void);
 const char *jabs_jab_java_home(void);
-jabs_object *jabs_jab_path_string(void);
+const char *jabs_jab_path(void);
 /* The virtual tree the file natives consult before the operating system: a path is OUTSIDE (the
  * OS's), a FILE or DIRECTORY of the .jab, or MISSING (inside the .jab's tree, not there). */
 enum { JABS_VFS_OUTSIDE, JABS_VFS_FILE, JABS_VFS_DIRECTORY, JABS_VFS_MISSING };
@@ -832,11 +832,6 @@ int64_t jabs_vfs_position(int64_t d);
 int32_t jabs_vfs_descriptor_kind(int64_t d, uint64_t *id);
 int32_t jabs_vfs_next_name(int64_t d, char **name, int32_t *is_directory, uint64_t *size);
 int32_t jabs_vfs_close(int64_t d);
-/* java.util.zip.Inflater's natives without zlib (jabs_jab.c): a stream that never inflates. */
-int64_t jabs_inflater_init(int32_t nowrap);
-void jabs_inflater_reset(int64_t address);
-void jabs_inflater_end(int64_t address);
-int32_t jabs_inflater_adler(int64_t address);
 
 /* SetErrorMode on Windows (returns the previous mode); 0 elsewhere. */
 int64_t jabs_platform_set_error_mode(int64_t mode);
