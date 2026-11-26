@@ -465,6 +465,8 @@ int64_t jabs_field_offset(jabs_object *c, jabs_object *name);
 int64_t jabs_unsafe_field_offset(jabs_object *field);
 /* ClassLoader.findLoadedClass0 (generated with the class registry). */
 jabs_object *jabs_find_loaded_class(jabs_object *loader, jabs_object *binary);
+/* VarHandle.withInvokeExactBehavior/withInvokeBehavior of a JABS handle (generated). */
+jabs_object *jabs_vh_with_exact(jabs_object *handle, int32_t exact);
 jabs_object **jabs_stream_fd_slot(jabs_object *stream);
 int32_t *jabs_descriptor_fd_slot(jabs_object *descriptor);
 void jabs_descriptor_set_handle(jabs_object *descriptor, int64_t handle);

@@ -4688,7 +4688,20 @@ fn emit_stubs(
         } else {
             "return 0;"
         };
-        let body = if is_abstract {
+        // JABS's VarHandles are instances of VarHandle itself (var_handle_functions), whose
+        // invocation-behavior methods are abstract.
+        let behavior = key.0 == VAR_HANDLE
+            && key.2 == "()Ljava/lang/invoke/VarHandle;"
+            && matches!(
+                key.1.as_str(),
+                "withInvokeExactBehavior" | "withInvokeBehavior"
+            );
+        let body = if behavior {
+            format!(
+                "return jabs_vh_with_exact(self, {});",
+                i32::from(key.1 == "withInvokeExactBehavior")
+            )
+        } else if is_abstract {
             format!("{} {ret}", raise("java/lang/AbstractMethodError"))
         } else {
             format!(
@@ -6192,6 +6205,27 @@ const jabs_vh *jabs_vh_of(jabs_object *o) {{
     return o->cls == &{record} ? (const jabs_vh *)((char *)o + jabs_vh_offset()) : NULL;
 }}
 
+/* VarHandle.withInvokeExactBehavior / withInvokeBehavior of a JABS handle (an instance of
+ * VarHandle itself, so the abstract methods have no implementation): the handle itself when it
+ * already behaves so, else a copy with VarHandle.exact set as asked, which is what
+ * hasInvokeExactBehavior reports. JABS resolves every access through a handle when it compiles
+ * it, so an exact handle does not add the JVM's WrongMethodTypeException checks.
+ * (sun.security.provider.ByteArrayAccess makes its handles exact this way.) */
+jabs_object *jabs_vh_with_exact(jabs_object *o, int32_t exact) {{
+    if (!o || !jabs_vh_of(o)) jabs_not_compiled("VarHandle.withInvokeExactBehavior on a handle JABS did not make (jabs_vh_with_exact)");
+    if ((({vh_struct} *)o)->{exact} == (uint8_t)(exact != 0)) return o;
+    size_t size = jabs_vh_offset() + sizeof(jabs_vh);
+    jabs_object *copy = (jabs_object *)calloc(1, size);
+    if (!copy) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+    jabs_heap_bytes += (int64_t)size;
+    memcpy(copy, o, size);
+    /* A new object: its own lock word and identity hash. */
+    copy->monitor = 0;
+    atomic_store(&copy->hash, 0);
+    (({vh_struct} *)copy)->{exact} = (uint8_t)(exact != 0);
+    return copy;
+}}
+
 void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index) {{
     switch (h->shape) {{
     case JABS_VH_STATIC: return h->address;
@@ -6276,6 +6310,8 @@ jabs_object *jabs_var_handle_byte_view(jabs_object *view_array_class, int32_t bi
 }}
 "#,
         record = class_record(VAR_HANDLE),
+        vh_struct = object_struct(VAR_HANDLE),
+        exact = instance_field("exact"),
     );
     out
 }
