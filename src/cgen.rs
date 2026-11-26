@@ -1887,6 +1887,9 @@ struct Unit<'a> {
     vtables: RefCell<HashMap<String, Rc<Vec<Slot>>>>,
     chains: RefCell<HashMap<String, ChainResult<'a>>>,
     itables: RefCell<HashMap<String, Rc<Vec<ItableEntry>>>>,
+    /// Every class that exists on the program's class path (its jars and the whole JDK), when
+    /// known: a class outside it is absent, which the JVM reports as NoClassDefFoundError.
+    known: Option<std::collections::HashSet<String>>,
 }
 
 impl<'a> Unit<'a> {
@@ -1897,7 +1900,18 @@ impl<'a> Unit<'a> {
             vtables: RefCell::new(HashMap::new()),
             chains: RefCell::new(HashMap::new()),
             itables: RefCell::new(HashMap::new()),
+            known: None,
         }
+    }
+    /// Whether `class` exists nowhere the program could load it from: not in the unit and not
+    /// among the known class-path classes. False whenever that is not known (no evidence).
+    fn absent(&self, class: &str) -> bool {
+        !class.starts_with('[')
+            && !self.classes.contains_key(class)
+            && self
+                .known
+                .as_ref()
+                .is_some_and(|known| !known.contains(class))
     }
     fn get(&self, name: &str) -> Option<&'a ClassFile> {
         self.classes.get(name).copied()
@@ -2293,6 +2307,12 @@ enum Resolved {
     /// Member of a class outside the unit: the instruction stops with this diagnostic if it
     /// ever executes (the JVM likewise resolves references lazily, when first executed).
     Unresolved(String),
+    /// A class on no class path (proved absent): the instruction throws NoClassDefFoundError when
+    /// it executes, as the JVM's lazy resolution does; a type test of null resolves nothing.
+    Absent(String),
+    /// A type test against a class that exists but is not compiled in: a null value passes as
+    /// in HotSpot (nothing is resolved), any other value stops with this diagnostic.
+    UnresolvedType(String),
 }
 
 /// Something a compiled method needs to be compiled too.
@@ -2361,22 +2381,46 @@ impl Cx<'_, '_> {
             (a, b) if a == b => Some(a),
             (VType::Null, o @ VType::Obj(_)) | (o @ VType::Obj(_), VType::Null) => Some(o),
             (VType::Obj(x), VType::Obj(y)) => {
-                let (x, y) = (self.unit.name(x), self.unit.name(y));
-                let common = self
-                    .unit
-                    .chain(&x)
-                    .ok()
-                    .and_then(|chain| {
-                        chain
-                            .iter()
-                            .find(|c| self.unit.is_subclass(&y, &c.name) == Some(true))
-                            .map(|c| c.name.clone())
-                    })
-                    .unwrap_or_else(|| OBJECT.to_string());
+                let common = self.merge_names(&self.unit.name(x), &self.unit.name(y), 0);
                 Some(VType::Obj(self.unit.intern(&common)))
             }
             _ => None,
         }
+    }
+    /// The join of two reference types by name (class names or array descriptors), as the
+    /// JVM's inference verifier computes it (JVMS 4.10.2.2): two arrays of references join to an
+    /// array of their joined element types; an array with anything else, a primitive array that
+    /// differs, or a class with an interface joins to java/lang/Object; two classes join to
+    /// their nearest common superclass. `depth` bounds the recursion through array dimensions.
+    fn merge_names(&self, x: &str, y: &str, depth: u32) -> String {
+        const MAX_ARRAY_DIMENSIONS: u32 = 255;
+        if x == y {
+            return x.to_string();
+        }
+        if x.starts_with('[') || y.starts_with('[') {
+            if depth >= MAX_ARRAY_DIMENSIONS || !x.starts_with('[') || !y.starts_with('[') {
+                return OBJECT.to_string();
+            }
+            let (Some(a), Some(b)) = (element_class(x), element_class(y)) else {
+                return OBJECT.to_string();
+            };
+            let element = self.merge_names(&a, &b, depth + 1);
+            return if element.starts_with('[') {
+                format!("[{element}")
+            } else {
+                format!("[L{element};")
+            };
+        }
+        self.unit
+            .chain(x)
+            .ok()
+            .and_then(|chain| {
+                chain
+                    .iter()
+                    .find(|c| self.unit.is_subclass(y, &c.name) == Some(true))
+                    .map(|c| c.name.clone())
+            })
+            .unwrap_or_else(|| OBJECT.to_string())
     }
     /// Merge two frames at a join: stack shapes must agree, locals that disagree become unusable.
     fn merge_frames(&self, a: &Frame, b: &Frame, pc: u32) -> Result<Frame> {
@@ -2574,9 +2618,13 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 }
             }
         }
-        out.resolved = Some(Resolved::Unresolved(format!(
-            "{class}.{name}{descriptor}: {class} is not in the compilation unit"
-        )));
+        out.resolved = Some(if unit.absent(&class) {
+            Resolved::Absent(class.clone())
+        } else {
+            Resolved::Unresolved(format!(
+                "{class}.{name}{descriptor}: {class} is not in the compilation unit"
+            ))
+        });
         return Ok(out);
     }
     match &insn.op {
@@ -2908,7 +2956,37 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 frame.stack.push(result);
                 return Ok(out);
             }
-            if unit.get(class).is_none() || unit.chain(class).is_err() {
+            if unit.absent(class) {
+                frame.pop_ref(cx, OBJECT, pc)?;
+                frame
+                    .stack
+                    .push(if matches!(insn.op, Op::CheckCast { .. }) {
+                        VType::Obj(unit.intern(class))
+                    } else {
+                        VType::I
+                    });
+                out.resolved = Some(Resolved::Absent(class.clone()));
+                return Ok(out);
+            }
+            if unit.get(class).is_none() {
+                // The class exists somewhere JABS did not compile (another JDK module, another
+                // jar): like a member access on it, the test stops only if it executes, so code
+                // that never takes this path (Netty's probes) still compiles. A null value
+                // resolves nothing, as in HotSpot.
+                frame.pop_ref(cx, OBJECT, pc)?;
+                frame
+                    .stack
+                    .push(if matches!(insn.op, Op::CheckCast { .. }) {
+                        VType::Obj(unit.intern(class))
+                    } else {
+                        VType::I
+                    });
+                out.resolved = Some(Resolved::UnresolvedType(format!(
+                    "type test against {class}: {class} is not in the compilation unit"
+                )));
+                return Ok(out);
+            }
+            if unit.chain(class).is_err() {
                 bail!(
                     "pc {pc}: type test against {class} (outside the unit or an interface) is not compiled yet"
                 );
@@ -3988,6 +4066,38 @@ fn emit_method(
         let npe = throw("java/lang/NullPointerException", exit);
         if let Some(Resolved::Unresolved(message)) = resolved {
             let _ = writeln!(out, "    jabs_not_compiled(\"{}\");", c_escape(message));
+            continue;
+        }
+        if let Some(Resolved::UnresolvedType(message)) = resolved {
+            let stop = format!("jabs_not_compiled(\"{}\");", c_escape(message));
+            let line = match &insn.op {
+                Op::InstanceOf { .. } => {
+                    format!("if (s[{t}].a == NULL) s[{t}].i = 0; else {stop}", t = d - 1)
+                }
+                _ => format!("if (s[{}].a != NULL) {stop}", d - 1),
+            };
+            let _ = writeln!(out, "    {line}");
+            continue;
+        }
+        if let Some(Resolved::Absent(class)) = resolved {
+            // HotSpot resolves the class of instanceof/checkcast only for a non-null value; a
+            // member access always resolves it.
+            let raise = throw("java/lang/NoClassDefFoundError", exit);
+            let line = match &insn.op {
+                Op::InstanceOf { .. } => {
+                    format!(
+                        "if (s[{t}].a == NULL) s[{t}].i = 0; else {raise}",
+                        t = d - 1
+                    )
+                }
+                Op::CheckCast { .. } => format!("if (s[{}].a != NULL) {raise}", d - 1),
+                _ => raise,
+            };
+            let _ = writeln!(
+                out,
+                "    {line} /* {} is on no class path */",
+                class.replace("*/", "*_/")
+            );
             continue;
         }
         let line = match &insn.op {
@@ -7846,6 +7956,11 @@ pub struct UnitExtras {
     /// The program has a .jab (src/jab.rs): its class path and java.home come from it at run
     /// time (runtime/jabs_jab.c) and `resources` should be empty (the .jab holds them).
     pub jab: Option<JabConfig>,
+    /// Every class on the program's class path: its input jars and every module of the JDK it
+    /// runs on (`jdk::all_class_names`). With it, a class the code names that is in neither is
+    /// proved absent, and an instruction naming it throws NoClassDefFoundError as on the JVM
+    /// (Netty probes for SLF4J this way). Without it, such an instruction stops, as before.
+    pub known_classes: Option<BTreeSet<String>>,
 }
 
 /// A program's .jab, as the generated C knows it.
@@ -7937,7 +8052,11 @@ pub fn compile_unit_with(
             app_classes.insert(proxy.name.clone());
         }
     }
-    let unit = Unit::new(classes);
+    let mut unit = Unit::new(classes);
+    unit.known = extras
+        .known_classes
+        .as_ref()
+        .map(|known| known.iter().cloned().collect());
     // The app class loader is created by the runtime itself, so it is always reachable.
     let mut roots = roots.cloned();
     if let Some(roots) = roots.as_mut()

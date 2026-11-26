@@ -206,7 +206,7 @@ const FIXTURE_SOURCES: [&str; 17] = [
 ];
 
 /// Whole programs from `Programs.java`: (class, `-D` properties, arguments).
-const PROGRAMS: [(&str, &[&str], &[&str]); 33] = [
+const PROGRAMS: [(&str, &[&str], &[&str]); 34] = [
     ("EchoArgs", &[], &[]),
     ("EchoArgs", &[], &["one", "two words", ""]),
     ("ExitCode", &[], &[]),
@@ -228,6 +228,7 @@ const PROGRAMS: [(&str, &[&str], &[&str]); 33] = [
     ("TimeZones", &[], &[]),
     ("TimeZones", &["user.timezone=Asia/Tokyo"], &[]),
     ("Checksums", &[], &[]),
+    ("AbsentProbe", &[], &[]),
     // Threads.java: one mechanism each; where to look when one differs is in THREAD_PROGRAMS.
     ("StartRunsOnOwnThread", &[], &[]),
     ("StartTwiceThrows", &[], &[]),
@@ -550,6 +551,10 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         out.push(("Arrays", "shapes", vec![I(n.min(50))]));
         out.push(("Arrays", "objects", vec![I(n)]));
         out.push(("Arrays", "rowsOfStrings", vec![I(n.min(50))]));
+        // Array-type joins in the verifier: interface, class and row element types.
+        for name in ["interfaceArrayJoin", "classArrayJoin", "rowArrayJoin"] {
+            out.push(("Arrays", name, vec![I(n.min(1))]));
+        }
     }
     // Reference rows: covariant stores, an interface element type and a reflective Object[][].
     for which in [0, 1, 2] {
@@ -976,6 +981,10 @@ fn native_matches_reference_jvm() {
                 .map(|c| fixtures.join(format!("{c}.java"))),
         ));
 
+    // GoneProbe exists only so AbsentProbe compiles: remove it so it is on no class path, for
+    // the JVM and for JABS alike (known_classes below then proves it absent).
+    fs::remove_file(root.join("GoneProbe.class")).unwrap();
+
     let mut java = String::from("public class Runner {\n");
     java.push_str(JAVA_PRINTERS);
     java.push_str("    public static void main(String[] args) {\n");
@@ -1000,6 +1009,12 @@ fn native_matches_reference_jvm() {
     let extras = cgen::UnitExtras {
         startup: true,
         java_home: Some(home.display().to_string()),
+        // The class path: every JDK module and every fixture class (GoneProbe was removed).
+        known_classes: Some({
+            let mut known = jabs::jdk::all_class_names(&home).unwrap();
+            known.extend(roots.iter().cloned());
+            known
+        }),
         ..Default::default()
     };
     let compiled = cgen::compile_unit_with(&classes, Some(&roots), &extras);

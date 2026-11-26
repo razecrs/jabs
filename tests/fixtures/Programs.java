@@ -124,3 +124,39 @@ class Checksums {
         System.out.println(Long.toHexString(crc.getValue()));
     }
 }
+
+// A class on no class path, probed the way Netty probes for SLF4J: the JVM resolves a class
+// only when an instruction naming it executes (a type test of null resolves nothing) and then
+// throws NoClassDefFoundError, which the probe catches and carries on. The differential test
+// deletes GoneProbe.class after javac, so it is missing on the JVM and natively alike.
+class AbsentProbe {
+    public static void main(String[] args) {
+        Object something = "x";
+        Object nothing = null;
+        System.out.println(nothing instanceof GoneProbe);
+        System.out.println((GoneProbe) nothing == null);
+        // java.sql.Timestamp exists (module java.sql) but is not in the test's unit: a null
+        // test resolves nothing, and the method testing a real value compiles (it would stop
+        // only if it ran), as Netty's PlatformDependent0 needs for sun.misc.Unsafe.
+        System.out.println(nothing instanceof java.sql.Timestamp);
+        try {
+            System.out.println(something instanceof GoneProbe);
+        } catch (NoClassDefFoundError e) {
+            System.out.println("instanceof: " + e.getClass().getName());
+        }
+        try {
+            GoneProbe.hello();
+        } catch (NoClassDefFoundError e) {
+            System.out.println("static call: " + e.getClass().getName());
+        }
+        System.out.println("after the probes");
+    }
+
+    static boolean neverCalled(Object o) {
+        return o instanceof java.sql.Timestamp;
+    }
+}
+
+class GoneProbe {
+    static void hello() { System.out.println("hello"); }
+}

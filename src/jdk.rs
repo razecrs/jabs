@@ -80,6 +80,47 @@ impl std::io::Seek for JmodZip {
 
 /// The JDK modules (by name) that contain at least one of `classes` (internal names), from the
 /// module files' directories alone. A JVM run's loaded classes give the modules a program uses.
+/// Every class name in every module of the JDK at `home` (internal names, from the jmods): the
+/// evidence that a class the program names exists nowhere in the JDK.
+pub fn all_class_names(home: &Path) -> Result<std::collections::BTreeSet<String>> {
+    use std::io::Read;
+    let mut out = std::collections::BTreeSet::new();
+    let dir = home.join("jmods");
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .with_context(|| format!("list {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "jmod"))
+        .collect();
+    entries.sort();
+    if entries.is_empty() {
+        anyhow::bail!(
+            "{} has no jmods: cannot list the JDK's classes",
+            dir.display()
+        );
+    }
+    for path in entries {
+        let mut file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)
+            .with_context(|| format!("read {}", path.display()))?;
+        if magic != JMOD_MAGIC {
+            anyhow::bail!("{} is not a jmod", path.display());
+        }
+        let archive = zip::ZipArchive::new(JmodZip(file))
+            .with_context(|| format!("read the classes of {}", path.display()))?;
+        for name in archive.file_names() {
+            if let Some(class) = name
+                .strip_prefix("classes/")
+                .and_then(|n| n.strip_suffix(".class"))
+                .filter(|n| !n.ends_with("module-info"))
+            {
+                out.insert(class.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn modules_containing(
     home: &Path,
     classes: &std::collections::BTreeSet<String>,

@@ -125,6 +125,22 @@ public class Arrays {
         for (ArraysOnlyDeep[][] plane : grid) for (ArraysOnlyDeep[] row : plane) if (row == null) nulls++;
         return grid.length * 100 + nulls;
     }
+    // Joins of array types (JVMS 4.10.2): two arrays of references merge to an array of the
+    // merged element type. Class.getGenericInterfaces returns a Class[] on one path and a Type[]
+    // on the other, which the verifier must accept as a Type[] (Serializable[] here, likewise).
+    static java.io.Serializable[] pickArray(int which) {
+        return which == 0 ? new String[1] : new Integer[2];
+    }
+    static int interfaceArrayJoin(int which) { return pickArray(which).length; }
+    static Number[] pickNumbers(int which) {
+        return which == 0 ? new Integer[3] : new Long[4];
+    }
+    static int classArrayJoin(int which) { return pickNumbers(which).length; }
+    static Object pickRows(int which) {
+        Object[] rows = which == 0 ? new String[2][1] : new Integer[5][1];
+        return rows;
+    }
+    static int rowArrayJoin(int which) { return ((Object[]) pickRows(which)).length; }
     static int multiNegative(int a, int b) { return new int[a][b].length; }
     static int negative(int n) { return new int[n].length; }
     static int outOfBounds(int i) { int[] a = new int[3]; return a[i]; }

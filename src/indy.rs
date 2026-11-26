@@ -1420,6 +1420,18 @@ fn enum_desc(class: &ClassFile, index: u16) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn truncated_instruction_is_malformed_instead_of_a_call_site() {
+        assert!(instruction_starts(&[0xba]).is_empty());
+
+        let mut class = host_with_concat_site("TruncatedIndy");
+        class.methods[0].code.as_mut().unwrap().bytecode = vec![0xba];
+        let mut classes = vec![class];
+        let report = desugar(&mut classes);
+        assert_eq!(classes.len(), 1);
+        assert_eq!(report.lambdas + report.concats + report.others, 0);
+    }
+
     /// `public class Host` with `static String f(int)`, whose body is one `makeConcat` call site.
     fn host_with_concat_site(name: &str) -> ClassFile {
         let pool = vec![

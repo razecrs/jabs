@@ -638,6 +638,8 @@ pub fn curseforge_instance_with_loader_root(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     #[test]
     fn offline_uuid_matches_java() {
         // java.util.UUID.nameUUIDFromBytes("OfflinePlayer:JabsTest".getBytes(UTF_8)), computed on the JVM.
@@ -645,5 +647,23 @@ mod tests {
             super::offline_uuid("JabsTest"),
             "f2121ce2a7e132b397858e1cb549e3d3"
         );
+    }
+
+    #[test]
+    fn explicit_loader_root_is_used_before_auto_discovery() {
+        let instance = tempfile::tempdir().unwrap();
+        let loader_root = instance.path().join("explicit-install");
+        fs::write(
+            instance.path().join("minecraftinstance.json"),
+            r#"{"gameVersion":"1.21.1","baseModLoader":{"name":"forge-test"},"allocatedMemory":3072}"#,
+        )
+        .unwrap();
+
+        let parsed =
+            super::curseforge_instance_with_loader_root(instance.path(), Some(&loader_root))
+                .unwrap();
+        assert_eq!(parsed.loader_root.as_deref(), Some(loader_root.as_path()));
+        assert_eq!(parsed.version, "forge-test");
+        assert_eq!(parsed.max_memory, "3072M");
     }
 }
