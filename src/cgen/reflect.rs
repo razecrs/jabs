@@ -534,6 +534,21 @@ pub(super) fn replacement(key: &MethodKey) -> Option<(String, bool)> {
     if key.0 == PROXY_BUILDER && key.1 == "isProxyClass" && key.2 == "(Ljava/lang/Class;)Z" {
         return Some(("return jabs_reflect_is_proxy_class(a0);".to_string(), true));
     }
+    // A static field's base and offset (Thread$ThreadNumbering counts thread names this way):
+    // null and the address of the field's global, Unsafe's absolute-address mode.
+    if key.0 == "jdk/internal/misc/Unsafe" {
+        return match (key.1.as_str(), key.2.as_str()) {
+            ("staticFieldBase0", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;") => Some((
+                "return jabs_reflect_static_field_base(a0);".to_string(),
+                true,
+            )),
+            ("staticFieldOffset0", "(Ljava/lang/reflect/Field;)J") => Some((
+                "return jabs_reflect_static_field_offset(a0);".to_string(),
+                true,
+            )),
+            _ => None,
+        };
+    }
     if key.0 == ACCESSOR_FACTORY {
         return match (key.1.as_str(), key.2.as_str()) {
             ("useNativeAccessor", "(Ljava/lang/reflect/Executable;)Z") => {

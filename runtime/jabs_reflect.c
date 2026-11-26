@@ -887,6 +887,34 @@ void *jabs_reflect_field_slot(jabs_object *accessor, jabs_object *o, int32_t for
     return (char *)o + f->offset;
 }
 
+/* Unsafe.staticFieldBase0 and staticFieldOffset0. JABS keeps each static field in its own
+ * global, so the base is null and the "offset" is the global's address: Unsafe's accessors add
+ * the two, which is its absolute-address mode (base null), the one JABS already uses for
+ * off-heap memory. Unsafe has already refused a null Field and checked that it is static. */
+static const jabs_rfield *static_field_row(jabs_object *field, const char *what) {
+    if (!field) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }
+    jabs_object *holder;
+    const jabs_rfield *f = field_row(field, &holder);
+    if (!(f->access & JABS_ACC_STATIC)) jabs_not_compiled_class(what, name_of(holder, "static field holder"));
+    if (!f->address) {
+        static char message[1024];
+        snprintf(message, sizeof message, "Unsafe on static field %s.%s (its class's statics are not compiled into this program)",
+                 name_of(holder, "static field holder"), jabs_rstrings + f->name);
+        jabs_not_compiled(message);
+    }
+    return f;
+}
+
+jabs_object *jabs_reflect_static_field_base(jabs_object *field) {
+    (void)static_field_row(field, "Unsafe.staticFieldBase0 on an instance field");
+    return NULL;
+}
+
+int64_t jabs_reflect_static_field_offset(jabs_object *field) {
+    const jabs_rfield *f = static_field_row(field, "Unsafe.staticFieldOffset0 on an instance field");
+    return f ? (int64_t)(intptr_t)f->address : 0;
+}
+
 /* The primitive set leaves' final-field rule: a read-only accessor checks the receiver
  * (ensureObj) and throws throwFinalFieldIllegalAccessException(value). 1 when the set must not
  * happen (an exception is pending), 0 to go on. */

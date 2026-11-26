@@ -198,6 +198,8 @@ jabs_object *jabs_reflect_proxy_constructor(jabs_object *loader, jabs_object *in
 int32_t jabs_reflect_is_proxy_class(jabs_object *c);
 /* Field accessor leaves (the JDK's MethodHandle<T>FieldAccessorImpl get/set of its own type). */
 void *jabs_reflect_field_slot(jabs_object *accessor, jabs_object *o, int32_t for_set, int32_t *is_volatile);
+jabs_object *jabs_reflect_static_field_base(jabs_object *field);
+int64_t jabs_reflect_static_field_offset(jabs_object *field);
 int32_t jabs_reflect_field_refuse_set(jabs_object *accessor, jabs_object *o, int kind, jabs_value value);
 void jabs_reflect_field_set_object(jabs_object *accessor, jabs_object *o, jabs_object *value);
 

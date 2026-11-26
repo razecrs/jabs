@@ -206,7 +206,7 @@ const FIXTURE_SOURCES: [&str; 17] = [
 ];
 
 /// Whole programs from `Programs.java`: (class, `-D` properties, arguments).
-const PROGRAMS: [(&str, &[&str], &[&str]); 32] = [
+const PROGRAMS: [(&str, &[&str], &[&str]); 33] = [
     ("EchoArgs", &[], &[]),
     ("EchoArgs", &[], &["one", "two words", ""]),
     ("ExitCode", &[], &[]),
@@ -239,6 +239,7 @@ const PROGRAMS: [(&str, &[&str], &[&str]); 32] = [
     ("ClassInitFailureOtherThread", &[], &[]),
     ("ManyShortThreads", &[], &[]),
     ("AvailableProcessors", &[], &[]),
+    ("UnnamedThreads", &[], &[]),
     // Joins.java: threads with real monitors (join, wait/notify, interrupting a wait).
     ("JoinReturnsAfterRunThrows", &[], &[]),
     ("JoinSeesResult", &[], &[]),
@@ -252,7 +253,11 @@ const PROGRAMS: [(&str, &[&str], &[&str]); 32] = [
 ];
 
 /// Where to look when a thread program differs from the JVM (or hangs), by class.
-const THREAD_PROGRAMS: [(&str, &str); 19] = [
+const THREAD_PROGRAMS: [(&str, &str); 20] = [
+    (
+        "UnnamedThreads",
+        "Unsafe.staticFieldBase0/staticFieldOffset0: jabs_reflect_static_field_base/_offset in runtime/jabs_reflect.c, replacement() in src/cgen/reflect.rs",
+    ),
     (
         "StartRunsOnOwnThread",
         "jabs_thread_start/jabs_thread_main (current-thread record, eetop, threadStatus) in runtime/jabs_thread.c",

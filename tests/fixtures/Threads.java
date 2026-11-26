@@ -223,3 +223,12 @@ class AvailableProcessors {
         System.out.println(Runtime.getRuntime().availableProcessors() >= 1);
     }
 }
+
+// Threads created without a name are numbered Thread-0, Thread-1, ... in creation order:
+// Thread$ThreadNumbering counts with Unsafe.getAndAddInt on a static field it finds through
+// Unsafe.staticFieldBase/staticFieldOffset (log4j's shutdown thread is made this way).
+class UnnamedThreads {
+    public static void main(String[] args) {
+        for (int i = 0; i < 3; i++) System.out.println(new Thread(() -> {}).getName());
+    }
+}
