@@ -7496,7 +7496,22 @@ fn reachable(
                 }
             }
         }
+        // `Unsafe.ensureClassInitialized(X.class)` (VarHandle's <clinit> does it for
+        // VarHandleGuards) initializes X, which no instruction names: keep the initializer of
+        // every class literal of a method that calls it.
+        let ensures_initialized = analyzed.insns.iter().any(|i| {
+            matches!(&i.op, Op::InvokeVirtual(m) if m.class == UNSAFE
+                && m.name == "ensureClassInitialized"
+                && m.descriptor == "(Ljava/lang/Class;)V")
+        });
         for insn in &analyzed.insns {
+            if ensures_initialized
+                && let Op::LdcClass(name) = &insn.op
+                && !name.starts_with('[')
+                && unit.get(name).is_some()
+            {
+                pending_inits.push(name.clone());
+            }
             match &insn.op {
                 Op::New { class } => {
                     add_records(class, &mut out.records);
