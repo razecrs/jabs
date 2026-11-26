@@ -30,10 +30,14 @@ use std::{
 };
 
 mod management;
+mod modules;
 mod net;
 mod nio_fs;
 mod reflect;
+mod stack;
 mod symbols;
+mod unsafe_rt;
+mod zip;
 
 pub const RUNTIME_PRELUDE: &str = include_str!("../runtime/jabs_rt.h");
 const OBJECT: &str = "java/lang/Object";
@@ -498,8 +502,8 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "(void)a0; (void)a1; (void)a2;",
         needs_classes: false,
     },
-    // The VM's module table: JABS keeps no VM-side module state (every class is compiled in, and
-    // module access is not enforced yet), so registering modules has nothing to update.
+    // BootLoader tracks its unnamed module in BootLoader.UNNAMED_MODULE and named JDK modules
+    // in runtime/jabs_modules.c; no separate VM-side unnamed-module registration is needed here.
     Intrinsic {
         key: (
             "jdk/internal/loader/BootLoader",
@@ -694,9 +698,9 @@ const INTRINSICS: &[Intrinsic] = &[
 /// Java (not native) methods JABS replaces, with the reason. Each is behavior-preserving for a
 /// program JABS can run today: (class, name, descriptor) -> C body.
 const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
-    // The VM sets Class.module. Named modules need the module system's boot (initPhase2), which
-    // JABS does not run yet: input classes are in the app loader's unnamed module (as on the
-    // JVM's class path); JDK classes report the boot loader's unnamed module, not java.base etc.
+    // The VM sets Class.module. Input classes belong to the app loader's unnamed module; JDK
+    // classes belong to their named module (runtime/jabs_modules.c) when module descriptors are
+    // present, or the boot loader's unnamed module otherwise.
     (
         "java/lang/Class",
         "getModule",
@@ -5532,7 +5536,7 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
     ));
     out.push_str(&for_name_function(unit, inits));
     out.push_str(&var_handle_functions(unit, recorded, inits));
-    out.push_str(&stack_functions(methods, hidden));
+    out.push_str(&stack_functions(unit, methods, hidden));
     out.push_str(&stack_trace_functions(unit, recorded));
     out.push_str(&new_instance_function(unit, recorded, methods));
     out.push_str(&main_thread_function(unit, recorded));
@@ -6125,24 +6129,32 @@ jabs_object *jabs_class_new_instance(jabs_object *c) {{
 /// Stack walking: which compiled method each native frame belongs to. Every emitted method's
 /// function start is listed with its class; frames whose function is not listed (runtime C
 /// helpers, class initialization wrappers) are not Java frames and are skipped.
-fn stack_functions(methods: &BTreeSet<MethodKey>, hidden: &BTreeSet<String>) -> String {
+fn stack_functions(
+    unit: &Unit,
+    methods: &BTreeSet<MethodKey>,
+    hidden: &BTreeSet<String>,
+) -> String {
     let mut out = String::from(
-        "/* hidden: left out of stack traces, as the JVM leaves out hidden classes' frames. */\ntypedef struct { const void *start; const char *class_name; const char *name; const char *descriptor; int hidden; } jabs_frame_entry;\nstatic jabs_frame_entry jabs_frames[] = {\n",
+        "/* hidden: left out of stack traces, as the JVM leaves out hidden classes' frames. */\ntypedef struct { const void *start; const char *class_name; const char *name; const char *descriptor; int hidden; uint32_t flags; } jabs_frame_entry;\nstatic jabs_frame_entry jabs_frames[] = {\n",
     );
     for (class, name, descriptor) in methods {
         let _ = writeln!(
             out,
-            "    {{ (const void *)&{}, \"{}\", \"{}\", \"{}\", {} }},",
+            "    {{ (const void *)&{}, \"{}\", \"{}\", \"{}\", {}, 0x{:x}u }},",
             symbol(class, name, descriptor),
             c_escape(class),
             c_escape(name),
             c_escape(descriptor),
-            i32::from(hidden.contains(class))
+            i32::from(hidden.contains(class)),
+            stack::method_flags(unit, class, name, descriptor, hidden.contains(class)),
         );
     }
-    // Runtime functions that stand in for a Java method keep that method's class, for
-    // getClassContext; in stack traces the compiled Java method already has its own frame.
-    out.push_str("    { (const void *)&jabs_class_new_instance, \"java/lang/Class\", \"newInstance\", \"()Ljava/lang/Object;\", 1 },\n    { NULL, NULL, NULL, NULL, 0 }\n};\n");
+    // Runtime helpers that stand in for a Java method keep hidden = 1 and flags = 0: fillInStackTrace
+    // and StackWalker both skip them because the Java wrapper already has its own frame.
+    let _ = writeln!(
+        out,
+        "    {{ (const void *)&jabs_class_new_instance, \"java/lang/Class\", \"newInstance\", \"()Ljava/lang/Object;\", 1, 0u }},\n    {{ NULL, NULL, NULL, NULL, 0, 0 }}\n}};",
+    );
     out.push_str(
         r#"static int jabs_compare_frames(const void *a, const void *b) {
     uintptr_t x = (uintptr_t)((const jabs_frame_entry *)a)->start, y = (uintptr_t)((const jabs_frame_entry *)b)->start;
@@ -6166,7 +6178,7 @@ static const jabs_frame_entry *jabs_frame_of(const void *start) {
         }
         jabs_unlock(JABS_LOCK_FRAMES);
     }
-    jabs_frame_entry key = { start, NULL, NULL, NULL, 0 };
+    jabs_frame_entry key = { start, NULL, NULL, NULL, 0, 0 };
     return (const jabs_frame_entry *)bsearch(&key, jabs_frames, count, sizeof key, jabs_compare_frames);
 }
 
@@ -6272,6 +6284,7 @@ void jabs_init_stack_trace_elements(jabs_object *elements, jabs_object *backtrac
         r#"
 #define JABS_MAX_TRACE 1024
 jabs_object *jabs_fill_in_stack_trace(jabs_object *throwable) {{
+    if (!throwable) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
     const void *starts[JABS_MAX_TRACE];
     const jabs_frame_entry *frames[JABS_MAX_TRACE];
     int n = jabs_platform_stack_functions(starts, JABS_MAX_TRACE);
@@ -6279,7 +6292,7 @@ jabs_object *jabs_fill_in_stack_trace(jabs_object *throwable) {{
     int count = 0, skipping_fill = 1, skipping_init = 1;
     for (int i = 0; i < n && count < JABS_MAX_TRACE; i++) {{
         const jabs_frame_entry *e = starts[i] ? jabs_frame_of(starts[i]) : NULL;
-        if (!e || e->hidden) continue;
+        if (!e || e->hidden || (e->flags & 0x{hidden:x}u)) continue;
         const jabs_class *holder = jabs_record_named(e->class_name);
         if (skipping_fill) {{
             if (strcmp(e->name, "fillInStackTrace") == 0 && holder && base && jabs_class_assignable(holder, base)) continue;
@@ -6304,6 +6317,7 @@ void jabs_init_stack_trace_elements(jabs_object *elements, jabs_object *backtrac
     if (!elements || !backtrace) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }}
     jabs_array *a = (jabs_array *)elements, *b = (jabs_array *)backtrace;
     /* The backtrace is only ever the long[] jabs_fill_in_stack_trace made. */
+    if (elements->cls != jabs_array_class() || a->component_kind == JABS_COMPONENT_PRIMITIVE) jabs_not_compiled("StackTraceElement.initStackTraceElements with non-reference elements array");
     if (backtrace->cls != jabs_array_class() || strcmp(b->descriptor, "[J") != 0) jabs_not_compiled("StackTraceElement.initStackTraceElements with a backtrace JABS did not record");
     if (depth < 0 || depth > a->length || depth > b->length) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return; }}
     const int64_t *slots = (const int64_t *)jabs_array_data(b);
@@ -6319,8 +6333,15 @@ void jabs_init_stack_trace_elements(jabs_object *elements, jabs_object *backtrac
         for (size_t k = 0; k <= length; k++) dotted[k] = f->class_name[k] == '/' ? '.' : f->class_name[k];
         jabs_object *class_name = jabs_string_from_utf8(dotted);
         free(dotted);
+        if (!class_name) {{
+            if (!jabs_pending) jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
+            return;
+        }}
         jabs_object *method_name = jabs_string_from_utf8(f->name);
-        if (!class_name || !method_name) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return; }}
+        if (!method_name) {{
+            if (!jabs_pending) jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
+            return;
+        }}
         (({e} *)ste)->{class_object} = cls;
         (({e} *)ste)->{declaring} = class_name;
         (({e} *)ste)->{method} = method_name;
@@ -6336,6 +6357,7 @@ void jabs_init_stack_trace_elements(jabs_object *elements, jabs_object *backtrac
         method = instance_field("methodName"),
         file = instance_field("fileName"),
         line = instance_field("lineNumber"),
+        hidden = stack::MN_HIDDEN_MEMBER,
     )
 }
 
@@ -6674,11 +6696,12 @@ fn module_function(unit: &Unit, inits: &BTreeSet<String>) -> String {
             })
     };
     let has_field = |class: &str, field: &str| {
-        unit.get(class).is_some_and(|c| {
-            c.fields
-                .iter()
-                .any(|f| f.name == field && f.access & ACC_STATIC == 0)
-        })
+        unit.chain(class).is_ok()
+            && unit.get(class).is_some_and(|c| {
+                c.fields
+                    .iter()
+                    .any(|f| f.name == field && f.access & ACC_STATIC == 0)
+            })
     };
     let boot = if has_static(BOOT_LOADER, "UNNAMED_MODULE") {
         format!(
@@ -6691,7 +6714,7 @@ fn module_function(unit: &Unit, inits: &BTreeSet<String>) -> String {
     };
     let app = if has_field("java/lang/ClassLoader", "unnamedModule") {
         format!(
-            "jabs_object *loader = jabs_app_loader(); if (loader) return (({} *)loader)->{};",
+            "jabs_object *loader = jabs_app_loader(); if (jabs_pending) return NULL; if (loader) return (({} *)loader)->{};",
             object_struct("java/lang/ClassLoader"),
             instance_field("unnamedModule")
         )
@@ -6708,22 +6731,41 @@ int32_t jabs_class_access_flags(jabs_object *c) {{
 }}
 
 /* Class.getModule. Only an array's name is a descriptor: `[...Lpkg/Name;` names its element
-   class, `[...I` a primitive (java.base). A plain name is the class itself, even one that starts
-   with 'L', such as a default-package `Launcher`. */
+   class, `[...I` a primitive. A plain name is the class itself, even one that starts with 'L',
+   such as a default-package `Launcher`. Primitives and their arrays are in java.base, as on the
+   JVM. An input class is in the app loader's unnamed module; a JDK class in its named module
+   (runtime/jabs_modules.c); anything else (no module data, a package of no JDK module) in the
+   boot loader's unnamed module. */
 jabs_object *jabs_class_module(jabs_object *c) {{
     jabs_class_entry *e = jabs_class_entry_of(c);
     const char *name = e ? e->name : "";
     int array = 0;
     while (name[0] == '[') {{ name++; array = 1; }}
+    /* The class whose module this is. */
+    const char *owner = NULL;
+    char element[1024];
+    char *heap_element = NULL;
     if (!array) {{
-        if (jabs_is_app_class(name)) {{ {app} }}
+        owner = jabs_is_primitive_name(name) ? "java/lang/Object" : name;
     }} else {{
         size_t len = strlen(name);
         if (len >= 3 && name[0] == 'L' && name[len - 1] == ';') {{
-            char element[1024];
             size_t n = len - 2;
-            if (n < sizeof element) {{ memcpy(element, name + 1, n); element[n] = 0; if (jabs_is_app_class(element)) {{ {app} }} }}
+            char *buf = n < sizeof element ? element : (heap_element = (char *)malloc(n + 1));
+            if (!buf) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
+            memcpy(buf, name + 1, n);
+            buf[n] = 0;
+            owner = buf;
+        }} else if (len == 1) {{
+            owner = "java/lang/Object";
         }}
+    }}
+    int is_app = owner && jabs_is_app_class(owner);
+    jabs_object *named = (!is_app && owner) ? jabs_module_of_class(owner) : NULL;
+    free(heap_element);
+    if (named || jabs_pending) return named;
+    if (is_app) {{
+        {app}
     }}
     {boot}
 }}
@@ -7521,18 +7563,27 @@ fn reachable(
     };
     let mut work: Vec<MethodKey> = Vec::new();
     let mut pending_inits: Vec<String> = Vec::new();
+    let mut startup_enqueued = false;
+    let enqueue_startup =
+        |work: &mut Vec<MethodKey>, pending_inits: &mut Vec<String>, done: &mut bool| {
+            if *done {
+                return;
+            }
+            *done = true;
+            let startup = (
+                SYSTEM.to_string(),
+                "initPhase1".to_string(),
+                "()V".to_string(),
+            );
+            if compiled(&startup) {
+                work.push(startup);
+                pending_inits.push(SYSTEM.to_string());
+                pending_inits.extend(VM_PREINITIALIZED.iter().map(|c| c.to_string()));
+                pending_inits.push(BOOT_LOADER.to_string());
+            }
+        };
     if startup || roots.contains(APP_LOADER) {
-        let startup = (
-            SYSTEM.to_string(),
-            "initPhase1".to_string(),
-            "()V".to_string(),
-        );
-        if compiled(&startup) {
-            work.push(startup);
-            pending_inits.push(SYSTEM.to_string());
-            pending_inits.extend(VM_PREINITIALIZED.iter().map(|c| c.to_string()));
-            pending_inits.push(BOOT_LOADER.to_string());
-        }
+        enqueue_startup(&mut work, &mut pending_inits, &mut startup_enqueued);
     }
     for class in classes.iter().filter(|c| roots.contains(&c.name)) {
         pending_inits.push(class.name.clone());
@@ -7643,6 +7694,8 @@ fn reachable(
         }
     }
     let mut needs_classes = false;
+    let mut unsafe_init_reached = false;
+    let mut unsafe_alloc_reached = false;
     loop {
         // Class objects (and the String names they carry) now exist: make their code reachable.
         if needs_classes {
@@ -7691,8 +7744,10 @@ fn reachable(
                 &compiled,
                 reach_inputs,
             );
-            if reached.is_empty() {
-                break;
+            let stack_records = stack::reach(unit, &out.records, &out.methods);
+            let mut progressed = !reached.is_empty() || !stack_records.is_empty();
+            for class in &stack_records {
+                add_records(class, &mut out.records);
             }
             for class in &reached.recorded {
                 add_records(class, &mut out.records);
@@ -7709,10 +7764,61 @@ fn reachable(
                 }
             }
             work.extend(reached.methods);
+            // Any class whose Class object is reachable (via LDC, reflection, loaded list, ...)
+            // can flow across methods into Unsafe.{ensureClassInitialized, shouldBeInitialized0,
+            // allocateInstance}.
+            if unsafe_init_reached || unsafe_alloc_reached {
+                let recorded: Vec<String> = out.records.iter().cloned().collect();
+                for class in recorded {
+                    if initializable.contains(&class) && !out.inits.contains(&class) {
+                        pending_inits.push(class.clone());
+                        progressed = true;
+                    }
+                    if unsafe_alloc_reached
+                        && let Some(c) = unit.get(&class)
+                        && c.access & (ACC_INTERFACE | ACC_ABSTRACT) == 0
+                        && unit.chain(&class).is_ok()
+                        && out.instantiated.insert(class.clone())
+                    {
+                        progressed = true;
+                        work.extend(implementations(&class).into_iter().filter(|k| {
+                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
+                        }));
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
             continue;
         };
         if !out.methods.insert(key.clone()) {
             continue;
+        }
+        if key.0 == CLASS && key.1 == "getModule" && key.2 == "()Ljava/lang/Module;" {
+            enqueue_startup(&mut work, &mut pending_inits, &mut startup_enqueued);
+            if unit.get(BOOT_LOADER).is_some() {
+                pending_inits.push(BOOT_LOADER.to_string());
+            }
+            if !extras.app_classes.is_empty() && unit.get(APP_LOADER).is_some() {
+                add_records(APP_LOADER, &mut out.records);
+                pending_inits.push(APP_LOADER.to_string());
+            }
+        }
+        if (key.0 == UNSAFE || key.0 == "sun/misc/Unsafe")
+            && matches!(
+                (key.1.as_str(), key.2.as_str()),
+                ("ensureClassInitialized", "(Ljava/lang/Class;)V")
+                    | ("ensureClassInitialized0", "(Ljava/lang/Class;)V")
+                    | ("shouldBeInitialized", "(Ljava/lang/Class;)Z")
+                    | ("shouldBeInitialized0", "(Ljava/lang/Class;)Z")
+                    | ("allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;")
+            )
+        {
+            unsafe_init_reached = true;
+            if key.1 == "allocateInstance" {
+                unsafe_alloc_reached = true;
+            }
         }
         if key.0 == THREAD && key.1 == "start0" && key.2 == "()V" {
             // jabs_thread_start calls run() virtually, then (as HotSpot's JavaThread::exit does)
@@ -7741,6 +7847,10 @@ fn reachable(
         // (management::glue), the net natives' InetAddresses and exceptions (net::glue).
         let mut from_c = net::called_by(&key);
         from_c.extend(nio_fs::called_by(&key));
+        from_c.extend(modules::called_by(&key, !extras.jdk_modules.is_empty()));
+        from_c.extend(stack::called_by(&key));
+        from_c.extend(unsafe_rt::called_by(&key));
+        from_c.extend(zip::called_by(&key));
         if let Some((class, descriptor)) = management::constructed_by(&key) {
             from_c.push((class, "<init>", descriptor));
         }
@@ -7802,22 +7912,30 @@ fn reachable(
                 }
             }
         }
-        // `Unsafe.ensureClassInitialized(X.class)` (VarHandle's <clinit> does it for
-        // VarHandleGuards) initializes X, which no instruction names: keep the initializer of
-        // every class literal of a method that calls it.
-        let ensures_initialized = analyzed.insns.iter().any(|i| {
-            matches!(&i.op, Op::InvokeVirtual(m) if m.class == UNSAFE
-                && m.name == "ensureClassInitialized"
-                && m.descriptor == "(Ljava/lang/Class;)V")
-        });
+        // Track interprocedural reachability of Unsafe class-init / allocateInstance natives.
+        if analyzed.insns.iter().any(|i| {
+            matches!(&i.op, Op::InvokeVirtual(m) | Op::InvokeSpecial(m)
+            if (m.class == UNSAFE || m.class == "sun/misc/Unsafe")
+            && matches!(
+                (m.name.as_str(), m.descriptor.as_str()),
+                ("ensureClassInitialized", "(Ljava/lang/Class;)V")
+                    | ("ensureClassInitialized0", "(Ljava/lang/Class;)V")
+                    | ("shouldBeInitialized", "(Ljava/lang/Class;)Z")
+                    | ("shouldBeInitialized0", "(Ljava/lang/Class;)Z")
+                    | ("allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;")
+            ))
+        }) {
+            unsafe_init_reached = true;
+        }
+        if analyzed.insns.iter().any(|i| {
+            matches!(&i.op, Op::InvokeVirtual(m) | Op::InvokeSpecial(m)
+                if (m.class == UNSAFE || m.class == "sun/misc/Unsafe")
+                && m.name == "allocateInstance"
+                && m.descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;")
+        }) {
+            unsafe_alloc_reached = true;
+        }
         for insn in &analyzed.insns {
-            if ensures_initialized
-                && let Op::LdcClass(name) = &insn.op
-                && !name.starts_with('[')
-                && unit.get(name).is_some()
-            {
-                pending_inits.push(name.clone());
-            }
             match &insn.op {
                 Op::New { class } => {
                     add_records(class, &mut out.records);
@@ -7831,8 +7949,13 @@ fn reachable(
                 // getSuperclass), so its class keeps a record.
                 Op::LdcClass(name) => {
                     needs_classes = true;
-                    if !name.starts_with('[') && unit.get(name).is_some() {
-                        add_records(name, &mut out.records);
+                    if let Some(c) = name
+                        .strip_prefix('[')
+                        .and_then(|_| element_class(name))
+                        .or_else(|| (!name.starts_with('[')).then(|| name.clone()))
+                        .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
+                    {
+                        add_records(&c, &mut out.records);
                     }
                 }
                 Op::LdcString(_) => {
@@ -7916,10 +8039,16 @@ const MANAGEMENT_C: &str = include_str!("../runtime/jabs_management.c");
 const NET_C: &str = include_str!("../runtime/jabs_net.c");
 /// java.nio.file natives (handwritten, OS-specific; needs the class registry).
 const NIO_FS_C: &str = include_str!("../runtime/jabs_nio_fs.c");
+/// java.util.zip natives: Inflater and Deflater (handwritten, OS-neutral; needs the class registry).
+const ZIP_C: &str = include_str!("../runtime/jabs_zip.c");
 /// Reflection: member listings and reflective calls (handwritten).
 const REFLECT_C: &str = include_str!("../runtime/jabs_reflect.c");
 /// Reflection's metadata layout and entry points (handwritten; part of every program's header).
 const REFLECT_H: &str = include_str!("../runtime/jabs_reflect.h");
+/// Named modules: building Module objects from the generated tables (handwritten).
+const MODULES_C: &str = include_str!("../runtime/jabs_modules.c");
+/// Named modules' tables and glue (handwritten; part of every program's header).
+const MODULES_H: &str = include_str!("../runtime/jabs_modules.h");
 
 /// What a program needs beyond its classes.
 #[derive(Default)]
@@ -7961,6 +8090,11 @@ pub struct UnitExtras {
     /// proved absent, and an instruction naming it throws NoClassDefFoundError as on the JVM
     /// (Netty probes for SLF4J this way). Without it, such an instruction stops, as before.
     pub known_classes: Option<BTreeSet<String>>,
+    /// The JDK's modules, from its module-info.class files (`jdk::modules`): with them a JDK
+    /// class's Class.getModule is its named module, with the exports, opens and reads its
+    /// declaration gives (src/cgen/modules.rs). Empty: every class is in its loader's unnamed
+    /// module (no module encapsulation).
+    pub jdk_modules: Vec<crate::jdk::JdkModule>,
 }
 
 /// A program's .jab, as the generated C knows it.
@@ -8091,6 +8225,10 @@ pub fn compile_unit_with(
                     let found = management::intrinsic(&unit, &key, have_classes)
                         .or_else(|| net::intrinsic(&key, have_classes))
                         .or_else(|| nio_fs::intrinsic(&key, have_classes))
+                        .or_else(|| modules::intrinsic(&key))
+                        .or_else(|| stack::intrinsic(&key, have_classes))
+                        .or_else(|| unsafe_rt::intrinsic(&key, have_classes))
+                        .or_else(|| zip::intrinsic(&key, have_classes))
                         .or_else(|| intrinsic(&key, have_classes));
                     let Some(body) = found else {
                         return Err("native method without a JABS implementation".to_string());
@@ -8219,6 +8357,8 @@ pub fn compile_unit_with(
         source.push_str("#define JABS_HAVE_REFLECTION 1\n");
     }
     source.push_str(REFLECT_H);
+    source.push('\n');
+    source.push_str(MODULES_H);
     source.push('\n');
     // Layouts for every class whose hierarchy is complete, superclasses first (types only).
     let mut laid_out = laid_out_all.clone();
@@ -8370,6 +8510,13 @@ pub fn compile_unit_with(
         &emission.inits,
     ));
     if registry {
+        source.push_str(&modules::tables(&extras.jdk_modules, classes, &app_classes));
+        source.push_str(&modules::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
         source.push_str(&net::glue(
             &unit,
             &emission.methods,
@@ -8377,6 +8524,19 @@ pub fn compile_unit_with(
             &emission.inits,
         ));
         source.push_str(&nio_fs::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        source.push_str(&stack::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        source.push_str(&unsafe_rt::glue(&emission.inits));
+        source.push_str(&zip::glue(
             &unit,
             &emission.methods,
             &emission.records,
@@ -8495,8 +8655,10 @@ pub fn compile_unit_with(
         if registry_emitted {
             files.push(("jabs_io.c".to_string(), IO_C.to_string()));
             files.push(("jabs_management.c".to_string(), MANAGEMENT_C.to_string()));
+            files.push(("jabs_modules.c".to_string(), MODULES_C.to_string()));
             files.push(("jabs_net.c".to_string(), NET_C.to_string()));
             files.push(("jabs_nio_fs.c".to_string(), NIO_FS_C.to_string()));
+            files.push(("jabs_zip.c".to_string(), ZIP_C.to_string()));
         }
         for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
             files.push((
@@ -8556,7 +8718,9 @@ pub fn compile_unit_with(
                 + &(if registry_emitted {
                     IO_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                         + &MANAGEMENT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                        + &MODULES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                         + &NIO_FS_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                        + &ZIP_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 } else {
                     String::new()
                 })

@@ -1015,6 +1015,8 @@ fn native_matches_reference_jvm() {
             known.extend(roots.iter().cloned());
             known
         }),
+        // JDK classes in their named modules, the fixtures in an unnamed one, as on the JVM.
+        jdk_modules: jabs::jdk::modules(&home).unwrap(),
         ..Default::default()
     };
     let compiled = cgen::compile_unit_with(&classes, Some(&roots), &extras);

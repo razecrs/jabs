@@ -578,14 +578,14 @@ jabs_object *jabs_nio_realpath(int64_t path) {
 
 /* ---- UnixFileDispatcherImpl ---- */
 
-static void raise_errno(int code, const char *fallback) {
+static void nio_raise_errno(int code, const char *fallback) {
     /* strerror is thread-safe in glibc 2.32 and later; _GNU_SOURCE hides the XSI strerror_r. */
     jabs_raise_message(JABS_VM_IO, code != 0 ? strerror(code) : fallback);
 }
 
 void jabs_nio_close_int_fd(int32_t fd) {
-    if (jabs_vfs_is_descriptor(fd)) { if (!jabs_vfs_close(fd)) raise_errno(EBADF, "Close failed"); return; }
-    if (fd != -1 && close(fd) < 0) raise_errno(errno, "Close failed");
+    if (jabs_vfs_is_descriptor(fd)) { if (!jabs_vfs_close(fd)) nio_raise_errno(EBADF, "Close failed"); return; }
+    if (fd != -1 && close(fd) < 0) nio_raise_errno(errno, "Close failed");
 }
 
 /* read0: convertReturnVal on a read. */
@@ -595,7 +595,7 @@ int32_t jabs_nio_unix_read(jabs_object *fdo, int64_t address, int32_t length) {
     int32_t fd = *jabs_descriptor_fd_slot(fdo);
     if (jabs_vfs_is_descriptor(fd)) {
         int64_t got = jabs_vfs_read(fd, (void *)(intptr_t)address, (size_t)length);
-        if (got < 0) { raise_errno(EIO, "Read failed"); return JABS_NIO_THROWN; }
+        if (got < 0) { nio_raise_errno(EIO, "Read failed"); return JABS_NIO_THROWN; }
         return got > 0 ? (int32_t)got : JABS_NIO_EOF;
     }
     ssize_t n = read(fd, (void *)(intptr_t)address, (size_t)length);
@@ -603,7 +603,7 @@ int32_t jabs_nio_unix_read(jabs_object *fdo, int64_t address, int32_t length) {
     if (n == 0) return JABS_NIO_EOF;
     if (errno == EAGAIN || errno == EWOULDBLOCK) return JABS_NIO_UNAVAILABLE;
     if (errno == EINTR) return JABS_NIO_INTERRUPTED;
-    raise_errno(errno, "Read failed");
+    nio_raise_errno(errno, "Read failed");
     return JABS_NIO_THROWN;
 }
 
@@ -613,7 +613,7 @@ int64_t jabs_nio_unix_size(jabs_object *fdo) {
     int32_t fd = *jabs_descriptor_fd_slot(fdo);
     if (jabs_vfs_is_descriptor(fd)) return jabs_vfs_size(fd);
     struct stat s;
-    if (fstat(fd, &s) != 0) { raise_errno(errno, "fstat64 failed"); return -1; }
+    if (fstat(fd, &s) != 0) { nio_raise_errno(errno, "fstat64 failed"); return -1; }
     return (int64_t)s.st_size;
 }
 
@@ -623,11 +623,11 @@ int64_t jabs_nio_unix_seek(jabs_object *fdo, int64_t offset) {
     int32_t fd = *jabs_descriptor_fd_slot(fdo);
     if (jabs_vfs_is_descriptor(fd)) {
         int64_t r = offset < 0 ? jabs_vfs_position(fd) : jabs_vfs_seek(fd, offset, 0);
-        if (r < 0) raise_errno(EINVAL, "lseek64 failed");
+        if (r < 0) nio_raise_errno(EINVAL, "lseek64 failed");
         return r;
     }
     off_t r = offset < 0 ? lseek(fd, 0, SEEK_CUR) : lseek(fd, (off_t)offset, SEEK_SET);
-    if (r < 0) { raise_errno(errno, "lseek64 failed"); return -1; }
+    if (r < 0) { nio_raise_errno(errno, "lseek64 failed"); return -1; }
     return (int64_t)r;
 }
 

@@ -233,6 +233,7 @@ fn execute(cli: Cli) -> Result<()> {
             };
             let mut java_home = None;
             let mut known_classes = None;
+            let mut jdk_modules = Vec::new();
             if let Some(java) = jdk {
                 let home = jabs::jdk::java_home(&java)?;
                 java_home = Some(home.clone());
@@ -241,6 +242,8 @@ fn execute(cli: Cli) -> Result<()> {
                 let mut known = jabs::jdk::all_class_names(&home)?;
                 known.extend(classes.iter().map(|c| c.name.clone()));
                 known_classes = Some(known);
+                // The JDK's module declarations: its classes get their named modules.
+                jdk_modules = jabs::jdk::modules(&home)?;
                 // java.base, plus every module a JVM run of the program loaded classes from or
                 // executed code of (as `coverage` counts them).
                 let mut used = loaded_classes.clone();
@@ -315,6 +318,7 @@ fn execute(cli: Cli) -> Result<()> {
                 startup: false,
                 jab: jab_config,
                 known_classes,
+                jdk_modules,
             };
             let compiled = jabs::cgen::compile_unit_with(&classes, Some(&roots), &extras);
             if let (Some(trace), Some(counts)) = (&trace, &compiled.executed_roots) {

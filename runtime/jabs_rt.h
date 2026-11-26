@@ -8,6 +8,24 @@
 #ifndef JABS_RT_H
 #define JABS_RT_H
 
+/* Feature-test macros for the runtime when compiled as a single C file (c_source).
+ * Must precede the first standard-library header include below. */
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#else
+#ifndef _CRT_RAND_S
+#define _CRT_RAND_S
+#endif
+#endif
+
 #include <float.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -64,7 +82,6 @@ typedef union jabs_value {
     jabs_object *a;
 } jabs_value;
 
-/* Internal class name of the pending exception, or NULL. */
 /* The exception being thrown (a Throwable object), or NULL. */
 extern _Thread_local jabs_object *jabs_pending;
 /* The method whose code last raised a VM exception on this thread (a breadcrumb until stack
@@ -137,6 +154,10 @@ static inline bool jabs_class_initialized(jabs_class_init *c) {
 enum { JABS_INIT_RUN, JABS_INIT_DONE, JABS_INIT_FAILED };
 int jabs_class_init_begin(jabs_class_init *c);
 void jabs_class_init_end(jabs_class_init *c, bool ok);
+/* The same gate for a once-only runtime step that runs Java code but is not a class (the module
+ * graph, runtime/jabs_modules.c): begin with jabs_class_init_begin, end with this, which does not
+ * count it as an initialized class. */
+void jabs_runtime_once_end(jabs_class_init *c, bool ok);
 
 /* Threads (jabs_thread.c). The java.lang.Thread of the calling thread: threads JABS started know
  * theirs from the start; the main thread's is built on first request (jabs_main_thread, generated),
@@ -153,6 +174,10 @@ void jabs_destroy_java_vm(void);
 /* Thread.sleepNanos0: sleep, ending early with InterruptedException("sleep interrupted") when
  * the thread is or becomes interrupted (the interrupt clears). 0 yields. */
 void jabs_thread_sleep(int64_t nanos);
+/* Unsafe.park / Unsafe.unpark: per-thread binary permit using sleep_lock/sleep_wake; unlike
+ * sleep, an interrupt wakes park without clearing the interrupt status or throwing. */
+void jabs_thread_park(int32_t is_absolute, int64_t time);
+void jabs_thread_unpark(jabs_object *thread);
 /* Thread.interrupt0: wake the thread if it sleeps (Thread.interrupt already set the flag). */
 void jabs_thread_interrupt(jabs_object *thread);
 /* Thread.clearInterruptEvent: the caller cleared the Java interrupt status; drop the monitors'
@@ -200,6 +225,26 @@ static inline uint32_t jabs_crc32(uint32_t crc, const uint8_t *data, size_t leng
         for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
     }
     return ~crc;
+}
+/* java.util.zip.Adler32: Adler-32 checksum continuing from a previous value, matching zlib's
+ * adler32(). Returns `adler` unchanged when `length == 0` without dereferencing `data`. */
+static inline uint32_t jabs_adler32(uint32_t adler, const uint8_t *data, size_t length) {
+    const uint32_t MOD_ADLER = 65521u;
+    const size_t NMAX = 5552;
+    uint32_t s1 = adler & 0xffffu;
+    uint32_t s2 = (adler >> 16) & 0xffffu;
+    while (length > 0) {
+        size_t chunk = length < NMAX ? length : NMAX;
+        length -= chunk;
+        for (size_t i = 0; i < chunk; i++) {
+            s1 += data[i];
+            s2 += s1;
+        }
+        data += chunk;
+        s1 %= MOD_ADLER;
+        s2 %= MOD_ADLER;
+    }
+    return (s2 << 16) | s1;
 }
 /* The host's 1, 5 and 15 minute load averages, the first `count` (1..3) into `out`: how many
  * were stored, or -1 when the host has none (Windows). */
@@ -346,6 +391,8 @@ static inline _Noreturn void jabs_not_compiled(const char *method) {
 /* Function start addresses of the current native stack frames, innermost first (jabs_platform.c). */
 int jabs_platform_stack_functions(const void **starts, int max);
 jabs_object *jabs_class_new_instance(jabs_object *c);
+jabs_object *jabs_unsafe_allocate_instance(jabs_object *c);
+int32_t jabs_unsafe_should_be_initialized(jabs_object *c);
 
 /* jabs_not_compiled naming the class involved. */
 static inline _Noreturn void jabs_not_compiled_class(const char *what, const char *class_name) {
@@ -676,6 +723,23 @@ jabs_object *jabs_nio_realpath(int64_t path);
 jabs_object *jabs_process_environment_block(void);
 jabs_object *jabs_process_environ(void);
 
+/* java.util.zip (jabs_zip.c, glue in src/cgen/zip.rs). */
+int64_t jabs_zip_inflate_init(int32_t nowrap);
+void jabs_zip_inflate_set_dict(int64_t stream, const uint8_t *dict, int32_t len);
+int64_t jabs_zip_inflate(jabs_object *inflater, int64_t stream, const uint8_t *in, int32_t in_len, uint8_t *out, int32_t out_len);
+int32_t jabs_zip_inflate_adler(int64_t stream);
+void jabs_zip_inflate_reset(int64_t stream);
+void jabs_zip_inflate_end(int64_t stream);
+int64_t jabs_zip_deflate_init(int32_t level, int32_t strategy, int32_t nowrap);
+void jabs_zip_deflate_set_dict(int64_t stream, const uint8_t *dict, int32_t len);
+int64_t jabs_zip_deflate(int64_t stream, const uint8_t *in, int32_t in_len, uint8_t *out, int32_t out_len, int32_t flush, int32_t params);
+int32_t jabs_zip_deflate_adler(int64_t stream);
+void jabs_zip_deflate_reset(int64_t stream);
+void jabs_zip_deflate_end(int64_t stream);
+void jabs_zip_data_format_exception(const char *message);
+void jabs_zip_illegal_argument(const char *message);
+void jabs_zip_set_inflater_consumed(jabs_object *inflater, int32_t in_consumed, int32_t out_consumed);
+
 /* Files (jabs_files.c): UTF-8 paths, one implementation per OS family. */
 enum { JABS_FS_EXISTS = 0x01, JABS_FS_REGULAR = 0x02, JABS_FS_DIRECTORY = 0x04, JABS_FS_HIDDEN = 0x08 };
 enum { JABS_FS_ACCESS_READ = 0x04, JABS_FS_ACCESS_WRITE = 0x02, JABS_FS_ACCESS_EXECUTE = 0x01 };
@@ -786,8 +850,7 @@ static inline void *jabs_array_data(jabs_array *a) {
     return (char *)a + ((sizeof(jabs_array) + 7) & ~(size_t)7);
 }
 
-/* Shared record for every array object: arrays are instances of no compiled class.
- * A function-local static avoids unused-variable warnings in programs without arrays. */
+/* Shared record for every array object: arrays are instances of no compiled class. */
 extern const jabs_class jabs_array_class_record;
 static inline const jabs_class *jabs_array_class(void) { return &jabs_array_class_record; }
 

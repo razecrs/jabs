@@ -128,6 +128,174 @@ pub struct ClassReflection {
     pub nest_host: Option<String>,
     /// Whether the class has a Record attribute (HotSpot's `is_record`).
     pub is_record: bool,
+    /// A module-info class's Module, ModulePackages and ModuleResolution attributes.
+    pub module: ModuleAttributes,
+}
+
+/// `module_flags` ACC_OPEN (JVMS 4.7.25): every package of the module is open.
+pub const ACC_OPEN: u16 = 0x0020;
+/// `requires_flags` ACC_TRANSITIVE: readers of the module also read the required one.
+pub const ACC_TRANSITIVE: u16 = 0x0020;
+/// `requires_flags` ACC_STATIC_PHASE: required at compile time only.
+pub const ACC_STATIC_PHASE: u16 = 0x0040;
+/// Class access flag ACC_MODULE: the class file is a module-info.
+pub const ACC_MODULE: u16 = 0x8000;
+/// ModuleResolution flag DO_NOT_RESOLVE_BY_DEFAULT (jdk.internal.module.ModuleResolution):
+/// the module is not a default root (the jdk.incubator modules).
+pub const DO_NOT_RESOLVE_BY_DEFAULT: u16 = 0x0001;
+/// Most entries accepted in one table of a Module attribute (requires, exports, a target list,
+/// ModulePackages...): java.base, the largest JDK module, has about 200 packages; the cap only
+/// stops a corrupt count from driving the parse.
+const MAX_MODULE_TABLE: u16 = 8192;
+
+/// One `requires` of a Module attribute: the module name and requires_flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRequires {
+    pub module: String,
+    pub flags: u16,
+}
+
+/// One `exports` or `opens` of a Module attribute: the package (internal form, `java/lang`),
+/// its flags, and the modules it is qualified to (empty: to everyone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModulePackageGrant {
+    pub package: String,
+    pub flags: u16,
+    pub targets: Vec<String>,
+}
+
+/// The Module attribute (JVMS 4.7.25) as far as JABS uses it: uses and provides are checked
+/// for bounds but not kept (the runtime reads them from the class bytes itself).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleDeclaration {
+    pub name: String,
+    pub flags: u16,
+    pub requires: Vec<ModuleRequires>,
+    pub exports: Vec<ModulePackageGrant>,
+    pub opens: Vec<ModulePackageGrant>,
+}
+
+/// The module-related attributes of a module-info class file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleAttributes {
+    pub declaration: Option<ModuleDeclaration>,
+    /// ModulePackages (JVMS 4.7.26): every package of the module, internal form.
+    pub packages: Option<Vec<String>>,
+    /// ModuleResolution (a JDK attribute, not in the JVMS): its resolution flags.
+    pub resolution: Option<u16>,
+}
+
+/// A Module or Package constant's name.
+fn named_constant(pool: &[Constant], index: u16, module: bool) -> Result<&str> {
+    match (pool.get(index as usize), module) {
+        (Some(Constant::Module(n)), true) | (Some(Constant::Package(n)), false) => utf8(pool, *n),
+        _ => bail!(
+            "constant {index} is not a {}",
+            if module { "Module" } else { "Package" }
+        ),
+    }
+}
+
+/// A table count of a Module attribute, refused above MAX_MODULE_TABLE.
+fn module_table_count(c: &mut Cursor, what: &str) -> Result<u16> {
+    let count = c.u16()?;
+    if count > MAX_MODULE_TABLE {
+        bail!("Module attribute: {count} {what}; limit is {MAX_MODULE_TABLE}");
+    }
+    Ok(count)
+}
+
+/// The exports or opens table of a Module attribute.
+fn parse_package_grants(
+    c: &mut Cursor,
+    pool: &[Constant],
+    what: &str,
+) -> Result<Vec<ModulePackageGrant>> {
+    let mut out = Vec::new();
+    for _ in 0..module_table_count(c, what)? {
+        let package = named_constant(pool, c.u16()?, false)?.to_owned();
+        let flags = c.u16()?;
+        let mut targets = Vec::new();
+        for _ in 0..module_table_count(c, "targets")? {
+            targets.push(named_constant(pool, c.u16()?, true)?.to_owned());
+        }
+        out.push(ModulePackageGrant {
+            package,
+            flags,
+            targets,
+        });
+    }
+    Ok(out)
+}
+
+/// The Module attribute (JVMS 4.7.25).
+fn parse_module(data: &[u8], pool: &[Constant]) -> Result<ModuleDeclaration> {
+    let mut c = Cursor::new(data);
+    let name = named_constant(pool, c.u16()?, true)?.to_owned();
+    let flags = c.u16()?;
+    let version = c.u16()?;
+    if version != 0 {
+        utf8(pool, version)?;
+    }
+    let mut requires = Vec::new();
+    for _ in 0..module_table_count(&mut c, "requires")? {
+        let module = named_constant(pool, c.u16()?, true)?.to_owned();
+        let flags = c.u16()?;
+        let version = c.u16()?;
+        if version != 0 {
+            utf8(pool, version)?;
+        }
+        requires.push(ModuleRequires { module, flags });
+    }
+    let exports = parse_package_grants(&mut c, pool, "exports")?;
+    let opens = parse_package_grants(&mut c, pool, "opens")?;
+    for _ in 0..module_table_count(&mut c, "uses")? {
+        class_name(pool, c.u16()?)?;
+    }
+    for _ in 0..module_table_count(&mut c, "provides")? {
+        class_name(pool, c.u16()?)?;
+        let count = module_table_count(&mut c, "provides with")?;
+        if count == 0 {
+            bail!("Module attribute: provides_with_count must be non-zero");
+        }
+        for _ in 0..count {
+            class_name(pool, c.u16()?)?;
+        }
+    }
+    if c.remaining() != 0 {
+        bail!(
+            "{} trailing bytes after the Module attribute",
+            c.remaining()
+        );
+    }
+    Ok(ModuleDeclaration {
+        name,
+        flags,
+        requires,
+        exports,
+        opens,
+    })
+}
+
+/// The ModulePackages attribute (JVMS 4.7.26).
+fn parse_module_packages(data: &[u8], pool: &[Constant]) -> Result<Vec<String>> {
+    let mut c = Cursor::new(data);
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..module_table_count(&mut c, "packages")? {
+        let pkg = named_constant(pool, c.u16()?, false)?.to_owned();
+        if !seen.insert(pkg.clone()) {
+            bail!("duplicate package {pkg} in ModulePackages attribute");
+        }
+        out.push(pkg);
+    }
+    if c.remaining() != 0 {
+        bail!(
+            "{} trailing bytes after the ModulePackages attribute",
+            c.remaining()
+        );
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -562,8 +730,11 @@ impl ClassFile {
                     bootstrap: c.u16()?,
                     name_and_type: c.u16()?,
                 },
-                19 => Constant::Module(c.u16()?),
-                20 => Constant::Package(c.u16()?),
+                19 if major >= 53 => Constant::Module(c.u16()?),
+                20 if major >= 53 => Constant::Package(c.u16()?),
+                19 | 20 => {
+                    bail!("constant-pool tag {tag} requires class file version >= 53 (got {major})")
+                }
                 _ => bail!("unknown constant-pool tag {tag} at index {}", pool.len()),
             };
             pool.push(entry);
@@ -649,6 +820,7 @@ impl ClassFile {
         let methods = members(&mut c)?;
         let mut bootstrap_methods = Vec::new();
         let mut reflect = ClassReflection::default();
+        let mut has_main_class = false;
         parse_attributes(&mut c, &pool, |attr, data| {
             match attr {
                 "Signature" => {
@@ -667,6 +839,36 @@ impl ClassFile {
                         Some(class_name(&pool, single_index(attr, data)?)?.to_owned());
                 }
                 "Record" => reflect.is_record = true,
+                "Module" | "ModulePackages" | "ModuleResolution" | "ModuleMainClass"
+                    if access & ACC_MODULE == 0 =>
+                {
+                    bail!("{attr} attribute requires ACC_MODULE");
+                }
+                "Module" => {
+                    if reflect.module.declaration.is_some() {
+                        bail!("duplicate Module attribute");
+                    }
+                    reflect.module.declaration = Some(parse_module(data, &pool)?);
+                }
+                "ModulePackages" => {
+                    if reflect.module.packages.is_some() {
+                        bail!("duplicate ModulePackages attribute");
+                    }
+                    reflect.module.packages = Some(parse_module_packages(data, &pool)?);
+                }
+                "ModuleResolution" => {
+                    if reflect.module.resolution.is_some() {
+                        bail!("duplicate ModuleResolution attribute");
+                    }
+                    reflect.module.resolution = Some(single_index(attr, data)?);
+                }
+                "ModuleMainClass" => {
+                    if has_main_class {
+                        bail!("duplicate ModuleMainClass attribute");
+                    }
+                    has_main_class = true;
+                    class_name(&pool, single_index(attr, data)?)?;
+                }
                 _ => {}
             }
             if attr == "BootstrapMethods" {
@@ -685,10 +887,32 @@ impl ClassFile {
         if c.remaining() != 0 {
             bail!("{} trailing bytes after class file", c.remaining());
         }
+        let name = class_name(&pool, this_class)?.to_owned();
+        if access & ACC_MODULE != 0 {
+            if major < 53 {
+                bail!("ACC_MODULE requires class file version >= 53 (got {major})");
+            }
+            if access != ACC_MODULE {
+                bail!("ACC_MODULE class must not set other access flags (0x{access:04x})");
+            }
+            if super_class != 0
+                || !interfaces.is_empty()
+                || !fields.is_empty()
+                || !methods.is_empty()
+            {
+                bail!("ACC_MODULE class must have no superclass, interfaces, fields, or methods");
+            }
+            if name != "module-info" {
+                bail!("ACC_MODULE class must be named module-info (got {name})");
+            }
+            if reflect.module.declaration.is_none() {
+                bail!("ACC_MODULE class is missing a Module attribute");
+            }
+        }
         Ok(ClassFile {
             minor,
             major,
-            name: class_name(&pool, this_class)?.to_owned(),
+            name,
             super_name: if super_class == 0 {
                 None
             } else {

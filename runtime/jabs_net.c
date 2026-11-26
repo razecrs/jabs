@@ -12,7 +12,9 @@
 #endif
 #ifdef _WIN32
 /* rand_s (NativeSeedGenerator's seed) is declared only when asked for, before stdlib.h. */
+#ifndef _CRT_RAND_S
 #define _CRT_RAND_S
+#endif
 /* winsock2.h must come before any windows.h (which would pull in the old winsock.h). */
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -421,7 +423,7 @@ static int32_t fd_of(jabs_object *fdo) {
     return *jabs_descriptor_fd_slot(fdo);
 }
 
-static void raise_io(const char *message) { jabs_raise_message(JABS_VM_IO, message); }
+static void net_raise_io(const char *message) { jabs_raise_message(JABS_VM_IO, message); }
 
 #ifdef _WIN32
 typedef SOCKET net_socket;
@@ -514,8 +516,8 @@ static int32_t socket_error(int code) {
 /* JNU_ThrowIOExceptionWithLastError: the system's text for the error, else the default. */
 static void raise_io_last_error(DWORD code, const char *fallback) {
     char text[1024];
-    if (net_error_text(code, text, sizeof text) > 0) raise_io(text);
-    else raise_io(fallback);
+    if (net_error_text(code, text, sizeof text) > 0) net_raise_io(text);
+    else net_raise_io(fallback);
 }
 #else
 #include <fcntl.h>
@@ -527,17 +529,21 @@ static void raise_io_last_error(DWORD code, const char *fallback) {
 #include <pthread.h>
 #include <limits.h>
 
-/* The system's text for an errno value (XSI strerror_r: thread-safe). */
+/* The system's text for an errno value (thread-safe; handles GNU vs XSI strerror_r). */
 static const char *errno_text(int code, char *buf, size_t size) {
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
+    return strerror_r(code, buf, size);
+#else
     if (strerror_r(code, buf, size) != 0) snprintf(buf, size, "error %d", code);
     return buf;
+#endif
 }
 
 /* JNU_ThrowByNameWithLastError: the errno text, or the default when errno is 0. */
 static void raise_errno(int32_t kind, int code, const char *fallback) {
     char text[256];
     const char *message = code != 0 ? errno_text(code, text, sizeof text) : fallback;
-    if (kind < 0) raise_io(message);
+    if (kind < 0) net_raise_io(message);
     else jabs_net_raise(kind, message);
 }
 
@@ -1128,7 +1134,7 @@ int32_t jabs_net_write(jabs_object *fdo, int64_t address, int32_t length) {
     if (WSASend(as_socket(fd), &b, 1, &sent, 0, NULL, NULL) == SOCKET_ERROR) {
         int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
-        if (e == WSAECONNRESET) raise_io("Connection reset by peer");
+        if (e == WSAECONNRESET) net_raise_io("Connection reset by peer");
         else raise_io_last_error((DWORD)e, "WSASend failed");
         return JABS_IOS_THROWN;
     }
@@ -1137,7 +1143,7 @@ int32_t jabs_net_write(jabs_object *fdo, int64_t address, int32_t length) {
 #else
     ssize_t n = write(fd, buffer, (size_t)length);
     if (n < 0 && (errno == ECONNRESET || errno == EPIPE)) {
-        raise_io("Connection reset by peer");
+        net_raise_io("Connection reset by peer");
         return JABS_IOS_THROWN;
     }
     if (n >= 0) return (int32_t)n;
@@ -1446,7 +1452,7 @@ int32_t jabs_net_epoll_data_offset(void) { return (int32_t)offsetof(jabs_epoll_e
 int64_t jabs_net_epoll_create(void) {
     net_ready();
     epoll_set *set = (epoll_set *)calloc(1, sizeof *set);
-    if (!set) { raise_io("epoll_create1 failed"); return 0; }
+    if (!set) { net_raise_io("epoll_create1 failed"); return 0; }
     set->magic = JABS_EPOLL_MAGIC;
     InitializeSRWLock(&set->lock);
     return (int64_t)(intptr_t)set;
@@ -1518,7 +1524,7 @@ int32_t jabs_net_epoll_wait(int64_t handle, int64_t address, int32_t maxevents, 
     if (n && (!fds || !wanted || !data)) {
         ReleaseSRWLockShared(&set->lock);
         free(fds); free(wanted); free(data);
-        raise_io("epoll_wait failed");
+        net_raise_io("epoll_wait failed");
         return JABS_IOS_THROWN;
     }
     size_t polled = 0;

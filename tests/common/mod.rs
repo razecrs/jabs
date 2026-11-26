@@ -132,11 +132,37 @@ pub fn built_once(
     }
 }
 
+/// Whether `javac`, `java` and `clang` are available; panics when `JABS_REQUIRE_TOOLS` is set.
+pub fn tools_ready(what: &str) -> bool {
+    let required = std::env::var_os("JABS_REQUIRE_TOOLS").is_some();
+    let missing: Vec<_> = [
+        ("javac", "-version"),
+        ("java", "-version"),
+        ("clang", "--version"),
+    ]
+    .into_iter()
+    .filter(|(t, a)| !tool_available(t, a))
+    .map(|(t, _)| t)
+    .collect();
+    if !missing.is_empty() {
+        assert!(!required, "required tools missing: {missing:?}");
+        eprintln!("skipping {what} behavior tests; missing {missing:?}");
+        return false;
+    }
+    true
+}
+
 /// Compile the fixture with javac (release 8 class files, like Minecraft 1.7.10's) and JABS
-/// (with java.base, reachable code only), and link it.
+/// (with java.base and the JDK's module declarations, reachable code only), and link it.
 fn build(fixture: &'static str, main_class: &'static str) -> Option<Built> {
+    if !tools_ready(fixture) {
+        return None;
+    }
+    let home = jabs::jdk::java_home(Path::new("java")).unwrap();
+    let jdk_modules = jabs::jdk::modules(&home).unwrap();
     let extras = cgen::UnitExtras {
         startup: true,
+        jdk_modules,
         ..Default::default()
     };
     build_native(fixture, main_class, "", None, extras)
@@ -152,19 +178,20 @@ pub fn build_native(
     roots: Option<&[&str]>,
     extras: cgen::UnitExtras,
 ) -> Option<Built> {
-    let required = std::env::var_os("JABS_REQUIRE_TOOLS").is_some();
-    let missing: Vec<_> = [
-        ("javac", "-version"),
-        ("java", "-version"),
-        ("clang", "--version"),
-    ]
-    .into_iter()
-    .filter(|(t, a)| !tool_available(t, a))
-    .map(|(t, _)| t)
-    .collect();
-    if !missing.is_empty() {
-        assert!(!required, "required tools missing: {missing:?}");
-        eprintln!("skipping {fixture} behavior tests; missing {missing:?}");
+    build_native_release(fixture, main_class, variant, roots, extras, "8")
+}
+
+/// [`build_native`] with the fixture compiled for Java `release` (a fixture that uses an API
+/// release 8 lacks, such as java.lang.Module).
+pub fn build_native_release(
+    fixture: &'static str,
+    main_class: &'static str,
+    variant: &str,
+    roots: Option<&[&str]>,
+    extras: cgen::UnitExtras,
+    release: &str,
+) -> Option<Built> {
+    if !tools_ready(fixture) {
         return None;
     }
     // Kept for the whole test run: every test reads the classes and runs the executable.
@@ -173,7 +200,7 @@ pub fn build_native(
     fs::create_dir_all(&classes).unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
     run(Command::new("javac")
-        .args(["--release", "8", "-nowarn", "-Xlint:-options", "-d"])
+        .args(["--release", release, "-nowarn", "-Xlint:-options", "-d"])
         .arg(&classes)
         .arg(&source));
     let mut units: Vec<ClassFile> = fs::read_dir(&classes)
