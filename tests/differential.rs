@@ -206,7 +206,7 @@ const FIXTURE_SOURCES: [&str; 17] = [
 ];
 
 /// Whole programs from `Programs.java`: (class, `-D` properties, arguments).
-const PROGRAMS: [(&str, &[&str], &[&str]); 29] = [
+const PROGRAMS: [(&str, &[&str], &[&str]); 32] = [
     ("EchoArgs", &[], &[]),
     ("EchoArgs", &[], &["one", "two words", ""]),
     ("ExitCode", &[], &[]),
@@ -225,6 +225,9 @@ const PROGRAMS: [(&str, &[&str], &[&str]); 29] = [
     ),
     ("Traces", &[], &[]),
     ("BootstrapClasses", &[], &[]),
+    ("TimeZones", &[], &[]),
+    ("TimeZones", &["user.timezone=Asia/Tokyo"], &[]),
+    ("Checksums", &[], &[]),
     // Threads.java: one mechanism each; where to look when one differs is in THREAD_PROGRAMS.
     ("StartRunsOnOwnThread", &[], &[]),
     ("StartTwiceThrows", &[], &[]),
@@ -987,8 +990,11 @@ fn native_matches_reference_jvm() {
     classes.extend(library);
     let phase = std::time::Instant::now();
     // Like a JVM, the program runs the JDK's startup (System.initPhase1) before any case.
+    // The programs are built against this JDK, as `jabs compile --jdk` builds them: java.home
+    // names it, so JDK code that reads its own files there (time zone data, tzmappings) finds them.
     let extras = cgen::UnitExtras {
         startup: true,
+        java_home: Some(home.display().to_string()),
         ..Default::default()
     };
     let compiled = cgen::compile_unit_with(&classes, Some(&roots), &extras);

@@ -117,6 +117,66 @@ int64_t jabs_platform_process_id(void) {
     return (int64_t)GetCurrentProcessId(); /* cannot fail */
 }
 
+/* TimeZone.getSystemTimeZoneID on Windows, as the JDK does it: the registry's zone key name
+ * (GetDynamicTimeZoneInformation), mapped to a Java zone ID through the JDK's own
+ * <java.home>/lib/tzmappings, whose lines are "WindowsKey:region:JavaID:". An entry for the
+ * user's two-letter region wins over the "001" default entry. NULL when there is no name, no
+ * mapping file or no matching line; Java then falls back to the GMT offset. */
+#define JABS_TZ_LINE_CAP 512
+#define JABS_TZ_LINES_CAP 4096
+char *jabs_platform_time_zone_id(const char *java_home) {
+    if (!java_home) return NULL;
+    DYNAMIC_TIME_ZONE_INFORMATION zone;
+    if (GetDynamicTimeZoneInformation(&zone) == TIME_ZONE_ID_INVALID) return NULL;
+    if (zone.TimeZoneKeyName[0] == 0) return NULL;
+    char *key = utf8_from_wide(zone.TimeZoneKeyName);
+    if (!key) return NULL;
+    char region[8] = "";
+    GEOID geo = GetUserGeoID(GEOCLASS_NATION);
+    if (geo != GEOID_NOT_AVAILABLE) {
+        wchar_t iso[8];
+        if (GetGeoInfoW(geo, GEO_ISO2, iso, 8, 0) > 0 && iso[0] && iso[1] && !iso[2]) {
+            region[0] = (char)iso[0];
+            region[1] = (char)iso[1];
+            region[2] = 0;
+        }
+    }
+    size_t home = strlen(java_home);
+    char *path = (char *)malloc(home + 32);
+    if (!path) { free(key); return NULL; }
+    memcpy(path, java_home, home);
+    memcpy(path + home, "\\lib\\tzmappings", 16);
+    FILE *f = fopen(path, "rb");
+    free(path);
+    if (!f) { free(key); return NULL; }
+    char line[JABS_TZ_LINE_CAP], fallback[JABS_TZ_LINE_CAP] = "", exact[JABS_TZ_LINE_CAP] = "";
+    size_t key_length = strlen(key);
+    for (int n = 0; n < JABS_TZ_LINES_CAP && fgets(line, sizeof line, f); n++) {
+        if (line[0] == '#' || strncmp(line, key, key_length) != 0 || line[key_length] != ':') continue;
+        char *code = line + key_length + 1;
+        char *id = strchr(code, ':');
+        if (!id) continue;
+        *id++ = 0;
+        char *end = strchr(id, ':');
+        if (!end || end == id) continue;
+        *end = 0;
+        if (region[0] && strcmp(code, region) == 0) { strcpy(exact, id); break; }
+        if (strcmp(code, "001") == 0 && !fallback[0]) strcpy(fallback, id);
+    }
+    fclose(f);
+    free(key);
+    const char *chosen = exact[0] ? exact : fallback;
+    if (!chosen[0]) return NULL;
+    size_t length = strlen(chosen);
+    char *out = (char *)malloc(length + 1);
+    if (out) memcpy(out, chosen, length + 1);
+    return out;
+}
+
+static bool jabs_utc_and_local(time_t now, struct tm *utc, struct tm *local) {
+    return gmtime_s(utc, &now) == 0 && localtime_s(local, &now) == 0;
+}
+
 int32_t jabs_platform_load_average(double *out, int32_t count) {
     (void)out;
     (void)count;
@@ -228,6 +288,50 @@ int64_t jabs_platform_process_id(void) {
     return (int64_t)getpid(); /* cannot fail */
 }
 
+/* TimeZone.getSystemTimeZoneID on Linux and other POSIX hosts, in the JDK's order: the TZ
+ * variable, then /etc/timezone (Debian and Ubuntu), then the zone /etc/localtime links to. The
+ * JDK would also compare a copied /etc/localtime with every zoneinfo file; JABS does not, and
+ * answers NULL there, so Java falls back to the GMT offset. */
+#define JABS_TZ_LINE_CAP 512
+static char *jabs_copy_text(const char *text) {
+    size_t length = strlen(text);
+    char *out = (char *)malloc(length + 1);
+    if (out) memcpy(out, text, length + 1);
+    return out;
+}
+char *jabs_platform_time_zone_id(const char *java_home) {
+    (void)java_home;
+    const char *tz = getenv("TZ");
+    if (tz && tz[0]) {
+        if (tz[0] == ':') tz++;
+        const char *zoneinfo = strstr(tz, "zoneinfo/");
+        if (zoneinfo) tz = zoneinfo + 9;
+        if (tz[0]) return jabs_copy_text(tz);
+    }
+    FILE *f = fopen("/etc/timezone", "r");
+    if (f) {
+        char line[JABS_TZ_LINE_CAP];
+        char *got = fgets(line, sizeof line, f);
+        fclose(f);
+        if (got) {
+            line[strcspn(line, " \t\r\n")] = 0;
+            if (line[0]) return jabs_copy_text(line);
+        }
+    }
+    char target[JABS_TZ_LINE_CAP];
+    ssize_t n = readlink("/etc/localtime", target, sizeof target - 1);
+    if (n > 0) {
+        target[n] = 0;
+        const char *zoneinfo = strstr(target, "zoneinfo/");
+        if (zoneinfo && zoneinfo[9]) return jabs_copy_text(zoneinfo + 9);
+    }
+    return NULL;
+}
+
+static bool jabs_utc_and_local(time_t now, struct tm *utc, struct tm *local) {
+    return gmtime_r(&now, utc) != NULL && localtime_r(&now, local) != NULL;
+}
+
 /* glibc and the BSDs have it in <stdlib.h>, but only outside strict POSIX mode, which this file
  * asks for (_POSIX_C_SOURCE); the signature is the same on every host that has it. */
 extern int getloadavg(double loadavg[], int nelem);
@@ -284,6 +388,26 @@ int64_t jabs_platform_write(int32_t fd, const void *data, size_t length) {
     return (int64_t)done;
 }
 #endif
+
+/* TimeZone.getSystemGMTOffsetID: the host's current offset from UTC as "GMT+hh:mm" (or
+ * "GMT-hh:mm"), and "GMT" for no offset. Java uses it when no zone ID could be found. */
+char *jabs_platform_gmt_offset_id(void) {
+    time_t now = time(NULL);
+    struct tm utc, local;
+    if (now == (time_t)-1 || !jabs_utc_and_local(now, &utc, &local)) return NULL;
+    int days = local.tm_year != utc.tm_year ? (local.tm_year > utc.tm_year ? 1 : -1) : local.tm_yday - utc.tm_yday;
+    int minutes = days * 1440 + (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
+    char *out = (char *)malloc(16);
+    if (!out) return NULL;
+    if (minutes == 0) {
+        memcpy(out, "GMT", 4);
+        return out;
+    }
+    char sign = minutes < 0 ? '-' : '+';
+    if (minutes < 0) minutes = -minutes;
+    snprintf(out, 16, "GMT%c%02d:%02d", sign, minutes / 60, minutes % 60);
+    return out;
+}
 
 int64_t jabs_nano_time_adjustment(int64_t offset_seconds) {
     struct timespec now;

@@ -89,3 +89,38 @@ class Traces {
         }
     }
 }
+
+// The default time zone: from the host (TimeZone.getSystemTimeZoneID, which reads the OS
+// setting the way the JDK does) unless user.timezone names one. On the same machine the ID
+// and the offset must be the JVM's.
+class TimeZones {
+    public static void main(String[] args) {
+        java.util.TimeZone zone = java.util.TimeZone.getDefault();
+        System.out.println(zone.getID());
+        System.out.println(zone.getRawOffset());
+    }
+}
+
+// CRC32 as zlib computes it: whole arrays, ranges, single bytes and direct buffers, continuing
+// from earlier input; the values must be the JVM's bit for bit.
+class Checksums {
+    public static void main(String[] args) {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        System.out.println(Long.toHexString(crc.getValue()));
+        crc.update("123456789".getBytes());
+        System.out.println(Long.toHexString(crc.getValue()));
+        crc.reset();
+        byte[] all = new byte[256];
+        for (int i = 0; i < all.length; i++) all[i] = (byte) i;
+        crc.update(all, 10, 200);
+        System.out.println(Long.toHexString(crc.getValue()));
+        crc.update(0xff);
+        crc.update(-1);
+        System.out.println(Long.toHexString(crc.getValue()));
+        java.nio.ByteBuffer direct = java.nio.ByteBuffer.allocateDirect(64);
+        for (int i = 0; i < 64; i++) direct.put((byte) (i * 7));
+        direct.flip();
+        crc.update(direct);
+        System.out.println(Long.toHexString(crc.getValue()));
+    }
+}

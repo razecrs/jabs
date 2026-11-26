@@ -536,6 +536,42 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "(void)a3; return jabs_class_for_name(a0, a1, a2);",
         needs_classes: true,
     },
+    // CRC32's natives (zlib's crc32 in the JDK), jabs_crc32 in jabs_rt.h. The JDK checks the
+    // bounds before calling; JABS checks again and stops rather than read outside the array.
+    Intrinsic {
+        key: ("java/util/zip/CRC32", "update", "(II)I"),
+        body: "uint8_t b = (uint8_t)a1; return (int32_t)jabs_crc32((uint32_t)a0, &b, 1);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/util/zip/CRC32", "updateBytes0", "(I[BII)I"),
+        body: "if (!a1) { jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; } jabs_array *b = (jabs_array *)a1; if (a2 < 0 || a3 < 0 || a2 > b->length - a3) jabs_not_compiled(\"CRC32.updateBytes0 outside the array (the JDK checks the range first)\"); return (int32_t)jabs_crc32((uint32_t)a0, (const uint8_t *)jabs_array_data(b) + a2, (size_t)a3);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/util/zip/CRC32", "updateByteBuffer0", "(IJII)I"),
+        body: "if (a2 < 0 || a3 < 0) jabs_not_compiled(\"CRC32.updateByteBuffer0 with a negative offset or length\"); return (int32_t)jabs_crc32((uint32_t)a0, (const uint8_t *)(intptr_t)a1 + a2, (size_t)a3);",
+        needs_classes: false,
+    },
+    // TimeZone asks the host for its zone (jabs_platform.c follows the JDK's own lookup).
+    Intrinsic {
+        key: (
+            "java/util/TimeZone",
+            "getSystemTimeZoneID",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+        ),
+        body: "char *home = NULL; if (a0) { home = jabs_string_to_utf8(a0); if (!home) return NULL; } char *id = jabs_platform_time_zone_id(home); free(home); if (!id) return NULL; jabs_object *s = jabs_string_from_utf8(id); free(id); return s;",
+        needs_classes: true,
+    },
+    Intrinsic {
+        key: (
+            "java/util/TimeZone",
+            "getSystemGMTOffsetID",
+            "()Ljava/lang/String;",
+        ),
+        body: "char *id = jabs_platform_gmt_offset_id(); if (!id) return NULL; jabs_object *s = jabs_string_from_utf8(id); free(id); return s;",
+        needs_classes: true,
+    },
     Intrinsic {
         key: (
             "java/lang/ClassLoader",

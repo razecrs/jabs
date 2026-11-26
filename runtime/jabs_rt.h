@@ -184,6 +184,23 @@ int64_t jabs_platform_start_millis(void);
 int64_t jabs_platform_uptime_millis(void);
 /* The operating system's id of this process. */
 int64_t jabs_platform_process_id(void);
+/* TimeZone's two natives (jabs_platform.c): the host's zone as a Java zone ID, and its current
+ * offset as "GMT+hh:mm"; malloc'd UTF-8, or NULL when the host has no answer. */
+char *jabs_platform_time_zone_id(const char *java_home);
+char *jabs_platform_gmt_offset_id(void);
+
+/* java.util.zip.CRC32: CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320) continuing from a
+ * previous checksum, exactly as zlib's crc32(), which the JDK's natives call. Bit by bit, with no
+ * table to build or share between threads; fast enough for the zone data and class-path checks
+ * that use it so far. */
+static inline uint32_t jabs_crc32(uint32_t crc, const uint8_t *data, size_t length) {
+    crc = ~crc;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
 /* The host's 1, 5 and 15 minute load averages, the first `count` (1..3) into `out`: how many
  * were stored, or -1 when the host has none (Windows). */
 int32_t jabs_platform_load_average(double *out, int32_t count);
