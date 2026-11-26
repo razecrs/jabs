@@ -1315,6 +1315,10 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
         ("objectFieldOffset1", "(Ljava/lang/Class;Ljava/lang/String;)J") => {
             return Some(("return jabs_field_offset(a0, a1);".into(), true));
         }
+        // java.util.Random's <clinit> asks for its seed field's offset this way.
+        ("objectFieldOffset0", "(Ljava/lang/reflect/Field;)J") => {
+            return Some(("return jabs_unsafe_field_offset(a0);".into(), true));
+        }
         _ => return None,
     };
     Some((body.to_string(), false))
@@ -6268,6 +6272,22 @@ fn io_accessor_functions(unit: &Unit, recorded: &[&ClassFile]) -> String {
         )
     };
     let mut out = String::from("\n/* ---- java.io glue accessors ---- */\n");
+    // Unsafe.objectFieldOffset0(Field): the offset of the field a Field object names (its
+    // declaring class and name), as objectFieldOffset1 finds it. Unsafe.objectFieldOffset has
+    // already refused a null Field and hidden or record classes.
+    let reflect_field = "java/lang/reflect/Field";
+    if has(reflect_field, "clazz", "Ljava/lang/Class;")
+        && has(reflect_field, "name", "Ljava/lang/String;")
+    {
+        let _ = writeln!(
+            out,
+            "int64_t jabs_unsafe_field_offset(jabs_object *f) {{ if (!f) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; }} return jabs_field_offset({}, {}); }}",
+            at(reflect_field, "f", "clazz"),
+            at(reflect_field, "f", "name")
+        );
+    } else {
+        out.push_str("int64_t jabs_unsafe_field_offset(jabs_object *f) { (void)f; jabs_not_compiled(\"Unsafe.objectFieldOffset0 (java.lang.reflect.Field is not in the program)\"); }\n");
+    }
     let file = "java/io/File";
     if has(file, "path", "Ljava/lang/String;") {
         let _ = writeln!(

@@ -460,6 +460,9 @@ static inline double jabs_atomic_add_double(double *p, double v, int order) {
 
 /* Generated glue the java.io natives use (see io_accessor_functions in cgen.rs). */
 jabs_object *jabs_file_path_of(jabs_object *file);
+/* Unsafe.objectFieldOffset1 (class and name) and objectFieldOffset0 (a reflect Field). */
+int64_t jabs_field_offset(jabs_object *c, jabs_object *name);
+int64_t jabs_unsafe_field_offset(jabs_object *field);
 jabs_object **jabs_stream_fd_slot(jabs_object *stream);
 int32_t *jabs_descriptor_fd_slot(jabs_object *descriptor);
 void jabs_descriptor_set_handle(jabs_object *descriptor, int64_t handle);
