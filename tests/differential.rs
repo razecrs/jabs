@@ -559,6 +559,7 @@ fn cases() -> Vec<(&'static str, &'static str, Vec<Arg>)> {
         out.push(("Arrays", "multiStore", vec![I(which)]));
     }
     out.push(("Arrays", "objectMethodsOnArrays", vec![I(3)]));
+    out.push(("Arrays", "onlyInDeepArrays", vec![I(2), I(3)]));
     for (a, b) in [(2, -1), (-1, 2), (0, -1), (2, 2)] {
         out.push(("Arrays", "multiNegative", vec![I(a), I(b)]));
     }

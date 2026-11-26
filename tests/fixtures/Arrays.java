@@ -116,9 +116,21 @@ public class Arrays {
         r += a.toString().startsWith("[I@") && b.toString().startsWith("[Ljava.lang.String;@") ? 1000 : 0;
         return r;
     }
+    // A class named only by a three-level multianewarray: the allocation names the record of
+    // the innermost class, so that record must be emitted (it once was not, and the C did not
+    // compile).
+    static int onlyInDeepArrays(int a, int b) {
+        ArraysOnlyDeep[][][] grid = new ArraysOnlyDeep[a][b][];
+        int nulls = 0;
+        for (ArraysOnlyDeep[][] plane : grid) for (ArraysOnlyDeep[] row : plane) if (row == null) nulls++;
+        return grid.length * 100 + nulls;
+    }
     static int multiNegative(int a, int b) { return new int[a][b].length; }
     static int negative(int n) { return new int[n].length; }
     static int outOfBounds(int i) { int[] a = new int[3]; return a[i]; }
     static int nullArray(int i) { int[] a = i > 100 ? new int[1] : null; return a[0]; }
     static int nullLength() { int[] a = null; return a.length; }
 }
+
+// Named only by Arrays.onlyInDeepArrays.
+class ArraysOnlyDeep {}

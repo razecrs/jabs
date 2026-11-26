@@ -1528,6 +1528,16 @@ fn element_class(array: &str) -> Option<String> {
     }
 }
 
+/// The class at the bottom of an array type, however many levels it has: `[[[Lp/C;` gives
+/// `p/C`; arrays of primitives give None. multianewarray's record and its RTA entry both use it,
+/// so the record it names is always emitted.
+fn innermost_class(array: &str) -> Option<&str> {
+    array
+        .trim_start_matches('[')
+        .strip_prefix('L')?
+        .strip_suffix(';')
+}
+
 /// Split the parameter list of a method descriptor into single-type descriptors.
 fn split_params(params: &str) -> Result<Vec<&str>> {
     let mut out = Vec::new();
@@ -4195,8 +4205,7 @@ fn emit_method(
                 let negative: Vec<String> = counts.iter().map(|c| format!("{c} < 0")).collect();
                 // The innermost element class's record: stores into the leaf arrays (and into
                 // rows of a one-level reference row type) are checked against it.
-                let element = descriptor.trim_start_matches('[');
-                let record = match element.strip_prefix('L').and_then(|e| e.strip_suffix(';')) {
+                let record = match innermost_class(descriptor) {
                     Some(e) if e != OBJECT && unit.get(e).is_some() && unit.chain(e).is_ok() => {
                         format!("&{}", class_record(e))
                     }
@@ -7447,11 +7456,11 @@ fn reachable(
                         add_records(&c, &mut out.records);
                     }
                 }
+                // The innermost element class, however many levels: the allocation passes its
+                // record (emit_method), so it must have one.
                 Op::MultiANewArray { class, .. } => {
-                    if let Some(c) = element_class(class)
-                        .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
-                    {
-                        add_records(&c, &mut out.records);
+                    if let Some(c) = innermost_class(class).filter(|c| unit.get(c).is_some()) {
+                        add_records(c, &mut out.records);
                     }
                 }
                 Op::ANewArray { class } | Op::CheckCast { class } | Op::InstanceOf { class }
