@@ -217,8 +217,8 @@ static const void *jabs_thread_identity(void) { return &jabs_thread_tag; }
 
 /* ---- Runtime locks for shared tables (see jabs_lock in jabs_rt.h) ---- */
 
-_Static_assert(JABS_LOCK_COUNT == 3, "one initializer per runtime lock");
-static jabs_os_mutex jabs_runtime_locks[JABS_LOCK_COUNT] = { JABS_OS_MUTEX_INIT, JABS_OS_MUTEX_INIT, JABS_OS_MUTEX_INIT };
+_Static_assert(JABS_LOCK_COUNT == 4, "one initializer per runtime lock");
+static jabs_os_mutex jabs_runtime_locks[JABS_LOCK_COUNT] = { JABS_OS_MUTEX_INIT, JABS_OS_MUTEX_INIT, JABS_OS_MUTEX_INIT, JABS_OS_MUTEX_INIT };
 
 void jabs_lock(int which) {
     if (which < 0 || which >= JABS_LOCK_COUNT) { fprintf(stderr, "jabs: jabs_lock(%d): no such runtime lock\n", which); abort(); }

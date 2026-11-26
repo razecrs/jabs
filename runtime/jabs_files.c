@@ -27,6 +27,7 @@ const char *jabs_files_error(void) { return error_text; }
 #include <share.h>
 #include <direct.h>
 #include <wctype.h>
+#include <errno.h>
 
 /* A malloc'd wide copy of a UTF-8 string. */
 static wchar_t *wide(const char *s) {
@@ -73,7 +74,7 @@ static int attributes(const char *path, WIN32_FILE_ATTRIBUTE_DATA *data) {
     return ok;
 }
 
-int32_t jabs_fs_attributes(const char *path, int32_t *hidden) {
+static int32_t os_fs_attributes(const char *path, int32_t *hidden) {
     WIN32_FILE_ATTRIBUTE_DATA d;
     *hidden = 0;
     if (!attributes(path, &d)) return 0;
@@ -82,7 +83,7 @@ int32_t jabs_fs_attributes(const char *path, int32_t *hidden) {
                             : (d.dwFileAttributes & FILE_ATTRIBUTE_DEVICE) ? 0 : JABS_FS_REGULAR);
 }
 
-int32_t jabs_fs_access(const char *path, int32_t access) {
+static int32_t os_fs_access(const char *path, int32_t access) {
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (!attributes(path, &d)) return 0;
     /* Windows has no read or execute bits; writing needs a directory or a non-read-only file. */
@@ -91,18 +92,18 @@ int32_t jabs_fs_access(const char *path, int32_t access) {
     return 1;
 }
 
-int64_t jabs_fs_mtime(const char *path) {
+static int64_t os_fs_mtime(const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA d;
     return attributes(path, &d) ? filetime_ms(d.ftLastWriteTime) : 0;
 }
 
-int64_t jabs_fs_length(const char *path) {
+static int64_t os_fs_length(const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (!attributes(path, &d) || (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return 0;
     return ((int64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
 }
 
-int32_t jabs_fs_create_exclusive(const char *path) {
+static int32_t os_fs_create_exclusive(const char *path) {
     wchar_t *w = wide(path);
     if (!w) { strcpy(error_text, "out of memory"); return -1; }
     HANDLE h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -118,7 +119,7 @@ int32_t jabs_fs_create_exclusive(const char *path) {
     return -1;
 }
 
-int32_t jabs_fs_delete(const char *path, int32_t allow_read_only) {
+static int32_t os_fs_delete(const char *path, int32_t allow_read_only) {
     wchar_t *w = wide(path);
     if (!w) return 0;
     DWORD a = GetFileAttributesW(w);
@@ -131,14 +132,14 @@ int32_t jabs_fs_delete(const char *path, int32_t allow_read_only) {
     return ok != 0;
 }
 
-int32_t jabs_fs_mkdir(const char *path) {
+static int32_t os_fs_mkdir(const char *path) {
     wchar_t *w = wide(path);
     int ok = w && CreateDirectoryW(w, NULL);
     free(w);
     return ok;
 }
 
-int32_t jabs_fs_rename(const char *from, const char *to) {
+static int32_t os_fs_rename(const char *from, const char *to) {
     wchar_t *a = wide(from), *b = wide(to);
     int ok = a && b && _wrename(a, b) == 0;
     free(a);
@@ -146,7 +147,7 @@ int32_t jabs_fs_rename(const char *from, const char *to) {
     return ok;
 }
 
-int32_t jabs_fs_set_mtime(const char *path, int64_t ms) {
+static int32_t os_fs_set_mtime(const char *path, int64_t ms) {
     wchar_t *w = wide(path);
     if (!w) return 0;
     HANDLE h = CreateFileW(w, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -158,7 +159,7 @@ int32_t jabs_fs_set_mtime(const char *path, int64_t ms) {
     return ok;
 }
 
-int32_t jabs_fs_set_read_only(const char *path) {
+static int32_t os_fs_set_read_only(const char *path) {
     wchar_t *w = wide(path);
     DWORD a = w ? GetFileAttributesW(w) : INVALID_FILE_ATTRIBUTES;
     int ok = a != INVALID_FILE_ATTRIBUTES && SetFileAttributesW(w, a | FILE_ATTRIBUTE_READONLY);
@@ -166,7 +167,7 @@ int32_t jabs_fs_set_read_only(const char *path) {
     return ok;
 }
 
-int32_t jabs_fs_set_permission(const char *path, int32_t access, int32_t enable, int32_t owner_only) {
+static int32_t os_fs_set_permission(const char *path, int32_t access, int32_t enable, int32_t owner_only) {
     (void)owner_only;
     /* Only the write permission maps to something on Windows (the read-only attribute). */
     if (!(access & JABS_FS_ACCESS_WRITE)) return enable;
@@ -181,7 +182,7 @@ int32_t jabs_fs_set_permission(const char *path, int32_t access, int32_t enable,
     return ok;
 }
 
-char **jabs_fs_list(const char *path, int32_t *count) {
+static char **os_fs_list(const char *path, int32_t *count) {
     size_t n = strlen(path);
     char *pattern = (char *)malloc(n + 3);
     if (!pattern) return NULL;
@@ -253,7 +254,7 @@ char *jabs_fs_canonicalize(const char *path) {
     return out;
 }
 
-char *jabs_fs_final_path(const char *path) {
+static char *os_fs_final_path(const char *path) {
     wchar_t *w = wide(path);
     if (!w) return NULL;
     HANDLE h = CreateFileW(w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -280,7 +281,7 @@ char *jabs_fs_drive_directory(int32_t drive) {
 
 int32_t jabs_fs_roots(void) { return (int32_t)GetLogicalDrives(); }
 
-int64_t jabs_fs_space(const char *path, int32_t which) {
+static int64_t os_fs_space(const char *path, int32_t which) {
     ULARGE_INTEGER usable, total, free_bytes;
     wchar_t *w = wide(path);
     int ok = w && GetDiskFreeSpaceExW(w, &usable, &total, &free_bytes);
@@ -289,7 +290,7 @@ int64_t jabs_fs_space(const char *path, int32_t which) {
     return (int64_t)(which == JABS_FS_SPACE_TOTAL ? total.QuadPart : which == JABS_FS_SPACE_FREE ? free_bytes.QuadPart : usable.QuadPart);
 }
 
-int32_t jabs_fd_open(const char *path, int32_t flags) {
+static int32_t os_fd_open(const char *path, int32_t flags) {
     int mode = _O_BINARY | _O_NOINHERIT;
     if ((flags & JABS_OPEN_READ) && (flags & JABS_OPEN_WRITE)) mode |= _O_RDWR;
     else if (flags & JABS_OPEN_WRITE) mode |= _O_WRONLY;
@@ -341,7 +342,7 @@ int32_t jabs_fd_open(const char *path, int32_t flags) {
     return fd;
 }
 
-int64_t jabs_fd_read(int32_t fd, void *buffer, size_t length) {
+static int64_t os_fd_read(int32_t fd, void *buffer, size_t length) {
     /* Inherited stdin starts in CRT text mode (CRLF translation and Ctrl-Z EOF).
      * Reapply on reads so a replaced standard descriptor is handled as well. */
     if (fd >= 0 && fd <= 2 && _setmode(fd, _O_BINARY) == -1) {
@@ -353,30 +354,30 @@ int64_t jabs_fd_read(int32_t fd, void *buffer, size_t length) {
     return n;
 }
 
-int64_t jabs_fd_seek(int32_t fd, int64_t offset, int32_t whence) {
+static int64_t os_fd_seek(int32_t fd, int64_t offset, int32_t whence) {
     int64_t r = _lseeki64(fd, offset, whence == 0 ? SEEK_SET : whence == 1 ? SEEK_CUR : SEEK_END);
     if (r < 0) snprintf(error_text, sizeof error_text, "%s", strerror(errno));
     return r;
 }
 
-int64_t jabs_fd_length(int32_t fd) {
+static int64_t os_fd_length(int32_t fd) {
     int64_t n = _filelengthi64(fd);
     if (n < 0) snprintf(error_text, sizeof error_text, "%s", strerror(errno));
     return n;
 }
 
-int32_t jabs_fd_set_length(int32_t fd, int64_t length) {
+static int32_t os_fd_set_length(int32_t fd, int64_t length) {
     errno_t e = _chsize_s(fd, length);
     if (e) snprintf(error_text, sizeof error_text, "%s", strerror(e));
     return e == 0;
 }
 
-int32_t jabs_fd_is_regular(int32_t fd) {
+static int32_t os_fd_is_regular(int32_t fd) {
     struct _stat64 s;
     return _fstat64(fd, &s) == 0 && (s.st_mode & _S_IFMT) == _S_IFREG;
 }
 
-int64_t jabs_fd_available(int32_t fd) {
+static int64_t os_fd_available(int32_t fd) {
     if (jabs_fd_is_regular(fd)) {
         int64_t here = _lseeki64(fd, 0, SEEK_CUR), end = _filelengthi64(fd);
         return here < 0 || end < 0 ? -1 : (end > here ? end - here : 0);
@@ -387,12 +388,20 @@ int64_t jabs_fd_available(int32_t fd) {
     return 0; /* a console: nothing is known to be available without blocking */
 }
 
-int32_t jabs_fd_close(int32_t fd) {
+static int32_t os_fd_close(int32_t fd) {
     if (_close(fd) != 0) { snprintf(error_text, sizeof error_text, "%s", strerror(errno)); return 0; }
     return 1;
 }
 
-int32_t jabs_fd_sync(int32_t fd) { return _commit(fd) == 0; }
+static int32_t os_fd_sync(int32_t fd) { return _commit(fd) == 0; }
+
+/* Errors for the .jab's virtual tree, as this OS words them (see the wrappers at the end). */
+enum { FILES_VFS_MISSING_FILE, FILES_VFS_MISSING_PATH, FILES_VFS_READ_ONLY };
+static void files_vfs_error(int which) {
+    win32_error(which == FILES_VFS_MISSING_FILE ? ERROR_FILE_NOT_FOUND : which == FILES_VFS_MISSING_PATH ? ERROR_PATH_NOT_FOUND : ERROR_WRITE_PROTECT);
+}
+/* Windows has no execute permission to refuse. */
+#define FILES_VFS_EXECUTE_FILE 1
 
 #else
 #include <dirent.h>
@@ -407,14 +416,14 @@ int32_t jabs_fd_sync(int32_t fd) { return _commit(fd) == 0; }
 /* Record errno's message. */
 static void posix_error(void) { snprintf(error_text, sizeof error_text, "%s", strerror(errno)); }
 
-int32_t jabs_fs_attributes(const char *path, int32_t *hidden) {
+static int32_t os_fs_attributes(const char *path, int32_t *hidden) {
     struct stat s;
     *hidden = 0; /* UnixFileSystem decides hidden-ness in Java, from the name */
     if (stat(path, &s) != 0) return 0;
     return JABS_FS_EXISTS | (S_ISDIR(s.st_mode) ? JABS_FS_DIRECTORY : S_ISREG(s.st_mode) ? JABS_FS_REGULAR : 0);
 }
 
-int32_t jabs_fs_access(const char *path, int32_t wanted) {
+static int32_t os_fs_access(const char *path, int32_t wanted) {
     int mode = 0;
     if (wanted & JABS_FS_ACCESS_READ) mode |= R_OK;
     if (wanted & JABS_FS_ACCESS_WRITE) mode |= W_OK;
@@ -422,7 +431,7 @@ int32_t jabs_fs_access(const char *path, int32_t wanted) {
     return access(path, mode ? mode : F_OK) == 0;
 }
 
-int64_t jabs_fs_mtime(const char *path) {
+static int64_t os_fs_mtime(const char *path) {
     struct stat s;
     if (stat(path, &s) != 0) return 0;
 #ifdef __APPLE__
@@ -432,12 +441,12 @@ int64_t jabs_fs_mtime(const char *path) {
 #endif
 }
 
-int64_t jabs_fs_length(const char *path) {
+static int64_t os_fs_length(const char *path) {
     struct stat s;
     return stat(path, &s) == 0 ? (int64_t)s.st_size : 0;
 }
 
-int32_t jabs_fs_create_exclusive(const char *path) {
+static int32_t os_fs_create_exclusive(const char *path) {
     int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
     if (fd >= 0) { close(fd); return 1; }
     if (errno == EEXIST) return 0;
@@ -445,16 +454,16 @@ int32_t jabs_fs_create_exclusive(const char *path) {
     return -1;
 }
 
-int32_t jabs_fs_delete(const char *path, int32_t allow_read_only) {
+static int32_t os_fs_delete(const char *path, int32_t allow_read_only) {
     (void)allow_read_only;
     return remove(path) == 0;
 }
 
-int32_t jabs_fs_mkdir(const char *path) { return mkdir(path, 0777) == 0; }
+static int32_t os_fs_mkdir(const char *path) { return mkdir(path, 0777) == 0; }
 
-int32_t jabs_fs_rename(const char *from, const char *to) { return rename(from, to) == 0; }
+static int32_t os_fs_rename(const char *from, const char *to) { return rename(from, to) == 0; }
 
-int32_t jabs_fs_set_mtime(const char *path, int64_t ms) {
+static int32_t os_fs_set_mtime(const char *path, int64_t ms) {
     struct timespec t[2];
     t[0].tv_sec = 0;
     t[0].tv_nsec = UTIME_OMIT;
@@ -463,12 +472,12 @@ int32_t jabs_fs_set_mtime(const char *path, int64_t ms) {
     return utimensat(AT_FDCWD, path, t, 0) == 0;
 }
 
-int32_t jabs_fs_set_read_only(const char *path) {
+static int32_t os_fs_set_read_only(const char *path) {
     struct stat s;
     return stat(path, &s) == 0 && chmod(path, s.st_mode & ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH)) == 0;
 }
 
-int32_t jabs_fs_set_permission(const char *path, int32_t access, int32_t enable, int32_t owner_only) {
+static int32_t os_fs_set_permission(const char *path, int32_t access, int32_t enable, int32_t owner_only) {
     mode_t bits = 0;
     if (access & JABS_FS_ACCESS_READ) bits |= owner_only ? S_IRUSR : (S_IRUSR | S_IRGRP | S_IROTH);
     if (access & JABS_FS_ACCESS_WRITE) bits |= owner_only ? S_IWUSR : (S_IWUSR | S_IWGRP | S_IWOTH);
@@ -478,7 +487,7 @@ int32_t jabs_fs_set_permission(const char *path, int32_t access, int32_t enable,
     return chmod(path, enable ? (s.st_mode | bits) : (s.st_mode & ~bits)) == 0;
 }
 
-char **jabs_fs_list(const char *path, int32_t *count) {
+static char **os_fs_list(const char *path, int32_t *count) {
     DIR *d = opendir(path);
     if (!d) return NULL;
     size_t used = 0, capacity = 16;
@@ -521,13 +530,13 @@ char *jabs_fs_canonicalize(const char *path) {
     return strdup(path);
 }
 
-char *jabs_fs_final_path(const char *path) { return jabs_fs_canonicalize(path); }
+static char *os_fs_final_path(const char *path) { return jabs_fs_canonicalize(path); }
 
 char *jabs_fs_drive_directory(int32_t drive) { (void)drive; return NULL; }
 
 int32_t jabs_fs_roots(void) { return 0; }
 
-int64_t jabs_fs_space(const char *path, int32_t which) {
+static int64_t os_fs_space(const char *path, int32_t which) {
     struct statvfs v;
     if (statvfs(path, &v) != 0) return 0;
     if (which == JABS_FS_SPACE_TOTAL) return (int64_t)v.f_frsize * (int64_t)v.f_blocks;
@@ -535,7 +544,7 @@ int64_t jabs_fs_space(const char *path, int32_t which) {
     return (int64_t)v.f_frsize * (int64_t)v.f_bavail;
 }
 
-int32_t jabs_fd_open(const char *path, int32_t flags) {
+static int32_t os_fd_open(const char *path, int32_t flags) {
     int mode = O_CLOEXEC;
     if ((flags & JABS_OPEN_READ) && (flags & JABS_OPEN_WRITE)) mode |= O_RDWR;
     else if (flags & JABS_OPEN_WRITE) mode |= O_WRONLY;
@@ -552,36 +561,36 @@ int32_t jabs_fd_open(const char *path, int32_t flags) {
     return fd;
 }
 
-int64_t jabs_fd_read(int32_t fd, void *buffer, size_t length) {
+static int64_t os_fd_read(int32_t fd, void *buffer, size_t length) {
     ssize_t n;
     do n = read(fd, buffer, length); while (n < 0 && errno == EINTR);
     if (n < 0) posix_error();
     return n;
 }
 
-int64_t jabs_fd_seek(int32_t fd, int64_t offset, int32_t whence) {
+static int64_t os_fd_seek(int32_t fd, int64_t offset, int32_t whence) {
     off_t r = lseek(fd, (off_t)offset, whence == 0 ? SEEK_SET : whence == 1 ? SEEK_CUR : SEEK_END);
     if (r < 0) posix_error();
     return r;
 }
 
-int64_t jabs_fd_length(int32_t fd) {
+static int64_t os_fd_length(int32_t fd) {
     struct stat s;
     if (fstat(fd, &s) != 0) { posix_error(); return -1; }
     return s.st_size;
 }
 
-int32_t jabs_fd_set_length(int32_t fd, int64_t length) {
+static int32_t os_fd_set_length(int32_t fd, int64_t length) {
     if (ftruncate(fd, (off_t)length) != 0) { posix_error(); return 0; }
     return 1;
 }
 
-int32_t jabs_fd_is_regular(int32_t fd) {
+static int32_t os_fd_is_regular(int32_t fd) {
     struct stat s;
     return fstat(fd, &s) == 0 && S_ISREG(s.st_mode);
 }
 
-int64_t jabs_fd_available(int32_t fd) {
+static int64_t os_fd_available(int32_t fd) {
     if (jabs_fd_is_regular(fd)) {
         struct stat s;
         off_t here = lseek(fd, 0, SEEK_CUR);
@@ -592,10 +601,180 @@ int64_t jabs_fd_available(int32_t fd) {
     return ioctl(fd, FIONREAD, &n) == 0 ? n : 0;
 }
 
-int32_t jabs_fd_close(int32_t fd) {
+static int32_t os_fd_close(int32_t fd) {
     if (close(fd) != 0) { posix_error(); return 0; }
     return 1;
 }
 
-int32_t jabs_fd_sync(int32_t fd) { return fsync(fd) == 0; }
+static int32_t os_fd_sync(int32_t fd) { return fsync(fd) == 0; }
+
+enum { FILES_VFS_MISSING_FILE, FILES_VFS_MISSING_PATH, FILES_VFS_READ_ONLY };
+static void files_vfs_error(int which) {
+    snprintf(error_text, sizeof error_text, "%s", strerror(which == FILES_VFS_READ_ONLY ? EROFS : ENOENT));
+}
+/* Virtual files are r--r--r--, directories r-xr-xr-x. */
+#define FILES_VFS_EXECUTE_FILE 0
 #endif
+
+/* ---- The .jab's virtual tree in front of the OS (jabs_jab.c) ----
+ * Every path goes through jabs_vfs_find first; OUTSIDE paths are the OS's. Virtual files are
+ * read-only: anything that would write fails as on a read-only file system, and a path under
+ * java.home that the .jab does not hold fails as a missing file does. */
+
+static void files_missing(const jabs_vfs_node *node) {
+    files_vfs_error(node->parent_exists ? FILES_VFS_MISSING_FILE : FILES_VFS_MISSING_PATH);
+}
+
+int32_t jabs_fs_attributes(const char *path, int32_t *hidden) {
+    jabs_vfs_node node;
+    switch (jabs_vfs_find(path, &node)) {
+    case JABS_VFS_OUTSIDE: return os_fs_attributes(path, hidden);
+    case JABS_VFS_FILE: *hidden = 0; return JABS_FS_EXISTS | JABS_FS_REGULAR;
+    case JABS_VFS_DIRECTORY: *hidden = 0; return JABS_FS_EXISTS | JABS_FS_DIRECTORY;
+    default: *hidden = 0; return 0;
+    }
+}
+
+int32_t jabs_fs_access(const char *path, int32_t access) {
+    jabs_vfs_node node;
+    switch (jabs_vfs_find(path, &node)) {
+    case JABS_VFS_OUTSIDE: return os_fs_access(path, access);
+    case JABS_VFS_FILE: return !(access & JABS_FS_ACCESS_WRITE) && (FILES_VFS_EXECUTE_FILE || !(access & JABS_FS_ACCESS_EXECUTE));
+    case JABS_VFS_DIRECTORY: return !(access & JABS_FS_ACCESS_WRITE);
+    default: return 0;
+    }
+}
+
+int64_t jabs_fs_mtime(const char *path) {
+    jabs_vfs_node node;
+    int32_t kind = jabs_vfs_find(path, &node);
+    if (kind == JABS_VFS_OUTSIDE) return os_fs_mtime(path);
+    return kind == JABS_VFS_MISSING ? 0 : jabs_vfs_mtime_ms();
+}
+
+int64_t jabs_fs_length(const char *path) {
+    jabs_vfs_node node;
+    int32_t kind = jabs_vfs_find(path, &node);
+    if (kind == JABS_VFS_OUTSIDE) return os_fs_length(path);
+    return kind == JABS_VFS_FILE ? (int64_t)node.size : 0;
+}
+
+int32_t jabs_fs_create_exclusive(const char *path) {
+    jabs_vfs_node node;
+    int32_t kind = jabs_vfs_find(path, &node);
+    if (kind == JABS_VFS_OUTSIDE) return os_fs_create_exclusive(path);
+    if (kind != JABS_VFS_MISSING) return 0; /* already exists */
+    files_vfs_error(FILES_VFS_READ_ONLY);
+    return -1;
+}
+
+/* Whether a path is in the virtual tree; then the operation fails as on a read-only volume. */
+static int files_virtual(const char *path) {
+    jabs_vfs_node node;
+    if (jabs_vfs_find(path, &node) == JABS_VFS_OUTSIDE) return 0;
+    if (node.kind == JABS_VFS_MISSING) files_missing(&node);
+    else files_vfs_error(FILES_VFS_READ_ONLY);
+    return 1;
+}
+
+int32_t jabs_fs_delete(const char *path, int32_t allow_read_only) { return files_virtual(path) ? 0 : os_fs_delete(path, allow_read_only); }
+int32_t jabs_fs_mkdir(const char *path) { return files_virtual(path) ? 0 : os_fs_mkdir(path); }
+int32_t jabs_fs_rename(const char *from, const char *to) { return files_virtual(from) || files_virtual(to) ? 0 : os_fs_rename(from, to); }
+int32_t jabs_fs_set_mtime(const char *path, int64_t ms) { return files_virtual(path) ? 0 : os_fs_set_mtime(path, ms); }
+int32_t jabs_fs_set_read_only(const char *path) { return files_virtual(path) ? 0 : os_fs_set_read_only(path); }
+int32_t jabs_fs_set_permission(const char *path, int32_t access, int32_t enable, int32_t owner_only) {
+    return files_virtual(path) ? 0 : os_fs_set_permission(path, access, enable, owner_only);
+}
+
+char **jabs_fs_list(const char *path, int32_t *count) {
+    jabs_vfs_node node;
+    jabs_vfs_note_listing(path);
+    int32_t kind = jabs_vfs_find(path, &node);
+    if (kind == JABS_VFS_OUTSIDE) return os_fs_list(path, count);
+    if (kind != JABS_VFS_DIRECTORY) return NULL;
+    return jabs_vfs_list(&node, count);
+}
+
+char *jabs_fs_final_path(const char *path) {
+    jabs_vfs_node node;
+    int32_t kind = jabs_vfs_find(path, &node);
+    if (kind == JABS_VFS_OUTSIDE) return os_fs_final_path(path);
+    if (kind == JABS_VFS_MISSING) { files_missing(&node); return NULL; }
+    /* No links inside a .jab: the path is already final. */
+    size_t n = strlen(path);
+    char *copy = (char *)malloc(n + 1);
+    if (copy) memcpy(copy, path, n + 1);
+    return copy;
+}
+
+int64_t jabs_fs_space(const char *path, int32_t which) {
+    jabs_vfs_node node;
+    if (jabs_vfs_find(path, &node) == JABS_VFS_OUTSIDE) return os_fs_space(path, which);
+    /* A read-only volume: its size is the .jab's volume's, nothing on it is free. */
+    return which == JABS_FS_SPACE_TOTAL ? os_fs_space(jabs_vfs_directory(), which) : 0;
+}
+
+int32_t jabs_fd_open(const char *path, int32_t flags) {
+    jabs_vfs_node node;
+    int32_t kind = jabs_vfs_find(path, &node);
+    if (kind == JABS_VFS_OUTSIDE) return os_fd_open(path, flags);
+    int writes = (flags & (JABS_OPEN_WRITE | JABS_OPEN_CREATE | JABS_OPEN_TRUNCATE | JABS_OPEN_APPEND | JABS_OPEN_DELETE_ON_CLOSE)) != 0;
+    if (kind == JABS_VFS_MISSING) {
+        if (writes && (flags & JABS_OPEN_CREATE) && node.parent_exists) files_vfs_error(FILES_VFS_READ_ONLY);
+        else files_missing(&node);
+        return -1;
+    }
+    if (kind == JABS_VFS_DIRECTORY) { strcpy(error_text, "Is a directory"); return -1; }
+    if (writes) { files_vfs_error(FILES_VFS_READ_ONLY); return -1; }
+    int64_t d = jabs_vfs_open(&node, 0);
+    if (d < 0) { snprintf(error_text, sizeof error_text, "too many open files in the .jab (%d)", JABS_VFS_DESCRIPTOR_CAP); return -1; }
+    return (int32_t)d;
+}
+
+int64_t jabs_fd_read(int32_t fd, void *buffer, size_t length) {
+    if (!jabs_vfs_is_descriptor(fd)) return os_fd_read(fd, buffer, length);
+    int64_t n = jabs_vfs_read(fd, buffer, length);
+    if (n < 0) strcpy(error_text, "read from the .jab failed");
+    return n;
+}
+
+int64_t jabs_fd_seek(int32_t fd, int64_t offset, int32_t whence) {
+    if (!jabs_vfs_is_descriptor(fd)) return os_fd_seek(fd, offset, whence);
+    int64_t r = jabs_vfs_seek(fd, offset, whence);
+    if (r < 0) snprintf(error_text, sizeof error_text, "%s", strerror(EINVAL));
+    return r;
+}
+
+int64_t jabs_fd_length(int32_t fd) {
+    if (!jabs_vfs_is_descriptor(fd)) return os_fd_length(fd);
+    int64_t n = jabs_vfs_size(fd);
+    if (n < 0) snprintf(error_text, sizeof error_text, "%s", strerror(EBADF));
+    return n;
+}
+
+int32_t jabs_fd_set_length(int32_t fd, int64_t length) {
+    if (!jabs_vfs_is_descriptor(fd)) return os_fd_set_length(fd, length);
+    files_vfs_error(FILES_VFS_READ_ONLY);
+    return 0;
+}
+
+int32_t jabs_fd_is_regular(int32_t fd) {
+    if (!jabs_vfs_is_descriptor(fd)) return os_fd_is_regular(fd);
+    return jabs_vfs_descriptor_kind(fd, NULL) == JABS_VFS_FILE;
+}
+
+int64_t jabs_fd_available(int32_t fd) {
+    if (!jabs_vfs_is_descriptor(fd)) return os_fd_available(fd);
+    int64_t size = jabs_vfs_size(fd), here = jabs_vfs_position(fd);
+    if (size < 0 || here < 0) return -1;
+    return size > here ? size - here : 0;
+}
+
+int32_t jabs_fd_close(int32_t fd) {
+    if (!jabs_vfs_is_descriptor(fd)) return os_fd_close(fd);
+    if (jabs_vfs_close(fd)) return 1;
+    snprintf(error_text, sizeof error_text, "%s", strerror(EBADF));
+    return 0;
+}
+
+int32_t jabs_fd_sync(int32_t fd) { return jabs_vfs_is_descriptor(fd) ? 1 : os_fd_sync(fd); }

@@ -604,6 +604,48 @@ const INTRINSICS: &[Intrinsic] = &[
         needs_classes: true,
     },
     Intrinsic {
+        key: ("jabs/rt/Natives", "jabPath", "()Ljava/lang/String;"),
+        body: "return jabs_jab_path_string();",
+        needs_classes: true,
+    },
+    // java.util.zip.Inflater: ZipInputStream (JarInputStream, log4j's plugin scan) creates one
+    // even for a jar of STORED entries, which it never inflates. JABS has no zlib: a stream
+    // exists so creating, resetting and ending one work, and inflating stops the program.
+    Intrinsic {
+        key: ("java/util/zip/Inflater", "initIDs", "()V"),
+        body: "/* no field IDs to cache */",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/util/zip/Inflater", "init", "(Z)J"),
+        body: "return jabs_inflater_init(a0);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/util/zip/Inflater", "reset", "(J)V"),
+        body: "jabs_inflater_reset(a0);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/util/zip/Inflater", "end", "(J)V"),
+        body: "jabs_inflater_end(a0);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: ("java/util/zip/Inflater", "getAdler", "(J)I"),
+        body: "return jabs_inflater_adler(a0);",
+        needs_classes: false,
+    },
+    Intrinsic {
+        key: (
+            "java/util/zip/Inflater",
+            "inflateBytesBytes",
+            "(J[BII[BII)J",
+        ),
+        body: "(void)self; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; jabs_not_compiled(\"java.util.zip.Inflater (DEFLATE): JABS has no inflater; a .jab stores every entry uncompressed\");",
+        needs_classes: false,
+    },
+    Intrinsic {
         key: ("jabs/rt/Natives", "resourceCount", "(Ljava/lang/String;)I"),
         body: "return jabs_resource_count(a0);",
         needs_classes: true,
@@ -4978,6 +5020,8 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
 struct RegistryInputs<'a> {
     app_classes: &'a BTreeSet<String>,
     java_home: Option<&'a str>,
+    /// java.home and java.class.path come from the program's .jab at run time.
+    jab: bool,
     inits: &'a BTreeSet<String>,
     methods: &'a BTreeSet<MethodKey>,
     interfaces: &'a BTreeSet<&'a str>,
@@ -4997,6 +5041,7 @@ fn emit_class_registry(
     let RegistryInputs {
         app_classes,
         java_home,
+        jab,
         inits,
         methods,
         interfaces,
@@ -5373,7 +5418,7 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
     out.push_str(&app_loader_functions(unit, recorded, app_classes));
     out.push_str(&module_function(unit, inits));
     out.push_str(&system_properties_functions(
-        unit, java_home, inits, methods,
+        unit, java_home, jab, inits, methods,
     ));
     out.push_str(&for_name_function(unit, inits));
     out.push_str(&var_handle_functions(unit, recorded, inits));
@@ -5550,6 +5595,7 @@ jabs_object *jabs_resource_bytes(jabs_object *resource, int32_t index) {
 fn system_properties_functions(
     unit: &Unit,
     java_home: Option<&str>,
+    jab: bool,
     inits: &BTreeSet<String>,
     methods: &BTreeSet<MethodKey>,
 ) -> String {
@@ -5623,9 +5669,17 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
     }
     // The class file version of Object gives the Java feature release of the compiled JDK.
     let feature = unit.get(OBJECT).map_or(0, |o| o.major.saturating_sub(44));
-    let home = match java_home {
-        Some(h) => format!("\"{}\"", c_escape(h)),
-        None => "jabs_platform_value(JABS_PLATFORM_EXE_DIR)".to_string(),
+    // With a .jab both come from it at run time (runtime/jabs_jab.c): java.home is its
+    // jabs-home/ (or the build JDK in a recording build) and the class path is the .jab itself.
+    let home = match (jab, java_home) {
+        (true, _) => "jabs_jab_java_home()".to_string(),
+        (false, Some(h)) => format!("\"{}\"", c_escape(h)),
+        (false, None) => "jabs_platform_value(JABS_PLATFORM_EXE_DIR)".to_string(),
+    };
+    let class_path = if jab {
+        "jabs_jab_class_path()".to_string()
+    } else {
+        "\"\"".to_string()
     };
     let vm: Vec<(&str, String)> = vec![
         ("java.home", home),
@@ -5646,7 +5700,7 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
         ),
         ("java.vm.info", "\"compiled to native code\"".into()),
         ("jdk.debug", "\"release\"".into()),
-        ("java.class.path", "\"\"".into()),
+        ("java.class.path", class_path),
         ("java.library.path", "\"\"".into()),
         ("sun.boot.library.path", "\"\"".into()),
         ("sun.java.launcher", "\"JABS\"".into()),
@@ -5703,6 +5757,8 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
     out.push_str("\n/* What the JVM does before main: System.initPhase1 (properties, standard streams). */\n");
     if has_startup {
         let _ = writeln!(out, "int jabs_vm_startup(void) {{");
+        // The .jab first: it is the class path and java.home, and a bad one stops here.
+        out.push_str("    if (jabs_jab_start() != 0) return -1;\n");
         // The VM's start for RuntimeMXBean (start time, uptime), before any Java code runs.
         out.push_str("    jabs_platform_record_start();\n");
         out.push_str("    jabs_on_not_compiled = jabs_print_java_stack;\n");
@@ -6565,9 +6621,32 @@ jabs_object *jabs_class_module(jabs_object *c) {{
     )
 }
 
-/// `resources.c`: the embedded resource table (`jabs_resources`, ended by a NULL name).
-pub fn resources_file(resources: &[(String, Vec<u8>)]) -> String {
+/// `resources.c`: the embedded resource table (`jabs_resources`, ended by a NULL name) and what
+/// runtime/jabs_jab.c needs to know about the program's .jab (mode 0 when it has none).
+pub fn resources_file(
+    resources: &[(String, Vec<u8>)],
+    jab: Option<&JabConfig>,
+    java_home: Option<&str>,
+) -> String {
     let mut out = String::from("#include \"jabs_unit.h\"\n");
+    let (mode, id, home, log) = match jab {
+        None => (0, "", "", ""),
+        Some(JabConfig {
+            id,
+            record_log: None,
+        }) => (1, id.as_str(), "", ""),
+        Some(JabConfig {
+            id,
+            record_log: Some(log),
+        }) => (2, id.as_str(), java_home.unwrap_or(""), log.as_str()),
+    };
+    let _ = writeln!(
+        out,
+        "const int32_t jabs_jab_mode = {mode};\nconst char jabs_jab_id[] = \"{}\";\nconst char jabs_jab_record_home[] = \"{}\";\nconst char jabs_jab_record_log[] = \"{}\";",
+        c_escape(id),
+        c_escape(home),
+        c_escape(log)
+    );
     for (i, (_, data)) in resources.iter().enumerate() {
         let _ = write!(
             out,
@@ -7712,6 +7791,8 @@ const VM_PREINITIALIZED: &[&str] = &[
 const PLATFORM_C: &str = include_str!("../runtime/jabs_platform.c");
 /// Files and descriptors (handwritten, OS-specific).
 const FILES_C: &str = include_str!("../runtime/jabs_files.c");
+/// The program's .jab and the virtual tree the file layer serves from it (handwritten).
+const JAB_C: &str = include_str!("../runtime/jabs_jab.c");
 /// java.io natives' Java-side glue (handwritten, OS-neutral; needs the class registry).
 const IO_C: &str = include_str!("../runtime/jabs_io.c");
 /// Monitors and atomic accesses (handwritten, OS-specific).
@@ -7762,6 +7843,19 @@ pub struct UnitExtras {
     /// Compile in the JVM's startup (System.initPhase1, run by `jabs_vm_startup()`). Implied by
     /// a whole program (one with the app class loader).
     pub startup: bool,
+    /// The program has a .jab (src/jab.rs): its class path and java.home come from it at run
+    /// time (runtime/jabs_jab.c) and `resources` should be empty (the .jab holds them).
+    pub jab: Option<JabConfig>,
+}
+
+/// A program's .jab, as the generated C knows it.
+#[derive(Clone, Debug, Default)]
+pub struct JabConfig {
+    /// The archive's id (`jab::Builder::finish`): the runtime refuses any other .jab.
+    pub id: String,
+    /// A recording build: java.home stays `UnitExtras::java_home` (the build JDK) and every path
+    /// the run touches under it is appended to this file, the list `--java-home-files` reads.
+    pub record_log: Option<String>,
 }
 
 /// Split a JVM run's executed methods into the compiled ones of the unit, which become roots,
@@ -8136,6 +8230,7 @@ pub fn compile_unit_with(
             &RegistryInputs {
                 app_classes: &app_classes,
                 java_home: extras.java_home.as_deref(),
+                jab: extras.jab.is_some(),
                 inits: &emission.inits,
                 methods: &emission.methods,
                 interfaces: &interface_records,
@@ -8264,7 +8359,15 @@ pub fn compile_unit_with(
                 format!("#include \"jabs_unit.h\"\n{RUNTIME_GLOBALS}{support}"),
             ),
         ];
-        files.push(("resources.c".to_string(), resources_file(&extras.resources)));
+        files.push((
+            "resources.c".to_string(),
+            resources_file(
+                &extras.resources,
+                extras.jab.as_ref(),
+                extras.java_home.as_deref(),
+            ),
+        ));
+        files.push(("jabs_jab.c".to_string(), JAB_C.to_string()));
         files.push(("jabs_platform.c".to_string(), PLATFORM_C.to_string()));
         files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
         files.push(("jabs_sync.c".to_string(), SYNC_C.to_string()));
@@ -8312,7 +8415,12 @@ pub fn compile_unit_with(
         c_source: format!(
             "{shared}{RUNTIME_GLOBALS}{support}{}{}",
             method_texts.concat(),
-            resources_file(&extras.resources).replacen("#include \"jabs_unit.h\"\n", "", 1)
+            resources_file(
+                &extras.resources,
+                extras.jab.as_ref(),
+                extras.java_home.as_deref(),
+            )
+            .replacen("#include \"jabs_unit.h\"\n", "", 1)
                 // First of the handwritten files: on Windows, winsock2.h must come before the
                 // first windows.h.
                 + &(if registry_emitted {
@@ -8322,6 +8430,7 @@ pub fn compile_unit_with(
                 })
                 + &PLATFORM_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &FILES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                + &JAB_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &SYNC_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &THREAD_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &REFLECT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)

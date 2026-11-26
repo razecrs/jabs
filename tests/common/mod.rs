@@ -202,17 +202,47 @@ pub fn build_native(
         unsupported.is_empty(),
         "fixture methods JABS could not compile: {unsupported:#?}"
     );
+    let native = link_native(&dir, &compiled.c_files, main_class, "fixture");
+    Some(Built {
+        classes,
+        native,
+        main_class,
+        fixture,
+        executed_roots: compiled.executed_roots,
+    })
+}
+
+/// Write a unit's C files into `dir` with the harness that runs `main_class`, compile them with
+/// the CI flags and link `<stem>` (`<stem>.exe` on Windows).
+pub fn link_native(
+    dir: &Path,
+    c_files: &[(String, String)],
+    main_class: &str,
+    stem: &str,
+) -> PathBuf {
+    // A file whose text and object are already in `dir` is not compiled again (a second build
+    // of a unit in the same directory changes only a few files).
     let mut sources = Vec::new();
-    for (name, contents) in &compiled.c_files {
-        fs::write(dir.join(name), contents).unwrap();
+    let mut objects = Vec::new();
+    for (name, contents) in c_files {
+        let path = dir.join(name);
+        let unchanged = fs::read_to_string(&path).is_ok_and(|old| old == *contents)
+            && path.with_extension("o").exists();
+        if !unchanged {
+            fs::write(&path, contents).unwrap();
+        }
         if name.ends_with(".c") {
-            sources.push(dir.join(name));
+            if unchanged {
+                objects.push(path.with_extension("o"));
+            } else {
+                sources.push(path);
+            }
         }
     }
     let main_c = dir.join("harness.c");
     fs::write(&main_c, harness(main_class)).unwrap();
     sources.push(main_c);
-    let target = clang_target_args(&dir);
+    let target = clang_target_args(dir);
     let flags = [
         "-std=c11",
         "-O2",
@@ -223,7 +253,7 @@ pub fn build_native(
         "-Wno-unused-label",
         "-D_CRT_SECURE_NO_WARNINGS",
     ];
-    let objects: Vec<PathBuf> = std::thread::scope(|scope| {
+    let compiled: Vec<PathBuf> = std::thread::scope(|scope| {
         let jobs: Vec<_> = sources
             .iter()
             .map(|source| {
@@ -243,10 +273,11 @@ pub fn build_native(
             .collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     });
+    objects.extend(compiled);
     let native = dir.join(if cfg!(windows) {
-        "fixture.exe"
+        format!("{stem}.exe")
     } else {
-        "fixture"
+        stem.to_string()
     });
     run(Command::new("clang")
         .args(&target)
@@ -258,13 +289,7 @@ pub fn build_native(
         } else {
             &["-lm"][..]
         }));
-    Some(Built {
-        classes,
-        native,
-        main_class,
-        fixture,
-        executed_roots: compiled.executed_roots,
-    })
+    native
 }
 
 /// What a finished run left behind: stdout, exit status, the internal name of an exception
@@ -405,7 +430,7 @@ pub fn same_as_jvm(built: Option<&Built>, mechanism: &str, look: &str) {
 /// The build directory for one fixture of this checkout, replaced on every run: the newest build
 /// stays for debugging, and runs do not pile up (a kept tempdir per run left about 216 MB behind
 /// each time and filled the disk). Keyed by the checkout, so worktrees never share one.
-fn fresh_build_dir(fixture: &str, variant: &str) -> PathBuf {
+pub fn fresh_build_dir(fixture: &str, variant: &str) -> PathBuf {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in env!("CARGO_MANIFEST_DIR").bytes() {
         hash ^= u64::from(byte);

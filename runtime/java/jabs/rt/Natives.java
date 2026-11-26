@@ -7,6 +7,10 @@ final class Natives {
     /** The compiled-in class with this binary name ({@code a.b.C}, {@code [La.b.C;}), or null. */
     static native Class<?> classNamed(String binaryName);
 
+    /** The program's .jab (its class path), or null when it was compiled without one and its
+     * resources are embedded instead (runtime/jabs_jab.c). */
+    static native String jabPath();
+
     /** How many embedded resources have this name (one per input jar that contains it). */
     static native int resourceCount(String name);
 

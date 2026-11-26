@@ -14,6 +14,9 @@ pub(super) fn called_by(key: &MethodKey) -> Vec<(&'static str, &'static str, &'s
     if body(key).is_none() {
         return Vec::new();
     }
+    if key.0 == PERF {
+        return vec![(DIRECT_BYTE_BUFFER, "<init>", "(JJ)V")];
+    }
     vec![
         (WINDOWS_EXCEPTION, "<init>", "(I)V"),
         (UNIX_EXCEPTION, "<init>", "(I)V"),
@@ -32,6 +35,8 @@ const WINDOWS_EXCEPTION: &str = "sun/nio/fs/WindowsException";
 const UNIX_EXCEPTION: &str = "sun/nio/fs/UnixException";
 const FIRST_FILE: &str = "sun/nio/fs/WindowsNativeDispatcher$FirstFile";
 const UNIX_ATTRIBUTES: &str = "sun/nio/fs/UnixFileAttributes";
+const PERF: &str = "jdk/internal/perf/Perf";
+const DIRECT_BYTE_BUFFER: &str = "java/nio/DirectByteBuffer";
 
 /// java.nio.file natives (runtime/jabs_nio_fs.c): Windows's WindowsNativeDispatcher and
 /// FileDispatcherImpl, Linux's UnixNativeDispatcher and UnixFileDispatcherImpl. Paths and
@@ -68,6 +73,18 @@ fn body(key: &MethodKey) -> Option<&'static str> {
         ("sun/nio/ch/FileDispatcherImpl", "read0", "(Ljava/io/FileDescriptor;JI)I") => {
             "return jabs_nio_file_read(a0, a1, a2);"
         }
+        ("sun/nio/ch/FileDispatcherImpl", "size0", "(Ljava/io/FileDescriptor;)J") => {
+            "return jabs_nio_file_size(a0);"
+        }
+        ("sun/nio/ch/FileDispatcherImpl", "seek0", "(Ljava/io/FileDescriptor;J)J") => {
+            "return jabs_nio_file_seek(a0, a1);"
+        }
+        ("sun/nio/ch/UnixFileDispatcherImpl", "size0", "(Ljava/io/FileDescriptor;)J") => {
+            "return jabs_nio_unix_size(a0);"
+        }
+        ("sun/nio/ch/UnixFileDispatcherImpl", "seek0", "(Ljava/io/FileDescriptor;J)J") => {
+            "return jabs_nio_unix_seek(a0, a1);"
+        }
         ("sun/nio/ch/FileDispatcherImpl", "allocationGranularity0", "()J")
         | ("sun/nio/ch/UnixFileDispatcherImpl", "allocationGranularity0", "()J") => {
             "return jabs_nio_allocation_granularity();"
@@ -101,6 +118,12 @@ fn body(key: &MethodKey) -> Option<&'static str> {
             "return jabs_nio_unix_read(a0, a1, a2);"
         }
         ("sun/nio/ch/UnixFileDispatcherImpl", "closeIntFD", "(I)V") => "jabs_nio_close_int_fd(a0);",
+        // A performance counter (ZipFile counts its opens): HotSpot hands out a direct buffer over
+        // the counter's 8 bytes of native memory, which hold the initial value. JABS keeps no
+        // perf data file, so nothing outside the program ever reads them.
+        (PERF, "createLong", "(Ljava/lang/String;IIJ)Ljava/nio/ByteBuffer;") => {
+            "(void)self; (void)a1; (void)a2; return jabs_perf_create_long(a0, a3);"
+        }
         // System.getenv's source (the Windows selector's Unix domain sockets ask it for TEMP).
         ("java/lang/ProcessEnvironment", "environmentBlock", "()Ljava/lang/String;") => {
             "return jabs_process_environment_block();"
@@ -134,6 +157,30 @@ pub(super) fn glue(
         )
     };
     let mut out = String::from("\n/* ---- java.nio.file glue (src/cgen/net.rs) ---- */\n");
+    // JNI's NewDirectByteBuffer, for Perf.createLong: DirectByteBuffer(long address, long capacity).
+    let direct = "jabs_object *jabs_perf_create_long(jabs_object *name, int64_t value)";
+    let direct_init = (
+        DIRECT_BYTE_BUFFER.to_string(),
+        "<init>".to_string(),
+        "(JJ)V".to_string(),
+    );
+    if records.contains(DIRECT_BYTE_BUFFER)
+        && inits.contains(DIRECT_BYTE_BUFFER)
+        && methods.contains(&direct_init)
+    {
+        let _ = writeln!(
+            out,
+            "{direct} {{\n    if (!name) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}\n    int64_t *counter = (int64_t *)malloc(sizeof(int64_t));\n    if (!counter) {{ jabs_raise_message(JABS_VM_OUT_OF_MEMORY, \"Perf.createLong\"); return NULL; }}\n    *counter = value;\n    if ({init}() != 0) return NULL;\n    jabs_object *b = jabs_new(&{record});\n    if (!b) return NULL;\n    {call}(b, (int64_t)(intptr_t)counter, (int64_t)sizeof(int64_t));\n    return jabs_pending ? NULL : b;\n}}",
+            init = init_symbol(DIRECT_BYTE_BUFFER),
+            record = class_record(DIRECT_BYTE_BUFFER),
+            call = symbol(DIRECT_BYTE_BUFFER, "<init>", "(JJ)V"),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "{direct} {{ (void)name; (void)value; jabs_not_compiled(\"Perf.createLong without DirectByteBuffer(long, long) in the program (src/cgen/nio_fs.rs)\"); }}"
+        );
+    }
     for (class, function) in [
         (WINDOWS_EXCEPTION, "jabs_nio_windows_exception"),
         (UNIX_EXCEPTION, "jabs_nio_unix_exception"),

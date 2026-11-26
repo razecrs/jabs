@@ -78,6 +78,32 @@ enum Action {
         /// method the unit compiles is kept, since code may call it only by a computed name.
         #[arg(long)]
         executed_methods: Option<PathBuf>,
+        /// Also write the program's .jab here: the inputs' classes and resources, plus the
+        /// JDK files of --java-home-files, as one uncompressed jar (see src/jab.rs).
+        #[arg(long)]
+        jab: Option<PathBuf>,
+        /// The JDK files a recorded run touched under java.home (a --record-java-home log),
+        /// copied from --jdk into the .jab's jabs-home/.
+        #[arg(long, requires = "jab", requires = "jdk")]
+        java_home_files: Option<PathBuf>,
+        /// A recording build: java.home stays the --jdk installation and the program appends
+        /// every path it touches under it to this file (the list --java-home-files takes).
+        #[arg(
+            long,
+            requires = "jab",
+            requires = "jdk",
+            conflicts_with = "java_home_files"
+        )]
+        record_java_home: Option<PathBuf>,
+    },
+    /// Append a .jab to a linked executable: one portable file that is both the program and its
+    /// .jab (the runtime finds an appended archive before looking for <exe stem>.jab).
+    Pack {
+        exe: PathBuf,
+        jab: PathBuf,
+        /// The portable executable to write.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Download (verified against Mojang's hashes) and launch a vanilla client on the JVM, offline sign-in.
     Client {
@@ -183,6 +209,9 @@ fn execute(cli: Cli) -> Result<()> {
             root,
             loaded_classes,
             executed_methods,
+            jab,
+            java_home_files,
+            record_java_home,
         } => {
             let mut classes = jabs::jar::load_classes(&inputs)?;
             let roots: std::collections::BTreeSet<String> =
@@ -226,10 +255,51 @@ fn execute(cli: Cli) -> Result<()> {
                     classes.extend(library.into_iter().filter(|c| !known.contains(&c.name)));
                 }
             }
+            let mut jab_config = None;
+            if let Some(out) = &jab {
+                let mut builder = jabs::jab::Builder::new();
+                builder.add_inputs(&inputs)?;
+                if let Some(list) = &java_home_files {
+                    let Some(home) = &java_home else {
+                        anyhow::bail!("--java-home-files needs --jdk");
+                    };
+                    let (entries, missing) = jabs::jab::java_home_entries(home, list)?;
+                    eprintln!(
+                        "java.home files in the .jab: {} entries ({} listed paths do not exist in {})",
+                        entries.len(),
+                        missing,
+                        home.display()
+                    );
+                    jabs::jab::add_java_home(&mut builder, entries, &list.display().to_string())?;
+                }
+                let (bytes, id) = builder.finish()?;
+                std::fs::write(out, &bytes).with_context(|| format!("write {}", out.display()))?;
+                eprintln!(".jab: {} ({} bytes, id {id})", out.display(), bytes.len());
+                let record_log = match &record_java_home {
+                    Some(log) => Some(
+                        std::path::absolute(log)
+                            .with_context(|| format!("absolute path of {}", log.display()))?
+                            .display()
+                            .to_string(),
+                    ),
+                    None => None,
+                };
+                jab_config = Some(jabs::cgen::JabConfig { id, record_log });
+            }
+            // With a .jab, java.home is inside it: the build JDK's path is compiled in only for a
+            // recording build, so a final program cannot reach the build machine's JDK.
+            if jab.is_some() && record_java_home.is_none() {
+                java_home = None;
+            }
             // Input classes belong to the app class loader; their jars' other files are its resources.
             let extras = jabs::cgen::UnitExtras {
                 app_classes: inputs_named.clone(),
-                resources: jabs::jar::load_resources(&inputs)?,
+                // A .jab holds the resources; otherwise they are embedded in the program.
+                resources: if jab.is_some() {
+                    Vec::new()
+                } else {
+                    jabs::jar::load_resources(&inputs)?
+                },
                 java_home: java_home.map(|h| h.display().to_string()),
                 loaded_classes,
                 executed_methods: trace
@@ -237,6 +307,7 @@ fn execute(cli: Cli) -> Result<()> {
                     .map(|t| t.methods.clone())
                     .unwrap_or_default(),
                 startup: false,
+                jab: jab_config,
             };
             let compiled = jabs::cgen::compile_unit_with(&classes, Some(&roots), &extras);
             if let (Some(trace), Some(counts)) = (&trace, &compiled.executed_roots) {
@@ -264,6 +335,11 @@ fn execute(cli: Cli) -> Result<()> {
                 }
             }
             print_json(compiled)
+        }
+        Action::Pack { exe, jab, out } => {
+            jabs::jab::pack(&exe, &jab, &out)?;
+            eprintln!("portable program: {}", out.display());
+            Ok(())
         }
         Action::Hash { file } => {
             let (bytes, sha256) = profile::hash_file(&file)?;

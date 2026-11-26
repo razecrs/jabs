@@ -112,9 +112,9 @@ jabs_object *jabs_string_intern(jabs_object *s);
 extern _Atomic int64_t jabs_heap_bytes;
 
 /* Runtime locks (jabs_thread.c) for the tables every thread shares: the Class registry, the
- * String intern table and the sorting of the frame table. A holder never runs Java code, never
+ * String intern table, the sorting of the frame table and the .jab's descriptors. A holder never runs Java code, never
  * raises an exception and never takes another runtime lock, so these cannot deadlock. */
-enum { JABS_LOCK_CLASSES, JABS_LOCK_STRINGS, JABS_LOCK_FRAMES, JABS_LOCK_COUNT };
+enum { JABS_LOCK_CLASSES, JABS_LOCK_STRINGS, JABS_LOCK_FRAMES, JABS_LOCK_JAB, JABS_LOCK_COUNT };
 void jabs_lock(int which);
 void jabs_unlock(int which);
 /* Class (internal name) that called the @CallerSensitive method now running; see
@@ -640,6 +640,13 @@ int64_t jabs_nio_create_file(int64_t path, int32_t access, int32_t share, int64_
 void jabs_nio_close_handle(int64_t handle);
 /* CloseHandle for FileDescriptor.close: 0 when it failed (the caller raises). */
 int32_t jabs_nio_close_descriptor_handle(int64_t handle);
+/* FileDispatcherImpl.size0 / seek0 (Windows) and UnixFileDispatcherImpl.size0 / seek0. */
+/* Perf.createLong: a direct ByteBuffer over a new native counter (src/cgen/nio_fs.rs glue). */
+jabs_object *jabs_perf_create_long(jabs_object *name, int64_t value);
+int64_t jabs_nio_file_size(jabs_object *fdo);
+int64_t jabs_nio_file_seek(jabs_object *fdo, int64_t offset);
+int64_t jabs_nio_unix_size(jabs_object *fdo);
+int64_t jabs_nio_unix_seek(jabs_object *fdo, int64_t offset);
 void jabs_nio_delete_file(int64_t path);
 void jabs_nio_find_first_file(int64_t path, jabs_object *first);
 jabs_object *jabs_nio_find_next_file(int64_t handle, int64_t data);
@@ -712,6 +719,60 @@ int32_t jabs_fd_is_regular(int32_t fd);
 int64_t jabs_fd_available(int32_t fd);
 int32_t jabs_fd_close(int32_t fd);
 int32_t jabs_fd_sync(int32_t fd);
+
+/* The program's .jab (jabs_jab.c): its class path and java.home. The generated program says
+ * whether it has one: jabs_jab_mode 0 none, 1 a .jab, 2 a .jab and a recording of the java.home
+ * files the run touches (java.home is then the build JDK, jabs_jab_record_home). */
+extern const int32_t jabs_jab_mode;
+extern const char jabs_jab_id[];
+extern const char jabs_jab_record_home[];
+extern const char jabs_jab_record_log[];
+/* Find and check the .jab before any Java code runs; a missing or damaged one stops the program. */
+int jabs_jab_start(void);
+/* java.class.path ("" without a .jab), java.home (NULL without a .jab), the .jab's path as a
+ * String (null without one: jabs.rt.Natives.jabPath). */
+const char *jabs_jab_class_path(void);
+const char *jabs_jab_java_home(void);
+jabs_object *jabs_jab_path_string(void);
+/* The virtual tree the file natives consult before the operating system: a path is OUTSIDE (the
+ * OS's), a FILE or DIRECTORY of the .jab, or MISSING (inside the .jab's tree, not there). */
+enum { JABS_VFS_OUTSIDE, JABS_VFS_FILE, JABS_VFS_DIRECTORY, JABS_VFS_MISSING };
+typedef struct {
+    int32_t kind;
+    int32_t parent_exists; /* MISSING: whether its directory is there */
+    uint32_t index;
+    uint64_t start, size, id; /* id: unique per node, for inode numbers and file indexes */
+} jabs_vfs_node;
+int32_t jabs_vfs_find(const char *path, jabs_vfs_node *node);
+#ifdef _WIN32
+int32_t jabs_vfs_find_wide(const uint16_t *path, jabs_vfs_node *node);
+#endif
+/* Every virtual node's last-modified time (the .jab's own), and the directory the .jab is in. */
+int64_t jabs_vfs_mtime_ms(void);
+const char *jabs_vfs_directory(void);
+/* A recording build notes a directory listed under java.home. */
+void jabs_vfs_note_listing(const char *path);
+/* malloc'd names directly inside a DIRECTORY node. */
+char **jabs_vfs_list(const jabs_vfs_node *directory, int32_t *count);
+/* Virtual descriptors: [BASE, BASE + CAP), never an OS descriptor or HANDLE. listing: 0 a file's
+ * contents, 1 a directory's names, 2 the same after "." and ".." (Windows FindFirstFile). */
+#define JABS_VFS_DESCRIPTOR_BASE 0x6A610000
+#define JABS_VFS_DESCRIPTOR_CAP 1024
+int jabs_vfs_is_descriptor(int64_t d);
+int64_t jabs_vfs_open(const jabs_vfs_node *node, int32_t listing);
+/* Bytes read (0 at the end), or -1 for a bad descriptor or a failed read of the .jab. */
+int64_t jabs_vfs_read(int64_t d, void *buffer, size_t length);
+int64_t jabs_vfs_seek(int64_t d, int64_t offset, int32_t whence);
+int64_t jabs_vfs_size(int64_t d);
+int64_t jabs_vfs_position(int64_t d);
+int32_t jabs_vfs_descriptor_kind(int64_t d, uint64_t *id);
+int32_t jabs_vfs_next_name(int64_t d, char **name, int32_t *is_directory, uint64_t *size);
+int32_t jabs_vfs_close(int64_t d);
+/* java.util.zip.Inflater's natives without zlib (jabs_jab.c): a stream that never inflates. */
+int64_t jabs_inflater_init(int32_t nowrap);
+void jabs_inflater_reset(int64_t address);
+void jabs_inflater_end(int64_t address);
+int32_t jabs_inflater_adler(int64_t address);
 
 /* SetErrorMode on Windows (returns the previous mode); 0 elsewhere. */
 int64_t jabs_platform_set_error_mode(int64_t mode);

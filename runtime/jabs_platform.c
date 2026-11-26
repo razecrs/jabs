@@ -124,6 +124,7 @@ int64_t jabs_platform_process_id(void) {
  * mapping file or no matching line; Java then falls back to the GMT offset. */
 #define JABS_TZ_LINE_CAP 512
 #define JABS_TZ_LINES_CAP 4096
+#define JABS_TZ_FILE_CAP (1024 * 1024)
 char *jabs_platform_time_zone_id(const char *java_home) {
     if (!java_home) return NULL;
     DYNAMIC_TIME_ZONE_INFORMATION zone;
@@ -146,12 +147,29 @@ char *jabs_platform_time_zone_id(const char *java_home) {
     if (!path) { free(key); return NULL; }
     memcpy(path, java_home, home);
     memcpy(path + home, "\\lib\\tzmappings", 16);
-    FILE *f = fopen(path, "rb");
+    /* Through the file layer, so a .jab's java.home serves it (jabs_files.c, jabs_jab.c). */
+    int32_t fd = jabs_fd_open(path, JABS_OPEN_READ);
     free(path);
-    if (!f) { free(key); return NULL; }
+    if (fd < 0) { free(key); return NULL; }
+    char *text = (char *)malloc(JABS_TZ_FILE_CAP + 1);
+    size_t used = 0;
+    for (int reads = 0; text && used < JABS_TZ_FILE_CAP && reads < JABS_TZ_LINES_CAP; reads++) {
+        int64_t n = jabs_fd_read(fd, text + used, JABS_TZ_FILE_CAP - used);
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    jabs_fd_close(fd);
+    if (!text) { free(key); return NULL; }
+    text[used] = 0;
     char line[JABS_TZ_LINE_CAP], fallback[JABS_TZ_LINE_CAP] = "", exact[JABS_TZ_LINE_CAP] = "";
     size_t key_length = strlen(key);
-    for (int n = 0; n < JABS_TZ_LINES_CAP && fgets(line, sizeof line, f); n++) {
+    const char *next = text;
+    for (int n = 0; n < JABS_TZ_LINES_CAP && *next; n++) {
+        size_t length = strcspn(next, "\n");
+        size_t kept = length < sizeof line - 1 ? length : sizeof line - 1;
+        memcpy(line, next, kept);
+        line[kept] = 0;
+        next += length + (next[length] == '\n');
         if (line[0] == '#' || strncmp(line, key, key_length) != 0 || line[key_length] != ':') continue;
         char *code = line + key_length + 1;
         char *id = strchr(code, ':');
@@ -163,7 +181,7 @@ char *jabs_platform_time_zone_id(const char *java_home) {
         if (region[0] && strcmp(code, region) == 0) { strcpy(exact, id); break; }
         if (strcmp(code, "001") == 0 && !fallback[0]) strcpy(fallback, id);
     }
-    fclose(f);
+    free(text);
     free(key);
     const char *chosen = exact[0] ? exact : fallback;
     if (!chosen[0]) return NULL;
