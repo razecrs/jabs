@@ -1348,6 +1348,23 @@ pub struct MethodReport {
     pub status: MethodStatus,
 }
 
+/// How the methods of a JVM run's trace (`UnitExtras::executed_methods`) were used. Every
+/// traced method lands in exactly one count.
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
+pub struct ExecutedRoots {
+    /// Compiled methods of the unit: reachability roots.
+    pub roots: usize,
+    /// Methods of classes the unit does not contain (other modules or jars, hidden classes).
+    pub class_not_in_unit: usize,
+    /// Methods the unit's class lacks: another build of the class, or a method the JDK's runtime
+    /// image generates (`java/lang/invoke/*$Holder`).
+    pub method_not_in_class: usize,
+    /// Abstract in the unit, which a run cannot execute: the trace and the unit disagree.
+    pub abstract_in_unit: usize,
+    /// Methods JABS cannot compile; calling one still stops with the not-compiled diagnostic.
+    pub not_compiled: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CompiledUnit {
     pub schema_version: u32,
@@ -1367,6 +1384,9 @@ pub struct CompiledUnit {
     /// Compiled methods whose whole reachable call graph and class initialization is native.
     pub self_contained: usize,
     pub methods: Vec<MethodReport>,
+    /// What `UnitExtras::executed_methods` made roots and what it set aside, when one is given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executed_roots: Option<ExecutedRoots>,
     #[serde(skip)]
     pub c_source: String,
     /// The same program split for parallel compilation: (file name, contents). The first is the
@@ -7127,6 +7147,8 @@ struct Emission {
 struct ReachFrom<'a> {
     roots: &'a BTreeSet<String>,
     extras: &'a UnitExtras,
+    /// The compiled methods of `extras.executed_methods` (see executed_roots).
+    executed: &'a [MethodKey],
     /// What reflection and proxies add (src/cgen/reflect.rs).
     reflect: reflect::ReachInputs<'a>,
 }
@@ -7145,6 +7167,7 @@ fn reachable(
     let ReachFrom {
         roots,
         extras,
+        executed,
         reflect: reach_inputs,
     } = from;
     let loaded = &extras.loaded_classes;
@@ -7210,6 +7233,19 @@ fn reachable(
         }));
         keys
     };
+    // Methods a real JVM run executed (UnitExtras::executed_methods): some may be called only
+    // by name (log4j calls its plugins' factories through Method.invoke), so each is a root, and
+    // its class is recorded (reflection lists only recorded classes) and initialized, as a root
+    // class is. A <clinit> runs through its class's initialization, which keeps it only when the
+    // class can be initialized natively. No class is marked instantiated here; see
+    // UnitExtras::executed_methods for why.
+    for key in executed.iter() {
+        add_records(&key.0, &mut out.records);
+        pending_inits.push(key.0.clone());
+        if key.1 != "<clinit>" {
+            work.push(key.clone());
+        }
+    }
     // Rapid Type Analysis: an implementation is reachable only when its class is instantiated AND
     // some reachable code calls its (name, descriptor) virtually or through an interface.
     let mut called: BTreeSet<(String, String)> = BTreeSet::new();
@@ -7534,9 +7570,62 @@ pub struct UnitExtras {
     /// Classes a real JVM run of this program loaded (`-Xlog:class+load`). Each may be loaded by
     /// name, so its record, initializer and no-arg constructor are kept and it may be instantiated.
     pub loaded_classes: BTreeSet<String>,
+    /// Methods a real JVM run of this program executed (`jabs::jar::read_method_trace`). Code
+    /// may reach a method only by a name computed at run time (Method.invoke), which no
+    /// analysis of the instructions can find, so each one the unit compiles is a root, with
+    /// its class recorded and initialized ([`ExecutedRoots`] counts what is set aside).
+    ///
+    /// No class is marked instantiated because of the trace. An executed instance method proves
+    /// that an object of its class *or of any subclass* existed, so it cannot say which class
+    /// needs a real vtable: marking the declaring class would give real vtables to bases only
+    /// ever instantiated through subclasses (HashMap when only LinkedHashMap was made), and to
+    /// abstract classes and interfaces, which have none. Natively an object exists only through
+    /// a creation path JABS compiles, and each already marks its class: `new` (RTA),
+    /// Constructor.newInstance (reflect::reach instantiates every recorded concrete class
+    /// whose constructor is reachable, which includes the classes of executed constructors
+    /// once reflection is in the program), `loaded_classes`, VM exceptions and the management
+    /// glue.
+    pub executed_methods: BTreeSet<MethodKey>,
     /// Compile in the JVM's startup (System.initPhase1, run by `jabs_vm_startup()`). Implied by
     /// a whole program (one with the app class loader).
     pub startup: bool,
+}
+
+/// Split a JVM run's executed methods into the compiled ones of the unit, which become roots,
+/// and counts of the rest. A hidden class's name never matches a unit class, so its methods
+/// count as outside the unit (read_method_trace already sets them aside and counts them).
+fn executed_roots(
+    unit: &Unit,
+    executed: &BTreeSet<MethodKey>,
+    compiled: &BTreeSet<MethodKey>,
+) -> (Vec<MethodKey>, ExecutedRoots) {
+    let mut roots = Vec::new();
+    let mut counts = ExecutedRoots::default();
+    for key in executed {
+        let Some(class) = unit.get(&key.0) else {
+            counts.class_not_in_unit += 1;
+            continue;
+        };
+        let Some(method) = class
+            .methods
+            .iter()
+            .find(|m| m.name == key.1 && m.descriptor == key.2)
+        else {
+            counts.method_not_in_class += 1;
+            continue;
+        };
+        if method.access & ACC_ABSTRACT != 0 {
+            counts.abstract_in_unit += 1;
+            continue;
+        }
+        if !compiled.contains(key) {
+            counts.not_compiled += 1;
+            continue;
+        }
+        counts.roots += 1;
+        roots.push(key.clone());
+    }
+    (roots, counts)
 }
 
 /// Compile a set of classes together into one C unit, emitting only what is reachable from
@@ -7678,6 +7767,7 @@ pub fn compile_unit_with(
         .filter(|(_, r)| r.is_ok())
         .map(|(k, _)| k.clone())
         .collect();
+    let (executed, executed_counts) = executed_roots(&unit, &extras.executed_methods, &compiled);
     let initializable: BTreeSet<String> = classes
         .iter()
         .filter(|c| init_ok[&c.name].is_ok())
@@ -7704,6 +7794,7 @@ pub fn compile_unit_with(
             &ReachFrom {
                 roots,
                 extras,
+                executed: &executed,
                 reflect: reflect::ReachInputs {
                     proxies: &proxies.proxies,
                     annotation_loads: &crate::proxy::loaded_by_annotations(classes),
@@ -8026,6 +8117,7 @@ pub fn compile_unit_with(
         abstract_methods,
         self_contained: self_contained_count,
         methods,
+        executed_roots: (!extras.executed_methods.is_empty()).then_some(executed_counts),
         c_source: format!(
             "{shared}{RUNTIME_GLOBALS}{support}{}{}",
             method_texts.concat(),

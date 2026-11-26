@@ -1,6 +1,9 @@
 //! The method-trace agent (`tools/method-trace/jabs_trace.c`) and the reader that refuses any
 //! trace that is not whole.
 
+mod common;
+
+use common::{build_agent, tool_available};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,49 +61,6 @@ fn a_trace_that_is_not_whole_is_refused() {
         let error = format!("{:#}", jabs::jar::read_method_trace(&path).unwrap_err());
         assert!(error.contains(expected), "{text:?}: {error}");
     }
-}
-
-fn tool_available(name: &str, arg: &str) -> bool {
-    Command::new(name)
-        .arg(arg)
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Build the agent as a shared library, trying the host's default clang target, then MinGW.
-fn build_agent(dir: &Path) -> PathBuf {
-    let home = jabs::jdk::java_home(Path::new("java")).unwrap();
-    let include = home.join("include");
-    let platform = include.join(if cfg!(windows) { "win32" } else { "linux" });
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/method-trace/jabs_trace.c");
-    let library = dir.join(if cfg!(windows) {
-        "jabs_trace.dll"
-    } else {
-        "libjabs_trace.so"
-    });
-    let mut targets = vec![None];
-    if cfg!(windows) {
-        targets.push(Some("--target=x86_64-w64-windows-gnu"));
-    }
-    let mut last = String::new();
-    for target in targets {
-        let output = Command::new("clang")
-            .args(target)
-            .args(["-shared", "-O2", "-Wall", "-Wextra", "-Werror"])
-            .args(if cfg!(windows) { None } else { Some("-fPIC") })
-            .arg(format!("-I{}", include.display()))
-            .arg(format!("-I{}", platform.display()))
-            .arg(&source)
-            .arg("-o")
-            .arg(&library)
-            .output()
-            .unwrap();
-        if output.status.success() {
-            return library;
-        }
-        last = String::from_utf8_lossy(&output.stderr).into_owned();
-    }
-    panic!("clang cannot build the trace agent:\n{last}");
 }
 
 #[test]

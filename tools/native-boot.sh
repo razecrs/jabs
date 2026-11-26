@@ -15,9 +15,16 @@ for list in local/profiles/1.7.10-loaded-classes-done.txt local/profiles/1.7.10-
     [ -f "$list" ] && { LOADED="--loaded-classes $list"; break; }
 done
 echo "class list: ${LOADED:-none}"
+# Methods a JVM run executed (tools/method-trace), if recorded: log4j calls its plugins' factory
+# methods (DatePatternConverter.newInstance, ...) by name through Method.invoke, which no
+# instruction shows, so they are kept only because the run executed them.
+EXECUTED=""
+trace=local/profiles/1.7.10-method-trace.txt
+[ -f "$trace" ] && EXECUTED="--executed-methods $trace"
+echo "method trace: ${EXECUTED:-none}"
 # JABS's runtime classes (the app class loader); no invokedynamic for string concatenation.
 rm -rf "$B/rt" && javac -XDstringConcat=inline -nowarn -d "$B/rt" runtime/java/jabs/rt/*.java 2>&1 | grep -v "^Note:"
-./target/release/jabs.exe compile local/servers/1.7.10-server.jar $(find "$B/rt" -name "*.class") --jdk java --root net/minecraft/server/MinecraftServer $LOADED --out-dir "$B/src" > "$B/report.json" || exit 1
+./target/release/jabs.exe compile local/servers/1.7.10-server.jar $(find "$B/rt" -name "*.class") --jdk java --root net/minecraft/server/MinecraftServer $LOADED $EXECUTED --out-dir "$B/src" > "$B/report.json" || exit 1
 cp "$TOOLS/native-boot-entry.c" "$B/src/entry.c"
 cd "$B/src" && start=$(date +%s)
 ls *.c | xargs -P 12 -I{} clang --target=x86_64-w64-windows-gnu -std=c11 ${JABS_BOOT_OPT:--O1} -w -c {} -o {}.o 2>&1 | grep -m5 error

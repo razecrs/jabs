@@ -74,6 +74,10 @@ enum Action {
         /// may be loaded by name, so they are kept with their initializers and no-arg constructors.
         #[arg(long)]
         loaded_classes: Option<PathBuf>,
+        /// A whole method trace from a JVM run with `tools/method-trace` attached: every traced
+        /// method the unit compiles is kept, since code may call it only by a computed name.
+        #[arg(long)]
+        executed_methods: Option<PathBuf>,
     },
     /// Download (verified against Mojang's hashes) and launch a vanilla client on the JVM, offline sign-in.
     Client {
@@ -178,6 +182,7 @@ fn execute(cli: Cli) -> Result<()> {
             out_dir,
             root,
             loaded_classes,
+            executed_methods,
         } => {
             let mut classes = jabs::jar::load_classes(&inputs)?;
             let roots: std::collections::BTreeSet<String> =
@@ -192,13 +197,23 @@ fn execute(cli: Cli) -> Result<()> {
                 Some(path) => jabs::jar::read_class_list(&path)?,
                 None => std::collections::BTreeSet::new(),
             };
+            // Read strictly: a trace cut short would silently leave out what the run did last.
+            let trace = match executed_methods {
+                Some(path) => Some(jabs::jar::read_method_trace(&path)?),
+                None => None,
+            };
             let mut java_home = None;
             if let Some(java) = jdk {
                 let home = jabs::jdk::java_home(&java)?;
                 java_home = Some(home.clone());
-                // java.base, plus every module a JVM run of the program loaded classes from.
+                // java.base, plus every module a JVM run of the program loaded classes from or
+                // executed code of (as `coverage` counts them).
+                let mut used = loaded_classes.clone();
+                if let Some(trace) = &trace {
+                    used.extend(trace.methods.iter().map(|(class, _, _)| class.clone()));
+                }
                 let mut modules = vec!["java.base".to_string()];
-                for m in jabs::jdk::modules_containing(&home, &loaded_classes)? {
+                for m in jabs::jdk::modules_containing(&home, &used)? {
                     if !modules.contains(&m) {
                         modules.push(m);
                     }
@@ -217,9 +232,25 @@ fn execute(cli: Cli) -> Result<()> {
                 resources: jabs::jar::load_resources(&inputs)?,
                 java_home: java_home.map(|h| h.display().to_string()),
                 loaded_classes,
+                executed_methods: trace
+                    .as_ref()
+                    .map(|t| t.methods.clone())
+                    .unwrap_or_default(),
                 startup: false,
             };
             let compiled = jabs::cgen::compile_unit_with(&classes, Some(&roots), &extras);
+            if let (Some(trace), Some(counts)) = (&trace, &compiled.executed_roots) {
+                eprintln!(
+                    "executed methods: {} roots; set aside: {} in hidden classes, {} of classes \
+                     outside the unit, {} missing from their class, {} abstract, {} not compiled",
+                    counts.roots,
+                    trace.hidden_class_methods,
+                    counts.class_not_in_unit,
+                    counts.method_not_in_class,
+                    counts.abstract_in_unit,
+                    counts.not_compiled
+                );
+            }
             if let Some(out) = out {
                 std::fs::write(&out, &compiled.c_source)
                     .with_context(|| format!("write {}", out.display()))?;

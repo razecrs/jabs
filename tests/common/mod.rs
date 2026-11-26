@@ -76,6 +76,8 @@ pub struct Built {
     pub main_class: &'static str,
     /// The fixture's path, for failure messages.
     pub fixture: &'static str,
+    /// What the build's `UnitExtras::executed_methods` made roots, when it had any.
+    pub executed_roots: Option<cgen::ExecutedRoots>,
 }
 
 /// The native entry point: start the VM, pass the arguments as `String[]`, run `main`, and
@@ -131,6 +133,23 @@ pub fn built_once(
 /// Compile the fixture with javac (release 8 class files, like Minecraft 1.7.10's) and JABS
 /// (with java.base, reachable code only), and link it.
 fn build(fixture: &'static str, main_class: &'static str) -> Option<Built> {
+    let extras = cgen::UnitExtras {
+        startup: true,
+        ..Default::default()
+    };
+    build_native(fixture, main_class, "", None, extras)
+}
+
+/// [`build`] with the unit's extras given (they should set `startup`, as a JVM runs it), roots
+/// limited to `roots` (None: every fixture class), and its own build directory per `variant`
+/// (so two builds of one fixture can coexist).
+pub fn build_native(
+    fixture: &'static str,
+    main_class: &'static str,
+    variant: &str,
+    roots: Option<&[&str]>,
+    extras: cgen::UnitExtras,
+) -> Option<Built> {
     let required = std::env::var_os("JABS_REQUIRE_TOOLS").is_some();
     let missing: Vec<_> = [
         ("javac", "-version"),
@@ -147,7 +166,7 @@ fn build(fixture: &'static str, main_class: &'static str) -> Option<Built> {
         return None;
     }
     // Kept for the whole test run: every test reads the classes and runs the executable.
-    let dir = fresh_build_dir(fixture);
+    let dir = fresh_build_dir(fixture, variant);
     let classes = dir.join("classes");
     fs::create_dir_all(&classes).unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
@@ -161,15 +180,14 @@ fn build(fixture: &'static str, main_class: &'static str) -> Option<Built> {
         .filter(|p| p.extension().is_some_and(|e| e == "class"))
         .map(|p| ClassFile::parse(&fs::read(p).unwrap()).unwrap())
         .collect();
-    let roots: std::collections::BTreeSet<String> = units.iter().map(|c| c.name.clone()).collect();
+    let roots: std::collections::BTreeSet<String> = match roots {
+        Some(named) => named.iter().map(|n| n.to_string()).collect(),
+        None => units.iter().map(|c| c.name.clone()).collect(),
+    };
     let home = jabs::jdk::java_home(Path::new("java")).unwrap();
     let (library, _, unparsable) = jabs::jdk::read_module(&home, "java.base").unwrap();
     assert_eq!(unparsable, 0, "java.base classes ClassFile::parse rejects");
     units.extend(library);
-    let extras = cgen::UnitExtras {
-        startup: true,
-        ..Default::default()
-    };
     let compiled = cgen::compile_unit_with(&units, Some(&roots), &extras);
     let unsupported: Vec<_> = compiled
         .methods
@@ -239,6 +257,7 @@ fn build(fixture: &'static str, main_class: &'static str) -> Option<Built> {
         native,
         main_class,
         fixture,
+        executed_roots: compiled.executed_roots,
     })
 }
 
@@ -334,7 +353,7 @@ pub fn same_as_jvm(built: Option<&Built>, mechanism: &str, look: &str) {
 /// The build directory for one fixture of this checkout, replaced on every run: the newest build
 /// stays for debugging, and runs do not pile up (a kept tempdir per run left about 216 MB behind
 /// each time and filled the disk). Keyed by the checkout, so worktrees never share one.
-fn fresh_build_dir(fixture: &str) -> PathBuf {
+fn fresh_build_dir(fixture: &str, variant: &str) -> PathBuf {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in env!("CARGO_MANIFEST_DIR").bytes() {
         hash ^= u64::from(byte);
@@ -346,7 +365,7 @@ fn fresh_build_dir(fixture: &str) -> PathBuf {
         .unwrap_or("fixture");
     let dir = std::env::temp_dir()
         .join("jabs-behavior")
-        .join(format!("{hash:016x}-{stem}"));
+        .join(format!("{hash:016x}-{stem}{variant}"));
     if dir.exists() {
         fs::remove_dir_all(&dir).unwrap_or_else(|e| {
             panic!("cannot clear the previous build in {}: {e}", dir.display())
@@ -354,4 +373,41 @@ fn fresh_build_dir(fixture: &str) -> PathBuf {
     }
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
     dir
+}
+
+/// Build the method-trace agent (tools/method-trace/jabs_trace.c) as a shared library, trying
+/// the host's default clang target, then MinGW.
+pub fn build_agent(dir: &Path) -> PathBuf {
+    let home = jabs::jdk::java_home(Path::new("java")).unwrap();
+    let include = home.join("include");
+    let platform = include.join(if cfg!(windows) { "win32" } else { "linux" });
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/method-trace/jabs_trace.c");
+    let library = dir.join(if cfg!(windows) {
+        "jabs_trace.dll"
+    } else {
+        "libjabs_trace.so"
+    });
+    let mut targets = vec![None];
+    if cfg!(windows) {
+        targets.push(Some("--target=x86_64-w64-windows-gnu"));
+    }
+    let mut last = String::new();
+    for target in targets {
+        let output = Command::new("clang")
+            .args(target)
+            .args(["-shared", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .args(if cfg!(windows) { None } else { Some("-fPIC") })
+            .arg(format!("-I{}", include.display()))
+            .arg(format!("-I{}", platform.display()))
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .unwrap();
+        if output.status.success() {
+            return library;
+        }
+        last = String::from_utf8_lossy(&output.stderr).into_owned();
+    }
+    panic!("clang cannot build the trace agent:\n{last}");
 }
