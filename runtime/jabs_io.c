@@ -313,13 +313,25 @@ int32_t jabs_io_is_regular(jabs_object *fdo) {
 void jabs_io_close_descriptor(jabs_object *fdo) {
     int32_t *slot = jabs_descriptor_fd_slot(fdo);
     int32_t fd = *slot;
+    int64_t handle = jabs_descriptor_handle(fdo);
     *slot = -1;
     jabs_descriptor_set_handle(fdo, -1);
+    /* A Windows HANDLE without a descriptor is one java.nio opened (CreateFile0); JABS's own
+     * streams keep a C runtime descriptor (whose handle the standard streams also report). */
+    if (fd < 0 && handle != -1) {
+        if (!jabs_nio_close_descriptor_handle(handle)) jabs_raise_message(JABS_VM_IO, "close failed");
+        return;
+    }
     /* The standard streams stay open, as in the JDK. */
     if (fd > 2 && !jabs_fd_close(fd)) raise_io();
 }
 
-void jabs_io_cleanup_close(int32_t fd) {
+/* FileCleanable.cleanupClose0(fd, handle): a descriptor, or else a handle (as close above). */
+void jabs_io_cleanup_close(int32_t fd, int64_t handle) {
+    if (fd < 0 && handle != -1) {
+        if (!jabs_nio_close_descriptor_handle(handle)) jabs_raise_message(JABS_VM_IO, "close failed");
+        return;
+    }
     if (fd > 2 && !jabs_fd_close(fd)) raise_io();
 }
 

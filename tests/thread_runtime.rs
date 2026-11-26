@@ -296,7 +296,7 @@ fn harness() -> Option<&'static PathBuf> {
                 .arg("-o")
                 .arg(&exe)
                 .args(if cfg!(windows) {
-                    &[][..]
+                    &["-lws2_32", "-liphlpapi"][..]
                 } else {
                     &["-pthread", "-lm"][..]
                 })

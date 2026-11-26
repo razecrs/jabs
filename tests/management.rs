@@ -243,7 +243,7 @@ fn build() -> Option<Built> {
         .arg("-o")
         .arg(&native)
         .args(if cfg!(windows) {
-            &[][..]
+            &["-lws2_32", "-liphlpapi"][..]
         } else {
             &["-pthread", "-lm"][..]
         }));

@@ -1153,7 +1153,7 @@ fn native_matches_reference_jvm() {
         .arg("-o")
         .arg(&exe)
         .args(if cfg!(windows) {
-            &[][..]
+            &["-lws2_32", "-liphlpapi"][..]
         } else {
             &["-pthread", "-lm"][..]
         }));
@@ -1396,7 +1396,7 @@ fn native_matches_reference_jvm() {
             .arg("-o")
             .arg(&program)
             .args(if cfg!(windows) {
-                &[][..]
+                &["-lws2_32", "-liphlpapi"][..]
             } else {
                 &["-pthread", "-lm"][..]
             }));

@@ -110,7 +110,7 @@ fn harness() -> Option<&'static Path> {
                 .arg("-o")
                 .arg(&exe)
                 .args(if cfg!(windows) {
-                    Vec::new()
+                    vec!["-lws2_32", "-liphlpapi"]
                 } else {
                     vec!["-lm", "-lpthread"]
                 })

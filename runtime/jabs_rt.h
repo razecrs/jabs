@@ -479,6 +479,113 @@ jabs_object *jabs_string_from_utf8(const char *text);
 jabs_object *jabs_management_vm_arguments(void);
 /* A MemoryUsage built with its constructor (generated: management::glue in src/cgen/management.rs). */
 jabs_object *jabs_management_memory_usage(int64_t init, int64_t used, int64_t committed, int64_t max);
+/* java.net and java.nio natives' glue: generated (net::glue in src/cgen/net.rs). */
+/* Exceptions jabs_net_raise builds, in the order of RAISED in src/cgen/net.rs. */
+enum {
+    JABS_NET_UNKNOWN_HOST,
+    JABS_NET_SOCKET,
+    JABS_NET_BIND,
+    JABS_NET_CONNECT,
+    JABS_NET_NO_ROUTE,
+    JABS_NET_PROTOCOL,
+    JABS_NET_CONNECTION_RESET
+};
+void jabs_net_raise(int32_t kind, const char *utf8);
+jabs_object *jabs_net_new_inet4(int32_t address, jabs_object *host);
+jabs_object *jabs_net_new_inet6(const uint8_t *bytes, int32_t scope_id, jabs_object *host);
+jabs_object *jabs_net_new_inet_array(int32_t length);
+int32_t jabs_net_inet_read(jabs_object *address, uint8_t *bytes, int32_t *scope_id);
+jabs_object *jabs_net_new_socket_address(jabs_object *address, int32_t port);
+int32_t jabs_net_enhanced_host_info(void);
+int32_t jabs_net_prefer_ipv4_stack(void);
+/* The natives themselves (handwritten: jabs_net.c). */
+int32_t jabs_net_ipv4_available(void);
+int32_t jabs_net_ipv6_available(void);
+jabs_object *jabs_net_local_host_name(void);
+jabs_object *jabs_net_lookup(jabs_object *host, int32_t characteristics);
+jabs_object *jabs_net_host_by_addr(jabs_object *address);
+/* NIO sockets (sun.nio.ch.Net, IOUtil, SocketDispatcher; Linux's UnixDispatcher, NativeThread). */
+enum {
+    JABS_NET_VALUE_POLLIN,
+    JABS_NET_VALUE_POLLOUT,
+    JABS_NET_VALUE_POLLERR,
+    JABS_NET_VALUE_POLLHUP,
+    JABS_NET_VALUE_POLLNVAL,
+    JABS_NET_VALUE_POLLCONN,
+    JABS_NET_VALUE_REUSE_PORT,
+    JABS_NET_VALUE_EXCLUSIVE_BIND,
+    JABS_NET_VALUE_SHUTDOWN_WRITE_BEFORE_CLOSE,
+    JABS_NET_VALUE_SET_BOTH_IPV4_IPV6_OPTIONS,
+    JABS_NET_VALUE_IPV6_JOINS_IPV4_GROUP,
+    JABS_NET_VALUE_JOIN6_WITH_IPV4_GROUP,
+    JABS_NET_VALUE_IPV6_OPTIONS_WITH_IPV4_LOCAL,
+    JABS_NET_VALUE_IOV_MAX,
+    JABS_NET_VALUE_WRITEV_MAX
+};
+int64_t jabs_net_value(int32_t which);
+int32_t jabs_net_fd_val(jabs_object *fdo);
+void jabs_net_set_fd_val(jabs_object *fdo, int32_t fd);
+int32_t jabs_net_socket(int32_t prefer_ipv6, int32_t stream, int32_t reuse, int32_t fast_loopback);
+void jabs_net_bind(jabs_object *fdo, int32_t prefer_ipv6, int32_t exclusive, jabs_object *address, int32_t port);
+void jabs_net_listen(jabs_object *fdo, int32_t backlog);
+int32_t jabs_net_connect(int32_t prefer_ipv6, jabs_object *fdo, jabs_object *address, int32_t port);
+int32_t jabs_net_accept(jabs_object *fdo, jabs_object *newfdo, jabs_object *addresses);
+int32_t jabs_net_port(jabs_object *fdo, int32_t peer);
+jabs_object *jabs_net_address(jabs_object *fdo, int32_t peer);
+void jabs_net_shutdown(jabs_object *fdo, int32_t how);
+int32_t jabs_net_get_option(jabs_object *fdo, int32_t may_need_conversion, int32_t level, int32_t option);
+void jabs_net_set_option(jabs_object *fdo, int32_t may_need_conversion, int32_t level, int32_t option, int32_t value, int32_t is_ipv6);
+int32_t jabs_net_poll(jabs_object *fdo, int32_t events, int64_t timeout);
+int32_t jabs_net_poll_connect(jabs_object *fdo, int64_t timeout);
+int32_t jabs_net_available(jabs_object *fdo);
+void jabs_net_configure_blocking(jabs_object *fdo, int32_t blocking);
+int32_t jabs_net_read(jabs_object *fdo, int64_t address, int32_t length);
+int32_t jabs_net_write(jabs_object *fdo, int64_t address, int32_t length);
+void jabs_net_close_socket(int32_t fd);
+int32_t jabs_net_drain(int32_t fd);
+int32_t jabs_net_write1(int32_t fd, int8_t byte);
+void jabs_net_ioutil_init(void);
+int32_t jabs_net_fd_limit(void);
+int64_t jabs_net_make_pipe(int32_t blocking);
+void jabs_net_dispatcher_init(void);
+void jabs_net_pre_close(jabs_object *fdo);
+void jabs_net_close_fd(int32_t fd);
+void jabs_net_native_thread_init(void);
+int64_t jabs_net_native_thread_current(void);
+void jabs_net_native_thread_signal(int64_t thread);
+/* Selectors (WEPoll on Windows; EPoll and EventFD on Linux), Unix domain sockets. */
+int32_t jabs_net_epoll_event_size(void);
+int32_t jabs_net_epoll_events_offset(void);
+int32_t jabs_net_epoll_data_offset(void);
+int64_t jabs_net_epoll_create(void);
+int32_t jabs_net_epoll_ctl(int64_t handle, int32_t op, int64_t socket_value, int32_t events);
+int32_t jabs_net_epoll_wait(int64_t handle, int64_t address, int32_t maxevents, int32_t timeout);
+void jabs_net_epoll_close(int64_t handle);
+int32_t jabs_net_linux_epoll_create(void);
+int32_t jabs_net_linux_epoll_ctl(int32_t epfd, int32_t op, int32_t fd, int32_t events);
+int32_t jabs_net_linux_epoll_wait(int32_t epfd, int64_t address, int32_t maxevents, int32_t timeout);
+int32_t jabs_net_eventfd(void);
+int32_t jabs_net_eventfd_set(int32_t efd);
+int32_t jabs_net_uds_init(void);
+int32_t jabs_net_uds_socket(void);
+void jabs_net_uds_bind(jabs_object *fdo, jabs_object *path);
+int32_t jabs_net_uds_connect(jabs_object *fdo, jabs_object *path);
+int32_t jabs_net_uds_accept(jabs_object *fdo, jabs_object *newfdo, jabs_object *addresses);
+jabs_object *jabs_net_uds_local_address(jabs_object *fdo);
+int32_t jabs_net_generate_seed(jabs_object *bytes);
+/* jdk.net's WindowsSocketOptions and LinuxSocketOptions: which extended options the OS has. */
+enum { JABS_NET_EXTENDED_KEEPALIVE, JABS_NET_EXTENDED_QUICKACK, JABS_NET_EXTENDED_NAPI_ID };
+int32_t jabs_net_extended_option_supported(int32_t which);
+/* NetworkInterface (jabs_net.c) and the objects it builds (generated, src/cgen/net.rs). */
+jabs_object *jabs_net_interfaces(void);
+int32_t jabs_net_interface_is_loopback(int32_t index);
+jabs_object *jabs_net_interface_mac(int32_t index);
+int32_t jabs_net_address_is_bound(jabs_object *address);
+jabs_object *jabs_net_new_interface(jabs_object *name, jabs_object *display_name, int32_t index, jabs_object *addresses, jabs_object *bindings);
+jabs_object *jabs_net_new_interface_array(int32_t length);
+jabs_object *jabs_net_new_interface_address(jabs_object *address, jabs_object *broadcast, int16_t prefix);
+jabs_object *jabs_net_new_interface_address_array(int32_t length);
+void jabs_net_set_scope_interface(jabs_object *inet6, jabs_object *owner);
 /* java.io natives' glue (jabs_io.c). */
 /* System.mapLibraryName: "name" -> "name.dll" / "libname.so" / "libname.dylib". */
 jabs_object *jabs_map_library_name(jabs_object *name);
@@ -512,8 +619,55 @@ void jabs_io_set_length(jabs_object *stream, int64_t length);
 int32_t jabs_io_available(jabs_object *stream);
 int32_t jabs_io_is_regular(jabs_object *fdo);
 void jabs_io_close_descriptor(jabs_object *fdo);
-void jabs_io_cleanup_close(int32_t fd);
+void jabs_io_cleanup_close(int32_t fd, int64_t handle);
 void jabs_io_sync(jabs_object *fdo);
+
+/* java.nio.file natives (jabs_nio_fs.c; bodies in src/cgen/net.rs) and their generated glue. */
+jabs_object *jabs_string_from_utf16(const uint16_t *units, size_t count);
+/* A FileDescriptor's handle field (Windows; -1 where the JDK has none). */
+int64_t jabs_descriptor_handle(jabs_object *descriptor);
+void jabs_nio_windows_exception(int32_t error);
+void jabs_nio_unix_exception(int32_t error);
+void jabs_nio_set_first_file(jabs_object *first, int64_t handle, jabs_object *name, int32_t attributes);
+/* What UnixNativeDispatcher.stat0 stores into a UnixFileAttributes. */
+typedef struct {
+    int32_t mode, nlink, uid, gid, birthtime_available;
+    int64_t ino, dev, rdev, size;
+    int64_t atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec, birthtime_sec, birthtime_nsec;
+} jabs_nio_stat_result;
+void jabs_nio_set_unix_attributes(jabs_object *attributes, const jabs_nio_stat_result *s);
+int64_t jabs_nio_create_file(int64_t path, int32_t access, int32_t share, int64_t descriptor, int32_t disposition, int32_t flags);
+void jabs_nio_close_handle(int64_t handle);
+/* CloseHandle for FileDescriptor.close: 0 when it failed (the caller raises). */
+int32_t jabs_nio_close_descriptor_handle(int64_t handle);
+void jabs_nio_delete_file(int64_t path);
+void jabs_nio_find_first_file(int64_t path, jabs_object *first);
+jabs_object *jabs_nio_find_next_file(int64_t handle, int64_t data);
+void jabs_nio_find_close(int64_t handle);
+void jabs_nio_get_file_attributes_ex(int64_t path, int64_t data);
+void jabs_nio_get_file_information(int64_t handle, int64_t data);
+jabs_object *jabs_nio_get_full_path_name(int64_t path);
+void jabs_nio_get_reparse_point(int64_t handle, int64_t buffer, int32_t size);
+int32_t jabs_nio_file_read(jabs_object *fdo, int64_t address, int32_t length);
+int64_t jabs_nio_allocation_granularity(void);
+int32_t jabs_nio_max_direct_transfer_size(void);
+int32_t jabs_nio_unix_init(void);
+jabs_object *jabs_nio_getcwd(void);
+int32_t jabs_nio_open(int64_t path, int32_t flags, int32_t mode);
+int32_t jabs_nio_stat(int64_t path, jabs_object *attributes, int32_t follow);
+void jabs_nio_unlink(int64_t path);
+void jabs_nio_close_int_fd(int32_t fd);
+int32_t jabs_nio_unix_read(jabs_object *fdo, int64_t address, int32_t length);
+int32_t jabs_nio_access(int64_t path, int32_t mode);
+void jabs_nio_close(int32_t fd);
+int32_t jabs_nio_dup(int32_t fd);
+int64_t jabs_nio_fdopendir(int32_t fd);
+void jabs_nio_closedir(int64_t dir);
+jabs_object *jabs_nio_readdir(int64_t dir);
+jabs_object *jabs_nio_realpath(int64_t path);
+/* java.lang.ProcessEnvironment (jabs_nio_fs.c): Windows's environment block, Linux's environ. */
+jabs_object *jabs_process_environment_block(void);
+jabs_object *jabs_process_environ(void);
 
 /* Files (jabs_files.c): UTF-8 paths, one implementation per OS family. */
 enum { JABS_FS_EXISTS = 0x01, JABS_FS_REGULAR = 0x02, JABS_FS_DIRECTORY = 0x04, JABS_FS_HIDDEN = 0x08 };

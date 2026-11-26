@@ -9,9 +9,11 @@
 use jabs::{cgen, classfile::ClassFile};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, ExitStatus, Stdio},
     sync::OnceLock,
+    time::{Duration, Instant},
 };
 
 /// Whether a tool runs successfully with the given probe argument.
@@ -251,7 +253,11 @@ pub fn build_native(
         .args(&objects)
         .arg("-o")
         .arg(&native)
-        .args(if cfg!(windows) { None } else { Some("-lm") }));
+        .args(if cfg!(windows) {
+            &["-lws2_32", "-liphlpapi"][..]
+        } else {
+            &["-lm"][..]
+        }));
     Some(Built {
         classes,
         native,
@@ -270,12 +276,58 @@ pub struct Outcome {
     pub uncaught: Option<String>,
 }
 
+/// Longest one mechanism may run before the watchdog kills it: a deadlocked thread or a socket
+/// that never becomes ready must fail the test, not hang the suite.
+pub const RUN_LIMIT: Duration = Duration::from_secs(60);
+
+/// Run a command under the watchdog: its stdout, stderr and exit status, or a panic naming the
+/// command when it outlives RUN_LIMIT (with what it printed so far).
+pub fn watched(cmd: &mut Command) -> (Vec<u8>, Vec<u8>, ExitStatus) {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {cmd:?}: {e}"));
+    let mut out = child.stdout.take().expect("piped stdout");
+    let mut err = child.stderr.take().expect("piped stderr");
+    let out_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = out.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = err.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + RUN_LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for the program") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = out_reader.join().expect("stdout reader");
+    let stderr = err_reader.join().expect("stderr reader");
+    let Some(status) = status else {
+        panic!(
+            "{cmd:?} hung: killed after {RUN_LIMIT:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    };
+    (stdout, stderr, status)
+}
+
 /// Run a command; also returns its JABS stop line, if any.
 pub fn outcome(cmd: &mut Command, uncaught_prefix: &str) -> (Outcome, Option<String>) {
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("spawn {cmd:?}: {e}"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (stdout, stderr, status) = watched(cmd);
+    let stderr = String::from_utf8_lossy(&stderr);
     let uncaught = stderr.lines().find_map(|line| {
         let rest = line.strip_prefix(uncaught_prefix)?;
         let name = rest.split(':').next().unwrap_or(rest).trim();
@@ -291,8 +343,8 @@ pub fn outcome(cmd: &mut Command, uncaught_prefix: &str) -> (Outcome, Option<Str
     }
     (
         Outcome {
-            stdout: String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
-            status: output.status.code(),
+            stdout: String::from_utf8_lossy(&stdout).replace("\r\n", "\n"),
+            status: status.code(),
             uncaught,
         },
         stop,

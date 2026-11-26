@@ -28,7 +28,7 @@ rm -rf "$B/rt" && javac -XDstringConcat=inline -nowarn -d "$B/rt" runtime/java/j
 cp "$TOOLS/native-boot-entry.c" "$B/src/entry.c"
 cd "$B/src" && start=$(date +%s)
 ls *.c | xargs -P 12 -I{} clang --target=x86_64-w64-windows-gnu -std=c11 ${JABS_BOOT_OPT:--O1} -w -c {} -o {}.o 2>&1 | grep -m5 error
-clang --target=x86_64-w64-windows-gnu *.o -o server.exe 2>&1 | grep -m5 -E "error|undefined"
+clang --target=x86_64-w64-windows-gnu *.o -o server.exe -lws2_32 -liphlpapi 2>&1 | grep -m5 -E "error|undefined"
 echo "build: $(( $(date +%s) - start ))s, $(stat -c %s server.exe 2>/dev/null) bytes"
 mkdir -p /d/Projects/jabs/local/profiles/run/server-1.7.10 && cd /d/Projects/jabs/local/profiles/run/server-1.7.10
 # The same switches a JVM run would take: no JMX for log4j (nobody connects to it, and the

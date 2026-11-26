@@ -30,6 +30,8 @@ use std::{
 };
 
 mod management;
+mod net;
+mod nio_fs;
 mod reflect;
 mod symbols;
 
@@ -1136,7 +1138,7 @@ const IO_NATIVES: &[(&str, &str, &str, &str)] = &[
         "java/io/FileCleanable",
         "cleanupClose0",
         "(IJ)V",
-        "(void)a1; jabs_io_cleanup_close(a0);",
+        "jabs_io_cleanup_close(a0, a1);",
     ),
 ];
 
@@ -5105,6 +5107,28 @@ jabs_object *jabs_string_from_utf8(const char *text) {{
     return s;
 }}
 
+/* A String of exactly these UTF-16 code units (what JNI's NewString makes); Latin-1 when every
+ * unit fits, as the JDK compacts it. */
+jabs_object *jabs_string_from_utf16(const uint16_t *units, size_t count) {{
+    if (count > (size_t)INT32_MAX / 2) jabs_not_compiled("a UTF-16 string too long for a Java String (jabs_string_from_utf16)");
+    int latin1 = 1;
+    for (size_t i = 0; i < count; i++) if (units[i] > 0xFF) {{ latin1 = 0; break; }}
+    size_t bytes = latin1 ? count : count * 2;
+    jabs_object *value = jabs_new_array((int32_t)bytes, 1, JABS_COMPONENT_PRIMITIVE, NULL, "[B", NULL);
+    if (!value) return NULL;
+    unsigned char *data = (unsigned char *)jabs_array_data((jabs_array *)value);
+    for (size_t i = 0; i < count; i++) {{
+        if (latin1) data[i] = (unsigned char)units[i];
+        else memcpy(data + 2 * i, &units[i], 2);
+    }}
+    if ({string_init}() != 0) return NULL;
+    jabs_object *s = jabs_new(&{string_record});
+    if (!s) return NULL;
+    (({string_struct} *)s)->{value} = value;
+    (({string_struct} *)s)->{coder} = latin1 ? 0 : 1;
+    return s;
+}}
+
 /* Copy an all-ASCII Latin-1 String into `out`; 0 if it is not one or does not fit. */
 int jabs_string_to_ascii(jabs_object *s, char *out, size_t size) {{
     jabs_array *v = (jabs_array *)(({string_struct} *)s)->{value};
@@ -6388,17 +6412,24 @@ fn io_accessor_functions(unit: &Unit, recorded: &[&ClassFile]) -> String {
     } else {
         out.push_str("int32_t *jabs_descriptor_fd_slot(jabs_object *d) { (void)d; jabs_not_compiled(\"FileDescriptor without an fd field\"); }\n");
     }
-    // Windows FileDescriptors also carry a HANDLE; JABS uses the C runtime descriptor instead.
+    // Windows FileDescriptors also carry a HANDLE; JABS's java.io uses the C runtime
+    // descriptor instead, java.nio's files (CreateFile0) the HANDLE.
     if has(fd, "handle", "J") {
         let _ = writeln!(
             out,
             "void jabs_descriptor_set_handle(jabs_object *d, int64_t h) {{ {} = h; }}",
             at(fd, "d", "handle")
         );
+        let _ = writeln!(
+            out,
+            "int64_t jabs_descriptor_handle(jabs_object *d) {{ return {}; }}",
+            at(fd, "d", "handle")
+        );
     } else {
         out.push_str(
             "void jabs_descriptor_set_handle(jabs_object *d, int64_t h) { (void)d; (void)h; }\n",
         );
+        out.push_str("int64_t jabs_descriptor_handle(jabs_object *d) { (void)d; return -1; }\n");
     }
     if has(fd, "append", "Z") {
         let _ = writeln!(
@@ -7517,22 +7548,24 @@ fn reachable(
                 }
             }
         }
-        // A management native that builds an object from C (management::glue).
-        if let Some((class, descriptor)) = management::constructed_by(&key)
-            && unit.get(class).is_some()
-            && unit.chain(class).is_ok()
-        {
+        // Java methods a native calls from C: a management native that builds an object
+        // (management::glue), the net natives' InetAddresses and exceptions (net::glue).
+        let mut from_c = net::called_by(&key);
+        from_c.extend(nio_fs::called_by(&key));
+        if let Some((class, descriptor)) = management::constructed_by(&key) {
+            from_c.push((class, "<init>", descriptor));
+        }
+        for (class, name, descriptor) in from_c {
+            if unit.get(class).is_none() || unit.chain(class).is_err() {
+                continue;
+            }
             add_records(class, &mut out.records);
             pending_inits.push(class.to_string());
-            let ctor = (
-                class.to_string(),
-                "<init>".to_string(),
-                descriptor.to_string(),
-            );
-            if compiled(&ctor) {
-                work.push(ctor);
+            let callee = (class.to_string(), name.to_string(), descriptor.to_string());
+            if compiled(&callee) {
+                work.push(callee);
             }
-            if out.instantiated.insert(class.to_string()) {
+            if name == "<init>" && out.instantiated.insert(class.to_string()) {
                 work.extend(
                     implementations(class)
                         .into_iter()
@@ -7687,6 +7720,11 @@ const SYNC_C: &str = include_str!("../runtime/jabs_sync.c");
 const THREAD_C: &str = include_str!("../runtime/jabs_thread.c");
 /// java.lang.management natives' glue (handwritten, OS-neutral; needs the class registry).
 const MANAGEMENT_C: &str = include_str!("../runtime/jabs_management.c");
+/// java.net and java.nio natives' glue: resolver, sockets, selectors (handwritten, OS-specific;
+/// needs the class registry).
+const NET_C: &str = include_str!("../runtime/jabs_net.c");
+/// java.nio.file natives (handwritten, OS-specific; needs the class registry).
+const NIO_FS_C: &str = include_str!("../runtime/jabs_nio_fs.c");
 /// Reflection: member listings and reflective calls (handwritten).
 const REFLECT_C: &str = include_str!("../runtime/jabs_reflect.c");
 /// Reflection's metadata layout and entry points (handwritten; part of every program's header).
@@ -7838,6 +7876,8 @@ pub fn compile_unit_with(
                 }
                 if method.access & ACC_NATIVE != 0 {
                     let found = management::intrinsic(&unit, &key, have_classes)
+                        .or_else(|| net::intrinsic(&key, have_classes))
+                        .or_else(|| nio_fs::intrinsic(&key, have_classes))
                         .or_else(|| intrinsic(&key, have_classes));
                     let Some(body) = found else {
                         return Err("native method without a JABS implementation".to_string());
@@ -8115,6 +8155,20 @@ pub fn compile_unit_with(
         &emission.records,
         &emission.inits,
     ));
+    if registry {
+        source.push_str(&net::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        source.push_str(&nio_fs::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+    }
     // Everything above the methods: shared declarations, then data and support definitions.
     let header_end = source
         .find(&format!("\n{}", "/* @@definitions@@ */"))
@@ -8219,6 +8273,8 @@ pub fn compile_unit_with(
         if registry_emitted {
             files.push(("jabs_io.c".to_string(), IO_C.to_string()));
             files.push(("jabs_management.c".to_string(), MANAGEMENT_C.to_string()));
+            files.push(("jabs_net.c".to_string(), NET_C.to_string()));
+            files.push(("jabs_nio_fs.c".to_string(), NIO_FS_C.to_string()));
         }
         for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
             files.push((
@@ -8257,6 +8313,13 @@ pub fn compile_unit_with(
             "{shared}{RUNTIME_GLOBALS}{support}{}{}",
             method_texts.concat(),
             resources_file(&extras.resources).replacen("#include \"jabs_unit.h\"\n", "", 1)
+                // First of the handwritten files: on Windows, winsock2.h must come before the
+                // first windows.h.
+                + &(if registry_emitted {
+                    NET_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                } else {
+                    String::new()
+                })
                 + &PLATFORM_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &FILES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 + &SYNC_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
@@ -8265,6 +8328,7 @@ pub fn compile_unit_with(
                 + &(if registry_emitted {
                     IO_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                         + &MANAGEMENT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
+                        + &NIO_FS_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
                 } else {
                     String::new()
                 })
