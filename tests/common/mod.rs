@@ -147,7 +147,7 @@ fn build(fixture: &'static str, main_class: &'static str) -> Option<Built> {
         return None;
     }
     // Kept for the whole test run: every test reads the classes and runs the executable.
-    let dir = tempfile::tempdir().unwrap().keep();
+    let dir = fresh_build_dir(fixture);
     let classes = dir.join("classes");
     fs::create_dir_all(&classes).unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
@@ -329,4 +329,29 @@ pub fn same_as_jvm(built: Option<&Built>, mechanism: &str, look: &str) {
         first_difference + 1,
         stop.as_deref().unwrap_or("none")
     );
+}
+
+/// The build directory for one fixture of this checkout, replaced on every run: the newest build
+/// stays for debugging, and runs do not pile up (a kept tempdir per run left about 216 MB behind
+/// each time and filled the disk). Keyed by the checkout, so worktrees never share one.
+fn fresh_build_dir(fixture: &str) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in env!("CARGO_MANIFEST_DIR").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let stem = Path::new(fixture)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture");
+    let dir = std::env::temp_dir()
+        .join("jabs-behavior")
+        .join(format!("{hash:016x}-{stem}"));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap_or_else(|e| {
+            panic!("cannot clear the previous build in {}: {e}", dir.display())
+        });
+    }
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+    dir
 }

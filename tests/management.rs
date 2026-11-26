@@ -154,7 +154,7 @@ fn build() -> Option<Built> {
         eprintln!("skipping management tests; missing {missing:?}");
         return None;
     }
-    let dir = tempfile::tempdir().unwrap().keep();
+    let dir = fresh_build_dir("tests/fixtures/Management.java");
     let classes = dir.join("classes");
     fs::create_dir_all(&classes).unwrap();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Management.java");
@@ -500,4 +500,29 @@ fn support_flags_are_jabs_decisions() {
         "initOptionalSupportFields (SUPPORT_FLAGS, support_fields_body) in {NATIVES}\n\
          native run: {native:#?}"
     );
+}
+
+/// The build directory for one fixture of this checkout, replaced on every run: the newest build
+/// stays for debugging, and runs do not pile up (a kept tempdir per run left about 216 MB behind
+/// each time and filled the disk). Keyed by the checkout, so worktrees never share one.
+fn fresh_build_dir(fixture: &str) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in env!("CARGO_MANIFEST_DIR").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let stem = Path::new(fixture)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture");
+    let dir = std::env::temp_dir()
+        .join("jabs-behavior")
+        .join(format!("{hash:016x}-{stem}"));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap_or_else(|e| {
+            panic!("cannot clear the previous build in {}: {e}", dir.display())
+        });
+    }
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+    dir
 }
