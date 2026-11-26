@@ -581,6 +581,16 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "return jabs_find_bootstrap_class(a0);",
         needs_classes: true,
     },
+    // java.security's provider list asks the builtin app loader for providers outside java.base.
+    Intrinsic {
+        key: (
+            "java/lang/ClassLoader",
+            "findLoadedClass0",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+        ),
+        body: "return jabs_find_loaded_class(self, a0);",
+        needs_classes: true,
+    },
     // jabs.rt.Natives: the app class loader's view of compiled-in classes and embedded resources.
     Intrinsic {
         key: (
@@ -5421,6 +5431,9 @@ jabs_object *jabs_app_loader(void) {{
     return loader;
 }}
 
+/* The app class loader if it exists yet, without creating it. */
+static jabs_object *jabs_app_loader_created(void) {{ return atomic_load_explicit(&jabs_app_loader_object, memory_order_acquire); }}
+
 /* Class.getClassLoader: the app loader for classes from the inputs, null (boot) for the rest.
  * The caller holds JABS_LOCK_CLASSES. */
 static void jabs_set_defining_loader(jabs_object *c, const char *name) {{
@@ -5436,6 +5449,7 @@ static void jabs_set_defining_loader(jabs_object *c, const char *name) {{
         out.push_str(
             "/* No jabs.rt.AppLoader in the unit: every class belongs to the boot loader. */\n\
 jabs_object *jabs_app_loader(void) { return NULL; }\n\
+static jabs_object *jabs_app_loader_created(void) { return NULL; }\n\
 static void jabs_set_defining_loader(jabs_object *c, const char *name) { (void)c; (void)name; }\n",
         );
     }
@@ -5448,6 +5462,20 @@ jabs_object *jabs_class_for_binary_name(jabs_object *binary) {
     if (!jabs_string_to_ascii(binary, name, sizeof name)) return NULL;
     for (char *p = name; *p; p++) if (*p == '.') *p = '/';
     if (name[0] != '[' && !jabs_record_named(name)) return NULL;
+    return jabs_class_object(name);
+}
+
+/* ClassLoader.findLoadedClass0: the class this loader defined, or null. In a JABS program the app
+ * class loader (jabs.rt.AppLoader) defined the input classes and the boot loader the rest; the
+ * JDK's own loaders (the builtin app and platform loaders, which code reaches while the VM is
+ * not booted) defined none, so they go on to their parents and the boot loader, as on the JVM. */
+jabs_object *jabs_find_loaded_class(jabs_object *loader, jabs_object *binary) {
+    char name[1024];
+    if (!loader || !binary) return NULL;
+    if (loader != jabs_app_loader_created()) return NULL;
+    if (!jabs_string_to_ascii(binary, name, sizeof name)) return NULL;
+    for (char *p = name; *p; p++) if (*p == '.') *p = '/';
+    if (name[0] == '[' || !jabs_is_app_class(name) || !jabs_record_named(name)) return NULL;
     return jabs_class_object(name);
 }
 
