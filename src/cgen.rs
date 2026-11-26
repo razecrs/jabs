@@ -31,6 +31,7 @@ use std::{
 
 mod management;
 mod reflect;
+mod symbols;
 
 pub const RUNTIME_PRELUDE: &str = include_str!("../runtime/jabs_rt.h");
 const OBJECT: &str = "java/lang/Object";
@@ -7971,6 +7972,41 @@ pub fn compile_unit_with(
             )
         })
         .count();
+    let c_files = {
+        let header = format!(
+            "{shared}\n/* Definitions elsewhere in this program. */\n{}",
+            declarations_for(&support)
+        );
+        let mut files = vec![
+            ("jabs_unit.h".to_string(), header),
+            (
+                "unit_0.c".to_string(),
+                format!("#include \"jabs_unit.h\"\n{RUNTIME_GLOBALS}{support}"),
+            ),
+        ];
+        files.push(("resources.c".to_string(), resources_file(&extras.resources)));
+        files.push(("jabs_platform.c".to_string(), PLATFORM_C.to_string()));
+        files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
+        files.push(("jabs_sync.c".to_string(), SYNC_C.to_string()));
+        files.push(("jabs_thread.c".to_string(), THREAD_C.to_string()));
+        files.push(("jabs_reflect.c".to_string(), REFLECT_C.to_string()));
+        if registry_emitted {
+            files.push(("jabs_io.c".to_string(), IO_C.to_string()));
+            files.push(("jabs_management.c".to_string(), MANAGEMENT_C.to_string()));
+        }
+        for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
+            files.push((
+                format!("unit_{}.c", i + 1),
+                format!("#include \"jabs_unit.h\"\n{chunk}"),
+            ));
+        }
+        files
+    };
+    // Every symbol the C refers to must be defined: a miss is an emitter bug, which would
+    // otherwise show up only as a C compiler or linker error far from its cause.
+    if let Err(problem) = symbols::check(&c_files) {
+        panic!("jabs: {problem}");
+    }
     CompiledUnit {
         schema_version: 1,
         lambda_sites: indy.lambdas,
@@ -8006,35 +8042,6 @@ pub fn compile_unit_with(
                     String::new()
                 })
         ),
-        c_files: {
-            let header = format!(
-                "{shared}\n/* Definitions elsewhere in this program. */\n{}",
-                declarations_for(&support)
-            );
-            let mut files = vec![
-                ("jabs_unit.h".to_string(), header),
-                (
-                    "unit_0.c".to_string(),
-                    format!("#include \"jabs_unit.h\"\n{RUNTIME_GLOBALS}{support}"),
-                ),
-            ];
-            files.push(("resources.c".to_string(), resources_file(&extras.resources)));
-            files.push(("jabs_platform.c".to_string(), PLATFORM_C.to_string()));
-            files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
-            files.push(("jabs_sync.c".to_string(), SYNC_C.to_string()));
-            files.push(("jabs_thread.c".to_string(), THREAD_C.to_string()));
-            files.push(("jabs_reflect.c".to_string(), REFLECT_C.to_string()));
-            if registry_emitted {
-                files.push(("jabs_io.c".to_string(), IO_C.to_string()));
-                files.push(("jabs_management.c".to_string(), MANAGEMENT_C.to_string()));
-            }
-            for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
-                files.push((
-                    format!("unit_{}.c", i + 1),
-                    format!("#include \"jabs_unit.h\"\n{chunk}"),
-                ));
-            }
-            files
-        },
+        c_files,
     }
 }
