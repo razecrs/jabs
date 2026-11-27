@@ -75,6 +75,51 @@ static void jabs_modules_build(void) {
     }
 }
 
+static void jabs_modules_ensure_ready(const char *what) {
+    if (jabs_class_initialized(&jabs_modules_gate)) return;
+    switch (jabs_class_init_begin(&jabs_modules_gate)) {
+    case JABS_INIT_RUN: {
+        /* Building must not see a caller's pending exception as its own failure. */
+        jabs_object *pending = jabs_pending;
+        jabs_pending = NULL;
+        jabs_modules_build();
+        jabs_pending = pending;
+        jabs_modules_ready = true;
+        jabs_runtime_once_end(&jabs_modules_gate, true);
+        break;
+    }
+    case JABS_INIT_DONE:
+        /* Done, or this thread is building them and the JDK code it runs asked for a
+         * module: there is no answer yet that the JVM would give, so stop. */
+        if (!jabs_modules_ready) jabs_modules_stop("querying modules while they are being built", what);
+        break;
+    default:
+        jabs_modules_stop("waiting for another thread to build the modules", what);
+    }
+}
+
+const char *jabs_module_name_of_package(const char *package) {
+    if (!package || jabs_module_package_count <= 0) return NULL;
+    const jabs_module_package *found = (const jabs_module_package *)bsearch(
+        package, jabs_module_packages, (size_t)jabs_module_package_count, sizeof *jabs_module_packages, compare_package);
+    if (!found) return NULL;
+    if (found->module < 0 || found->module >= jabs_module_def_count || found->module >= JABS_MAX_MODULES) {
+        jabs_modules_stop("looking up a package", package);
+    }
+    return jabs_module_defs[found->module].name;
+}
+
+jabs_object *jabs_module_named(const char *name) {
+    if (!name || jabs_module_def_count <= 0) return NULL;
+    for (int32_t i = 0; i < jabs_module_def_count; i++) {
+        if (strcmp(jabs_module_defs[i].name, name) == 0) {
+            jabs_modules_ensure_ready(name);
+            return jabs_module_objects[i];
+        }
+    }
+    return NULL;
+}
+
 jabs_object *jabs_module_of_class(const char *name) {
     if (!name || jabs_module_package_count <= 0) return NULL;
     const char *slash = strrchr(name, '/');
@@ -88,39 +133,11 @@ jabs_object *jabs_module_of_class(const char *name) {
     package[length] = 0;
     const jabs_module_package *found = (const jabs_module_package *)bsearch(
         package, jabs_module_packages, (size_t)jabs_module_package_count, sizeof *jabs_module_packages, compare_package);
-    if (!found) {
-        free(heap_pkg);
-        return NULL;
-    }
+    free(heap_pkg);
+    if (!found) return NULL;
     if (found->module < 0 || found->module >= jabs_module_def_count || found->module >= JABS_MAX_MODULES) {
-        free(heap_pkg);
         jabs_modules_stop("looking up a package", name);
     }
-    if (!jabs_class_initialized(&jabs_modules_gate)) {
-        switch (jabs_class_init_begin(&jabs_modules_gate)) {
-        case JABS_INIT_RUN: {
-            /* Building must not see a caller's pending exception as its own failure. */
-            jabs_object *pending = jabs_pending;
-            jabs_pending = NULL;
-            jabs_modules_build();
-            jabs_pending = pending;
-            jabs_modules_ready = true;
-            jabs_runtime_once_end(&jabs_modules_gate, true);
-            break;
-        }
-        case JABS_INIT_DONE:
-            /* Done, or this thread is building them and the JDK code it runs asked for a
-             * module: there is no answer yet that the JVM would give, so stop. */
-            if (!jabs_modules_ready) {
-                free(heap_pkg);
-                jabs_modules_stop("Class.getModule while the modules are being built", name);
-            }
-            break;
-        default:
-            free(heap_pkg);
-            jabs_modules_stop("waiting for another thread to build the modules", name);
-        }
-    }
-    free(heap_pkg);
+    jabs_modules_ensure_ready(name);
     return jabs_module_objects[found->module];
 }

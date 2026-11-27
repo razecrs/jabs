@@ -30,6 +30,10 @@ extern const int32_t jabs_module_package_count;
  * pending when its package is in no present module (input classes, the default package, a
  * program without module data), NULL with an exception pending only on out of memory. */
 jabs_object *jabs_module_of_class(const char *name);
+/* The name of the present module owning `package` (internal form, "java/lang"), or NULL. */
+const char *jabs_module_name_of_package(const char *package);
+/* The Module object for a present module `name` ("java.base"), built on first use, or NULL. */
+jabs_object *jabs_module_named(const char *name);
 
 /* The JDK's own module code, called from C (generated: modules::glue in src/cgen/modules.rs).
  * Each returns NULL / -1 with an exception pending on failure. */

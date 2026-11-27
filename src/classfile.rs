@@ -126,6 +126,8 @@ pub struct ClassReflection {
     pub enclosing_method: Option<(String, Option<(String, String)>)>,
     /// NestHost; None means the class is its own nest host.
     pub nest_host: Option<String>,
+    /// PermittedSubclasses (JVMS 4.7.31); None means the class is not sealed.
+    pub permitted_subclasses: Option<Vec<String>>,
     /// Whether the class has a Record attribute (HotSpot's `is_record`).
     pub is_record: bool,
     /// A module-info class's Module, ModulePackages and ModuleResolution attributes.
@@ -554,15 +556,15 @@ fn single_index(attribute: &str, data: &[u8]) -> Result<u16> {
     Ok(u16::from_be_bytes([data[0], data[1]]))
 }
 
-/// Exceptions attribute (JVMS 4.7.5): the declared exception classes, in order.
-fn parse_exceptions(data: &[u8], pool: &[Constant]) -> Result<Vec<String>> {
+/// Exceptions (JVMS 4.7.5) or PermittedSubclasses (JVMS 4.7.31): u2 count followed by u2 class indices.
+fn parse_class_list(attribute: &str, data: &[u8], pool: &[Constant]) -> Result<Vec<String>> {
     let mut c = Cursor::new(data);
     let mut out = Vec::new();
     for _ in 0..c.u16()? {
         out.push(class_name(pool, c.u16()?)?.to_owned());
     }
     if c.remaining() != 0 {
-        bail!("Exceptions attribute has trailing bytes");
+        bail!("{attribute} attribute has trailing bytes");
     }
     Ok(out)
 }
@@ -799,7 +801,7 @@ impl ClassFile {
                             reflect.signature =
                                 Some(utf8(&pool, single_index(attr, data)?)?.to_owned());
                         }
-                        "Exceptions" => reflect.exceptions = parse_exceptions(data, &pool)?,
+                        "Exceptions" => reflect.exceptions = parse_class_list(attr, data, &pool)?,
                         _ => {}
                     }
                     Ok(())
@@ -837,6 +839,12 @@ impl ClassFile {
                 "NestHost" => {
                     reflect.nest_host =
                         Some(class_name(&pool, single_index(attr, data)?)?.to_owned());
+                }
+                "PermittedSubclasses" if major >= 61 => {
+                    if reflect.permitted_subclasses.is_some() {
+                        bail!("duplicate PermittedSubclasses attribute");
+                    }
+                    reflect.permitted_subclasses = Some(parse_class_list(attr, data, &pool)?);
                 }
                 "Record" => reflect.is_record = true,
                 "Module" | "ModulePackages" | "ModuleResolution" | "ModuleMainClass"
@@ -888,6 +896,11 @@ impl ClassFile {
             bail!("{} trailing bytes after class file", c.remaining());
         }
         let name = class_name(&pool, this_class)?.to_owned();
+        if (access & ACC_FINAL != 0 || access & ACC_MODULE != 0)
+            && reflect.permitted_subclasses.is_some()
+        {
+            bail!("PermittedSubclasses attribute not allowed on final or module class");
+        }
         if access & ACC_MODULE != 0 {
             if major < 53 {
                 bail!("ACC_MODULE requires class file version >= 53 (got {major})");

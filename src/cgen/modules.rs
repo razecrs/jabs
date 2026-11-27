@@ -37,11 +37,15 @@ use super::*;
 use crate::jdk::JdkModule;
 
 const MODULE: &str = "java/lang/Module";
+const MODULES: &str = "jdk/internal/module/Modules";
+const OPTIONAL: &str = "java/util/Optional";
 const MODULE_DESCRIPTOR: &str = "java/lang/module/ModuleDescriptor";
 const BYTE_ARRAY_INPUT_STREAM: &str = "java/io/ByteArrayInputStream";
 const HASH_MAP: &str = "java/util/HashMap";
 const HASH_SET: &str = "java/util/HashSet";
 const ARRAY_LIST: &str = "java/util/ArrayList";
+const FIND_LOADED_MODULE_DESC: &str = "(Ljava/lang/String;)Ljava/util/Optional;";
+const OF_NULLABLE_DESC: &str = "(Ljava/lang/Object;)Ljava/util/Optional;";
 
 const READ: (&str, &str) = (
     "read",
@@ -84,11 +88,27 @@ pub(super) fn called_by(
     key: &MethodKey,
     has_modules: bool,
 ) -> Vec<(&'static str, &'static str, &'static str)> {
+    if key.0 == MODULES && key.1 == "findLoadedModule" && key.2 == FIND_LOADED_MODULE_DESC {
+        let mut deps = vec![(OPTIONAL, "ofNullable", OF_NULLABLE_DESC)];
+        if has_modules {
+            deps.extend_from_slice(&JAVA_CALLS);
+        }
+        return deps;
+    }
     let get_module = key.0 == CLASS && key.1 == "getModule" && key.2 == "()Ljava/lang/Module;";
     if !get_module || !has_modules {
         return Vec::new();
     }
     JAVA_CALLS.to_vec()
+}
+
+/// Java methods replaced for module queries: `Modules.findLoadedModule` queries the modules
+/// built by `runtime/jabs_modules.c` (since `ModuleLayer.boot()` is not populated).
+pub(super) fn replacement(key: &MethodKey, classes_available: bool) -> Option<(String, bool)> {
+    if key.0 == MODULES && key.1 == "findLoadedModule" && key.2 == FIND_LOADED_MODULE_DESC {
+        return classes_available.then(|| ("return jabs_modules_find_loaded(a0);".into(), true));
+    }
+    None
 }
 
 /// Module's natives that tell HotSpot's own module table what the Java side decided. JABS keeps
@@ -546,6 +566,26 @@ pub(super) fn glue(
             signature,
             "Module.initExports, initExportsAndOpens, HashMap or ArrayList",
         ));
+    }
+
+    let find_sig = "jabs_object *jabs_modules_find_loaded(jabs_object *name_obj)";
+    if has(OPTIONAL, "ofNullable", OF_NULLABLE_DESC) && inits.contains(OPTIONAL) {
+        let _ = writeln!(
+            out,
+            "{find_sig} {{\n\
+             \x20   if (!name_obj) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}\n\
+             \x20   if ({opt_init}() != 0) return NULL;\n\
+             \x20   char *utf = jabs_string_to_utf8(name_obj);\n\
+             \x20   if (!utf) {{ if (!jabs_pending) jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}\n\
+             \x20   jabs_object *mod = jabs_module_named(utf);\n\
+             \x20   free(utf);\n\
+             \x20   return {of_nullable}(mod);\n\
+             }}",
+            opt_init = init_symbol(OPTIONAL),
+            of_nullable = symbol(OPTIONAL, "ofNullable", OF_NULLABLE_DESC),
+        );
+    } else {
+        out.push_str(&missing(find_sig, "Optional.ofNullable"));
     }
     out
 }

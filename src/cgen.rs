@@ -29,7 +29,9 @@ use std::{
     rc::Rc,
 };
 
+mod boot_extras;
 mod management;
+mod method_handles;
 mod modules;
 mod net;
 mod nio_fs;
@@ -731,12 +733,33 @@ const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
 ];
 
 /// The C body replacing a Java method, if JABS replaces it.
-fn replacement(key: &MethodKey) -> Option<(String, bool)> {
+fn replacement(key: &MethodKey, classes_available: bool) -> Option<(String, bool)> {
     if let Some(found) = reflect::replacement(key) {
         return Some(found);
     }
     if let Some(found) = management::replacement(key) {
         return Some(found);
+    }
+    if let Some(found) = method_handles::replacement(key) {
+        return Some(found);
+    }
+    if let Some(found) = modules::replacement(key, classes_available) {
+        return Some(found);
+    }
+    // Without initPhase2, ModuleLayer.boot() is null, so HashedModules.<clinit> would throw NPE on
+    // stack trace formatting (StackTraceElement.toString).
+    if key.0 == "java/lang/StackTraceElement$HashedModules"
+        && key.1 == "hashedModules"
+        && key.2 == "()Ljava/util/Set;"
+    {
+        return Some((
+            format!(
+                "if ({init}() != 0) return NULL;\n    return {empty}();",
+                init = init_symbol("java/util/Collections"),
+                empty = symbol("java/util/Collections", "emptySet", "()Ljava/util/Set;")
+            ),
+            false,
+        ));
     }
     // JDK 25 walks the stack with StackWalker (a lambda); JABS walks native frames instead.
     if key.0 == "java/lang/SecurityManager"
@@ -2520,6 +2543,46 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             true,
             None,
         )),
+        Op::InvokeSpecial(m) if outside(&m.class) => {
+            if m.name == "<init>" {
+                let s = parse_signature(&m.descriptor)?;
+                for p in s.params.iter().rev() {
+                    frame.pop_ty(cx, p, pc)?;
+                }
+                let parent = cx.class.super_name.as_deref().unwrap_or(OBJECT);
+                match frame.pop(pc)? {
+                    v @ VType::Uninit(at) if news.get(&at) == Some(&m.class) => {
+                        frame.initialize(v, VType::Obj(unit.intern(&m.class)));
+                    }
+                    VType::UninitThis
+                        if cx.is_constructor && (m.class == *this || m.class == parent) =>
+                    {
+                        frame.initialize(VType::UninitThis, VType::Obj(unit.intern(this)));
+                    }
+                    other => bail!(
+                        "pc {pc}: constructor of {} called on {}",
+                        m.class,
+                        cx.describe(other)
+                    ),
+                }
+                out.resolved = Some(if unit.absent(&m.class) {
+                    Resolved::Absent(m.class.clone())
+                } else {
+                    Resolved::Unresolved(format!(
+                        "{}.{}{}: {} is not in the compilation unit",
+                        m.class, m.name, m.descriptor, m.class
+                    ))
+                });
+                return Ok(out);
+            }
+            Some((
+                m.class.clone(),
+                m.name.clone(),
+                m.descriptor.clone(),
+                true,
+                None,
+            ))
+        }
         Op::GetStatic {
             class,
             name,
@@ -2798,6 +2861,11 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
         }
         Op::New { class } => {
             let Some(target) = unit.get(class) else {
+                if unit.absent(class) {
+                    frame.stack.push(VType::Uninit(pc));
+                    out.resolved = Some(Resolved::Absent(class.clone()));
+                    return Ok(out);
+                }
                 bail!("pc {pc}: new {class}: class is not in the compilation unit");
             };
             if target.access & (ACC_ABSTRACT | ACC_INTERFACE) != 0 {
@@ -5864,11 +5932,39 @@ static int jabs_put_utf8(jabs_object *array, int32_t index, const char *value) {
         }
         let _ = writeln!(
             out,
-            "    {}();
-    return jabs_pending ? -1 : 0;
-}}",
-            symbol(SYSTEM, "initPhase1", "()V")
+            "    {init}();",
+            init = symbol(SYSTEM, "initPhase1", "()V")
         );
+        out.push_str("    if (jabs_pending) return -1;\n");
+        if inits.contains(APP_LOADER)
+            && inits.contains("java/lang/ClassLoader")
+            && unit.get("java/lang/ClassLoader").is_some_and(|c| {
+                c.fields
+                    .iter()
+                    .any(|f| f.name == "scl" && f.access & ACC_STATIC != 0)
+            })
+        {
+            let _ = writeln!(
+                out,
+                "    if ({cl_init}() != 0) return -1;\n\
+                 \x20   {{ jabs_object *scl = jabs_app_loader(); if (jabs_pending) return -1; if (scl) {scl_sym} = scl; }}",
+                cl_init = init_symbol("java/lang/ClassLoader"),
+                scl_sym = field_symbol("java/lang/ClassLoader", "scl"),
+            );
+            let vm_init_level = (
+                "jdk/internal/misc/VM".to_string(),
+                "initLevel".to_string(),
+                "(I)V".to_string(),
+            );
+            if methods.contains(&vm_init_level) {
+                let _ = writeln!(
+                    out,
+                    "    {}(4);",
+                    symbol("jdk/internal/misc/VM", "initLevel", "(I)V")
+                );
+            }
+        }
+        out.push_str("    return jabs_pending ? -1 : 0;\n}\n");
     } else {
         out.push_str(
             "int jabs_vm_startup(void) { jabs_on_not_compiled = jabs_print_java_stack; return 0; }\n",
@@ -7543,6 +7639,15 @@ fn reachable(
                 pending_inits.push(SYSTEM.to_string());
                 pending_inits.extend(VM_PREINITIALIZED.iter().map(|c| c.to_string()));
                 pending_inits.push(BOOT_LOADER.to_string());
+                pending_inits.push("java/lang/ClassLoader".to_string());
+                let vm_level = (
+                    "jdk/internal/misc/VM".to_string(),
+                    "initLevel".to_string(),
+                    "(I)V".to_string(),
+                );
+                if compiled(&vm_level) {
+                    work.push(vm_level);
+                }
             }
         };
     if startup || roots.contains(APP_LOADER) {
@@ -7707,7 +7812,9 @@ fn reachable(
                 &compiled,
                 reach_inputs,
             );
-            let stack_records = stack::reach(unit, &out.records, &out.methods);
+            let mut stack_records = stack::reach(unit, &out.records, &out.methods);
+            stack_records.extend(boot_extras::reach(unit, &out.records, &out.methods));
+            stack_records.extend(method_handles::reach(unit, &out.records, &out.methods));
             let mut progressed = !reached.is_empty() || !stack_records.is_empty();
             for class in &stack_records {
                 add_records(class, &mut out.records);
@@ -7757,6 +7864,19 @@ fn reachable(
         };
         if !out.methods.insert(key.clone()) {
             continue;
+        }
+        if key.0 == "java/lang/StackTraceElement$HashedModules"
+            && key.1 == "hashedModules"
+            && key.2 == "()Ljava/util/Set;"
+        {
+            let empty_set = (
+                "java/util/Collections".to_string(),
+                "emptySet".to_string(),
+                "()Ljava/util/Set;".to_string(),
+            );
+            if compiled(&empty_set) {
+                work.push(empty_set);
+            }
         }
         if key.0 == CLASS && key.1 == "getModule" && key.2 == "()Ljava/lang/Module;" {
             enqueue_startup(&mut work, &mut pending_inits, &mut startup_enqueued);
@@ -7812,7 +7932,9 @@ fn reachable(
         from_c.extend(nio_fs::called_by(&key));
         from_c.extend(modules::called_by(&key, !extras.jdk_modules.is_empty()));
         from_c.extend(stack::called_by(&key));
+        from_c.extend(method_handles::called_by(&key));
         from_c.extend(unsafe_rt::called_by(&key));
+        from_c.extend(boot_extras::called_by(&key));
         from_c.extend(zip::called_by(&key));
         if let Some((class, descriptor)) = management::constructed_by(&key) {
             from_c.push((class, "<init>", descriptor));
@@ -7899,13 +8021,18 @@ fn reachable(
             unsafe_alloc_reached = true;
         }
         for insn in &analyzed.insns {
+            if caller_sensitive(unit, &insn.op) && unit.get(&key.0).is_some() {
+                add_records(&key.0, &mut out.records);
+            }
             match &insn.op {
                 Op::New { class } => {
-                    add_records(class, &mut out.records);
-                    if out.instantiated.insert(class.clone()) {
-                        work.extend(implementations(class).into_iter().filter(|k| {
-                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
-                        }));
+                    if unit.get(class).is_some() {
+                        add_records(class, &mut out.records);
+                        if out.instantiated.insert(class.clone()) {
+                            work.extend(implementations(class).into_iter().filter(|k| {
+                                compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
+                            }));
+                        }
                     }
                 }
                 // A class literal is what reflection works on (isAssignableFrom, isInstance,
@@ -8180,7 +8307,7 @@ pub fn compile_unit_with(
                 }
 
                 let sig = parse_signature(&method.descriptor).map_err(|e| e.to_string())?;
-                if let Some(body) = replacement(&key) {
+                if let Some(body) = replacement(&key, have_classes) {
                     intrinsics.insert(key.clone(), body);
                     return Ok((sig, Analyzed::empty()));
                 }
@@ -8190,8 +8317,10 @@ pub fn compile_unit_with(
                         .or_else(|| nio_fs::intrinsic(&key, have_classes))
                         .or_else(|| modules::intrinsic(&key))
                         .or_else(|| stack::intrinsic(&key, have_classes))
+                        .or_else(|| method_handles::intrinsic(&key, have_classes))
                         .or_else(|| unsafe_rt::intrinsic(&key, have_classes))
                         .or_else(|| zip::intrinsic(&key, have_classes))
+                        .or_else(|| boot_extras::intrinsic(&key, have_classes))
                         .or_else(|| intrinsic(&key, have_classes));
                     let Some(body) = found else {
                         return Err("native method without a JABS implementation".to_string());
@@ -8472,6 +8601,13 @@ pub fn compile_unit_with(
         &emission.records,
         &emission.inits,
     ));
+    source.push_str(&boot_extras::glue(
+        &unit,
+        &emission.methods,
+        &emission.records,
+        &emission.inits,
+        registry,
+    ));
     if registry {
         source.push_str(&modules::tables(&extras.jdk_modules, classes, &app_classes));
         source.push_str(&modules::glue(
@@ -8493,6 +8629,12 @@ pub fn compile_unit_with(
             &emission.inits,
         ));
         source.push_str(&stack::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        source.push_str(&method_handles::glue(
             &unit,
             &emission.methods,
             &emission.records,
