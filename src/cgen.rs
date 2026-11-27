@@ -5695,9 +5695,38 @@ static jabs_class_entry *jabs_class_entry_named_locked(const char *name) {{
     return jabs_class_entry_named(name);
 }}
 
-/* Record for an internal class name, if the unit compiled one. */
+/* Record for an internal class name, if the unit compiled one. Throwable.fillInStackTrace asks
+ * once per frame, and the 1.7.10 server throws in its tick (UUID.fromString on a tamed animal's
+ * owner name), so this is a hash lookup: the table over jabs_records is built on first use and
+ * published with one compare-and-swap (a thread that loses the race frees its copy). */
+typedef struct {{ size_t mask; const jabs_class *slots[]; }} jabs_record_index;
+
 static const jabs_class *jabs_record_named(const char *name) {{
-    for (const jabs_class *const *r = jabs_records; *r; r++) if (strcmp((*r)->name, name) == 0) return *r;
+    static _Atomic(jabs_record_index *) index;
+    jabs_record_index *t = atomic_load_explicit(&index, memory_order_acquire);
+    if (!t) {{
+        size_t n = 0, size = 64;
+        while (jabs_records[n]) n++;
+        while (size < 2 * n) size *= 2;
+        jabs_record_index *built = (jabs_record_index *)calloc(1, sizeof *built + size * sizeof built->slots[0]);
+        if (built) {{
+            built->mask = size - 1;
+            for (size_t r = 0; r < n; r++) {{
+                size_t i = jabs_class_hash_name(jabs_records[r]->name) & built->mask;
+                while (built->slots[i]) i = (i + 1) & built->mask;
+                built->slots[i] = jabs_records[r];
+            }}
+            jabs_record_index *expected = NULL;
+            if (atomic_compare_exchange_strong_explicit(&index, &expected, built, memory_order_acq_rel, memory_order_acquire)) t = built;
+            else {{ free(built); t = expected; }}
+        }}
+    }}
+    if (!t) {{ /* out of memory for the table: scan */
+        for (const jabs_class *const *r = jabs_records; *r; r++) if (strcmp((*r)->name, name) == 0) return *r;
+        return NULL;
+    }}
+    for (size_t i = jabs_class_hash_name(name) & t->mask; t->slots[i]; i = (i + 1) & t->mask)
+        if (strcmp(t->slots[i]->name, name) == 0) return t->slots[i];
     return NULL;
 }}
 
