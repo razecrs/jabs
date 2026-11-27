@@ -636,7 +636,16 @@ void jabs_thread_park(int32_t is_absolute, int64_t time) {
     if (!thread) return; /* building the main Thread failed: its exception is pending */
     jabs_thread_record *self = jabs_self;
     if (!self || self->thread != thread) { fprintf(stderr, "jabs: parking thread has no record\n"); abort(); }
-    if (time < 0 || (is_absolute && time == 0)) return;
+    if (time < 0 || (is_absolute && time == 0)) {
+#ifndef _WIN32
+        /* HotSpot's POSIX Parker takes an available permit before it looks at the time, so a
+           park that does not wait still uses it up; the Windows Parker returns first. */
+        jabs_os_mutex_lock(&self->sleep_lock);
+        self->park_permit = false;
+        jabs_os_mutex_unlock(&self->sleep_lock);
+#endif
+        return;
+    }
     int64_t start = is_absolute ? 0 : jabs_nano_time();
     int32_t *status = jabs_thread_status_slot(thread);
     int32_t parked_state = (!is_absolute && time == 0) ? JABS_THREAD_WAITING : JABS_THREAD_TIMED_WAITING;

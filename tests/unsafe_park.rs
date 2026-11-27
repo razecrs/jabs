@@ -178,7 +178,8 @@ class UnsafeInternalCases {
     static void internalPark() {
         Unsafe u = Unsafe.getUnsafe();
         Thread t = Thread.currentThread();
-        // Negative relative time and zero absolute time do not consume an existing permit.
+        // Negative relative time and zero absolute time do not wait. On Windows they also leave an
+        // existing permit; on Linux HotSpot takes it first, so the last park waits its 10s there.
         u.unpark(t);
         u.park(false, -1L);
         u.park(true, 0L);
