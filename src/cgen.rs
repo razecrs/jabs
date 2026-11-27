@@ -5614,17 +5614,76 @@ static jabs_class_entry **jabs_class_entries;
 static size_t jabs_class_count, jabs_class_capacity;
 static void jabs_set_defining_loader(jabs_object *c, const char *name);
 
-/* Listed entry for a name; the caller holds JABS_LOCK_CLASSES. */
-static jabs_class_entry *jabs_class_entry_named_locked(const char *name) {{
-    for (size_t i = 0; i < jabs_class_count; i++) if (strcmp(jabs_class_entries[i]->name, name) == 0) return jabs_class_entries[i];
-    return NULL;
+/* Two open-addressing hash indexes over the entries, by name and by Class object: Object.getClass
+ * and every Class method look an entry up, so a lookup must not scan the list or take the lock
+ * (a scan under JABS_LOCK_CLASSES once took most of the 1.7.10 server's tick: its packet codec
+ * calls getClass for every packet). Writers hold JABS_LOCK_CLASSES; readers take no lock. A slot,
+ * once filled, never changes, and a grown table is fully built before it is published, so a
+ * reader sees either the old table or the new one, each consistent. Old tables are kept (never
+ * freed) because a reader may still be probing one. */
+typedef struct {{ size_t mask; _Atomic(jabs_class_entry *) slots[]; }} jabs_class_index;
+static _Atomic(jabs_class_index *) jabs_class_by_name, jabs_class_by_object;
+
+static size_t jabs_class_hash_name(const char *name) {{
+    uint64_t h = 1469598103934665603ULL; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) h = (h ^ *p) * 1099511628211ULL;
+    return (size_t)h;
 }}
 
+static size_t jabs_class_hash_object(const jabs_object *c) {{
+    uint64_t h = (uint64_t)(uintptr_t)c;
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+    return (size_t)h;
+}}
+
+static void jabs_class_index_put(jabs_class_index *t, jabs_class_entry *e, size_t hash) {{
+    for (size_t i = hash & t->mask; ; i = (i + 1) & t->mask) {{
+        if (!atomic_load_explicit(&t->slots[i], memory_order_relaxed)) {{
+            atomic_store_explicit(&t->slots[i], e, memory_order_release);
+            return;
+        }}
+    }}
+}}
+
+/* Lists `e` in both indexes, growing them at half full; the caller holds JABS_LOCK_CLASSES and has
+ * already appended `e` to jabs_class_entries. Returns 0 when out of memory. */
+static int jabs_class_index_add(jabs_class_entry *e) {{
+    jabs_class_index *byname = atomic_load_explicit(&jabs_class_by_name, memory_order_relaxed);
+    jabs_class_index *byobject = atomic_load_explicit(&jabs_class_by_object, memory_order_relaxed);
+    if (!byname || jabs_class_count * 2 > byname->mask + 1) {{
+        size_t size = byname ? (byname->mask + 1) * 2 : 1024;
+        while (jabs_class_count * 2 > size) size *= 2;
+        jabs_class_index *n1 = (jabs_class_index *)calloc(1, sizeof *n1 + size * sizeof n1->slots[0]);
+        jabs_class_index *n2 = (jabs_class_index *)calloc(1, sizeof *n2 + size * sizeof n2->slots[0]);
+        if (!n1 || !n2) {{ free(n1); free(n2); return 0; }}
+        n1->mask = n2->mask = size - 1;
+        for (size_t i = 0; i < jabs_class_count; i++) {{
+            jabs_class_index_put(n1, jabs_class_entries[i], jabs_class_hash_name(jabs_class_entries[i]->name));
+            jabs_class_index_put(n2, jabs_class_entries[i], jabs_class_hash_object(jabs_class_entries[i]->object));
+        }}
+        atomic_store_explicit(&jabs_class_by_name, n1, memory_order_release);
+        atomic_store_explicit(&jabs_class_by_object, n2, memory_order_release);
+        return 1; /* the rebuild listed every entry, `e` included */
+    }}
+    jabs_class_index_put(byname, e, jabs_class_hash_name(e->name));
+    jabs_class_index_put(byobject, e, jabs_class_hash_object(e->object));
+    return 1;
+}}
+
+/* Listed entry for a name, or NULL. Takes no lock. */
 static jabs_class_entry *jabs_class_entry_named(const char *name) {{
-    jabs_lock(JABS_LOCK_CLASSES);
-    jabs_class_entry *e = jabs_class_entry_named_locked(name);
-    jabs_unlock(JABS_LOCK_CLASSES);
-    return e;
+    jabs_class_index *t = atomic_load_explicit(&jabs_class_by_name, memory_order_acquire);
+    if (!t) return NULL;
+    for (size_t i = jabs_class_hash_name(name) & t->mask; ; i = (i + 1) & t->mask) {{
+        jabs_class_entry *e = atomic_load_explicit(&t->slots[i], memory_order_acquire);
+        if (!e) return NULL;
+        if (strcmp(e->name, name) == 0) return e;
+    }}
+}}
+
+/* The same, for a caller that holds JABS_LOCK_CLASSES (and so sees every entry listed so far). */
+static jabs_class_entry *jabs_class_entry_named_locked(const char *name) {{
+    return jabs_class_entry_named(name);
 }}
 
 /* Record for an internal class name, if the unit compiled one. */
@@ -5774,6 +5833,14 @@ jabs_object *jabs_class_object(const char *name) {{
         jabs_class_capacity = grown;
     }}
     jabs_class_entries[jabs_class_count++] = entry;
+    if (!jabs_class_index_add(entry)) {{
+        jabs_class_count--;
+        jabs_unlock(JABS_LOCK_CLASSES);
+        free(entry);
+        free(copy);
+        jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
+        return NULL;
+    }}
     jabs_set_defining_loader(c, name);
     jabs_unlock(JABS_LOCK_CLASSES);
     return c;
@@ -5781,11 +5848,13 @@ jabs_object *jabs_class_object(const char *name) {{
 
 /* Registry entry of a Class object (every Class object comes from jabs_class_object). */
 static jabs_class_entry *jabs_class_entry_of(jabs_object *c) {{
-    jabs_class_entry *found = NULL;
-    jabs_lock(JABS_LOCK_CLASSES);
-    for (size_t i = 0; i < jabs_class_count; i++) if (jabs_class_entries[i]->object == c) {{ found = jabs_class_entries[i]; break; }}
-    jabs_unlock(JABS_LOCK_CLASSES);
-    return found;
+    jabs_class_index *t = atomic_load_explicit(&jabs_class_by_object, memory_order_acquire);
+    if (!t) return NULL;
+    for (size_t i = jabs_class_hash_object(c) & t->mask; ; i = (i + 1) & t->mask) {{
+        jabs_class_entry *e = atomic_load_explicit(&t->slots[i], memory_order_acquire);
+        if (!e) return NULL;
+        if (e->object == c) return e;
+    }}
 }}
 
 /* Object.getClass. */
