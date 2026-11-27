@@ -12,6 +12,7 @@ is not artificially inflated. Requires `bench_1_7_10_server.py` arguments pointi
 """
 import argparse
 import os
+import re
 import shutil
 import socket
 import struct
@@ -88,6 +89,22 @@ def mem_mb(pid: int):
     out = subprocess.check_output(["powershell", "-NoProfile", "-Command", ps], text=True).strip()
     ws, priv = out.split(",")
     return float(ws), float(priv)
+
+
+def jvm_heap_mb(jcmd: str, pid: int):
+    """The JVM's committed and used Java heap (jcmd GC.heap_info), or None without jcmd."""
+    try:
+        out = subprocess.check_output([jcmd, str(pid), "GC.heap_info"], text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"committed (\d+)K, used (\d+)K", out) or re.search(r"total (\d+)K, used (\d+)K", out)
+    if not m:
+        return None
+    return int(m.group(1)) / 1024.0, int(m.group(2)) / 1024.0
+
+
+def heap_text(heap):
+    return "" if heap is None else f" heap_committed={heap[0]:.1f}MB heap_used={heap[1]:.1f}MB"
 
 
 def write_config(dirpath: str, port: int, seed: str):
@@ -216,11 +233,21 @@ def main():
     ap.add_argument("--duration", type=int, default=600)
     ap.add_argument("--sample-every", type=int, default=30)
     ap.add_argument("--work-root", default=None)
+    ap.add_argument("--engines", choices=["both", "jvm", "native"], default="both")
+    ap.add_argument(
+        "--jvm-opts",
+        default="",
+        help="extra JVM flags, space-separated (e.g. -Xms64m: by default the JVM starts with 1/64 of RAM committed)",
+    )
     args = ap.parse_args()
 
     work_base = tempfile.mkdtemp(prefix="jabs_fair_bench_", dir=args.work_root)
+    jcmd = os.path.join(os.path.dirname(args.java), "jcmd")
+    run_jvm = args.engines in ("both", "jvm")
+    run_nat = args.engines in ("both", "native")
     jvm_cmd = [
         args.java,
+        *args.jvm_opts.split(),
         "-Xmx2G",
         "-XX:+UseG1GC",
         "-Dlog4j2.disable.jmx=true",
@@ -241,19 +268,22 @@ def main():
         write_config(jvm_cold, 25571, args.seed)
         write_config(nat_cold, 25572, args.seed)
 
-        p_jvm, b_jvm, dl_jvm, ov_jvm = start_server(jvm_cmd, jvm_cold)
-        ws_jvm_c, priv_jvm_c = mem_mb(p_jvm.pid)
-        rc_jvm = stop_server(p_jvm)
-        print(f"JVM_COLD boot={b_jvm:.2f}s ({dl_jvm}) idle_ws={ws_jvm_c:.1f}MB idle_priv={priv_jvm_c:.1f}MB overloads={len(ov_jvm)} rc={rc_jvm}", flush=True)
+        if run_jvm:
+            p_jvm, b_jvm, dl_jvm, ov_jvm = start_server(jvm_cmd, jvm_cold)
+            ws_jvm_c, priv_jvm_c = mem_mb(p_jvm.pid)
+            heap_c = jvm_heap_mb(jcmd, p_jvm.pid)
+            rc_jvm = stop_server(p_jvm)
+            print(f"JVM_COLD boot={b_jvm:.2f}s ({dl_jvm}) idle_ws={ws_jvm_c:.1f}MB idle_priv={priv_jvm_c:.1f}MB{heap_text(heap_c)} overloads={len(ov_jvm)} rc={rc_jvm}", flush=True)
 
-        p_nat, b_nat, dl_nat, ov_nat = start_server(nat_cmd, nat_cold)
-        ws_nat_c, priv_nat_c = mem_mb(p_nat.pid)
-        rc_nat = stop_server(p_nat)
-        print(f"NAT_COLD boot={b_nat:.2f}s ({dl_nat}) idle_ws={ws_nat_c:.1f}MB idle_priv={priv_nat_c:.1f}MB overloads={len(ov_nat)} rc={rc_nat}", flush=True)
+        if run_nat:
+            p_nat, b_nat, dl_nat, ov_nat = start_server(nat_cmd, nat_cold)
+            ws_nat_c, priv_nat_c = mem_mb(p_nat.pid)
+            rc_nat = stop_server(p_nat)
+            print(f"NAT_COLD boot={b_nat:.2f}s ({dl_nat}) idle_ws={ws_nat_c:.1f}MB idle_priv={priv_nat_c:.1f}MB overloads={len(ov_nat)} rc={rc_nat}", flush=True)
 
         # 2. Warm boot on identical copied pre-generated world + 1-player sustained run.
         print(f"\n=== SCENARIO B: WARM EXISTING WORLD + {args.duration}s 1-PLAYER ===", flush=True)
-        seed_world = os.path.join(jvm_cold, "world")
+        seed_world = os.path.join(jvm_cold if run_jvm else nat_cold, "world")
         jvm_warm = os.path.join(work_base, "jvm_warm")
         nat_warm = os.path.join(work_base, "nat_warm")
         os.makedirs(jvm_warm)
@@ -263,33 +293,38 @@ def main():
         shutil.copytree(seed_world, os.path.join(jvm_warm, "world"))
         shutil.copytree(seed_world, os.path.join(nat_warm, "world"))
 
-        print("[JVM Warm + 1p]", flush=True)
-        p_jw, b_jw, dl_jw, ov_jw = start_server(jvm_cmd, jvm_warm)
-        ws_jw_i, priv_jw_i = mem_mb(p_jw.pid)
-        time.sleep(2)
-        ws_jw_i2, priv_jw_i2 = mem_mb(p_jw.pid)
-        res_jw = run_player_session(p_jw.pid, 25573, args.duration, args.sample_every)
-        rc_jw = stop_server(p_jw)
-        print(
-            f"JVM_WARM boot={b_jw:.2f}s ({dl_jw}) idle_ws={ws_jw_i2:.1f}MB idle_priv={priv_jw_i2:.1f}MB "
-            f"end_ws={res_jw['end_ws']:.1f}MB end_priv={res_jw['end_priv']:.1f}MB "
-            f"bulk={res_jw['bulk_ok']} fail={res_jw['zlib_fail']} overloads={len(ov_jw)} rc={rc_jw}",
-            flush=True,
-        )
+        if run_jvm:
+            print("[JVM Warm + 1p]", flush=True)
+            p_jw, b_jw, dl_jw, ov_jw = start_server(jvm_cmd, jvm_warm)
+            ws_jw_i, priv_jw_i = mem_mb(p_jw.pid)
+            time.sleep(2)
+            ws_jw_i2, priv_jw_i2 = mem_mb(p_jw.pid)
+            heap_i = jvm_heap_mb(jcmd, p_jw.pid)
+            res_jw = run_player_session(p_jw.pid, 25573, args.duration, args.sample_every)
+            heap_e = jvm_heap_mb(jcmd, p_jw.pid)
+            rc_jw = stop_server(p_jw)
+            print(
+                f"JVM_WARM boot={b_jw:.2f}s ({dl_jw}) idle_ws={ws_jw_i2:.1f}MB idle_priv={priv_jw_i2:.1f}MB "
+                f"end_ws={res_jw['end_ws']:.1f}MB end_priv={res_jw['end_priv']:.1f}MB "
+                f"idle{heap_text(heap_i)} end{heap_text(heap_e)} "
+                f"bulk={res_jw['bulk_ok']} fail={res_jw['zlib_fail']} overloads={len(ov_jw)} rc={rc_jw}",
+                flush=True,
+            )
 
-        print("[Native Warm + 1p]", flush=True)
-        p_nw, b_nw, dl_nw, ov_nw = start_server(nat_cmd, nat_warm)
-        ws_nw_i, priv_nw_i = mem_mb(p_nw.pid)
-        time.sleep(2)
-        ws_nw_i2, priv_nw_i2 = mem_mb(p_nw.pid)
-        res_nw = run_player_session(p_nw.pid, 25574, args.duration, args.sample_every)
-        rc_nw = stop_server(p_nw)
-        print(
-            f"NAT_WARM boot={b_nw:.2f}s ({dl_nw}) idle_ws={ws_nw_i2:.1f}MB idle_priv={priv_nw_i2:.1f}MB "
-            f"end_ws={res_nw['end_ws']:.1f}MB end_priv={res_nw['end_priv']:.1f}MB "
-            f"bulk={res_nw['bulk_ok']} fail={res_nw['zlib_fail']} overloads={len(ov_nw)} rc={rc_nw}",
-            flush=True,
-        )
+        if run_nat:
+            print("[Native Warm + 1p]", flush=True)
+            p_nw, b_nw, dl_nw, ov_nw = start_server(nat_cmd, nat_warm)
+            ws_nw_i, priv_nw_i = mem_mb(p_nw.pid)
+            time.sleep(2)
+            ws_nw_i2, priv_nw_i2 = mem_mb(p_nw.pid)
+            res_nw = run_player_session(p_nw.pid, 25574, args.duration, args.sample_every)
+            rc_nw = stop_server(p_nw)
+            print(
+                f"NAT_WARM boot={b_nw:.2f}s ({dl_nw}) idle_ws={ws_nw_i2:.1f}MB idle_priv={priv_nw_i2:.1f}MB "
+                f"end_ws={res_nw['end_ws']:.1f}MB end_priv={res_nw['end_priv']:.1f}MB "
+                f"bulk={res_nw['bulk_ok']} fail={res_nw['zlib_fail']} overloads={len(ov_nw)} rc={rc_nw}",
+                flush=True,
+            )
     finally:
         shutil.rmtree(work_base, ignore_errors=True)
 
