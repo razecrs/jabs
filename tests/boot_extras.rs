@@ -292,6 +292,9 @@ fn build_modules_fixture() -> Option<Built> {
             "java.base/jdk.internal.loader=ALL-UNNAMED",
             "--add-exports",
             "java.base/jdk.internal.module=ALL-UNNAMED",
+            // jabs.rt.AppLoader builds the class path's jar: URLs with sun.net.www.ParseUtil.
+            "--add-exports",
+            "java.base/sun.net.www=ALL-UNNAMED",
             "-XDstringConcat=inline",
             "-nowarn",
             "-d",

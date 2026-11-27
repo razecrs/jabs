@@ -696,8 +696,6 @@ void jabs_nio_close_handle(int64_t handle);
 /* CloseHandle for FileDescriptor.close: 0 when it failed (the caller raises). */
 int32_t jabs_nio_close_descriptor_handle(int64_t handle);
 /* FileDispatcherImpl.size0 / seek0 (Windows) and UnixFileDispatcherImpl.size0 / seek0. */
-/* Perf.createLong: a direct ByteBuffer over a new native counter (src/cgen/nio_fs.rs glue). */
-jabs_object *jabs_perf_create_long(jabs_object *name, int64_t value);
 int64_t jabs_nio_file_size(jabs_object *fdo);
 int64_t jabs_nio_file_seek(jabs_object *fdo, int64_t offset);
 int64_t jabs_nio_unix_size(jabs_object *fdo);
