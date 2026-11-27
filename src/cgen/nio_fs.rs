@@ -118,6 +118,10 @@ fn body(key: &MethodKey) -> Option<&'static str> {
             "return jabs_process_environment_block();"
         }
         ("java/lang/ProcessEnvironment", "environ", "()[[B") => "return jabs_process_environ();",
+        // Linux's System.getenv reads ProcessImpl.JNU_CHARSET, so ProcessImpl's <clinit> runs and
+        // calls init(). HotSpot's init only caches PATH for launching processes; JABS launches
+        // none (forkAndExec stays not compiled), so there is nothing to set up.
+        ("java/lang/ProcessImpl", "init", "()V") => "",
         _ => return None,
     })
 }
