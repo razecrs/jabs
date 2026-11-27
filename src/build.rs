@@ -222,6 +222,7 @@ pub fn build_out_dir(
             .len();
 
         let header_hash_for_tu = if (is_runtime_tu(&file_name) || file_name == "resources.c")
+            && file_name != "jabs_reflect.c"
             && runtime_header_hash.is_some()
         {
             runtime_header_hash.as_ref()
