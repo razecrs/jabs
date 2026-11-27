@@ -6,9 +6,11 @@ set -u
 # The program's class path and java.home are its .jab (src/jab.rs), written beside server.exe.
 # Without a recorded java.home list (local/profiles/1.7.10-java-home.txt) this is a recording
 # build: java.home is the JDK and the run appends every file it touches there to that list; the
-# next build copies exactly those files into the .jab. An empty list (a recording run that never
-# got to run the server) counts as none. JABS_BOOT_PORTABLE=1 also packs the .jab into the
-# executable (jabs pack) and runs that single file, from a directory with no .jab.
+# next build copies exactly those files into the .jab. A recording run writes the list beside it
+# as .recording and makes it the list only if the server printed "Done (": a run that stopped
+# early would leave a partial list that later builds took for the whole one. JABS_BOOT_PORTABLE=1
+# also packs the .jab into the executable (jabs pack) and runs that single file, from a directory
+# with no .jab.
 B="${1:?usage: native-boot.sh WORKDIR}"
 mkdir -p "$B"
 TOOLS="$(cd "$(dirname "$0")" && pwd)"
@@ -29,7 +31,10 @@ trace=local/profiles/1.7.10-method-trace.txt
 [ -f "$trace" ] && EXECUTED="--executed-methods $trace"
 echo "method trace: ${EXECUTED:-none}"
 HOME_LIST=local/profiles/1.7.10-java-home.txt
-if [ -s "$HOME_LIST" ]; then HOME_FILES="--java-home-files $HOME_LIST"; else HOME_FILES="--record-java-home $(pwd)/$HOME_LIST"; fi
+RECORDING="$(pwd)/$HOME_LIST.recording"
+FINAL_LIST="$(pwd)/$HOME_LIST"
+if [ -s "$HOME_LIST" ]; then HOME_FILES="--java-home-files $HOME_LIST"; RECORDING=""
+else rm -f "$RECORDING"; HOME_FILES="--record-java-home $RECORDING"; fi
 echo "java.home: $HOME_FILES"
 # JABS's runtime classes (the app class loader); no invokedynamic for string concatenation, and
 # sun.net.www.ParseUtil for the class path's jar: URLs.
@@ -48,4 +53,12 @@ fi
 mkdir -p /d/Projects/jabs/local/profiles/run/server-1.7.10 && cd /d/Projects/jabs/local/profiles/run/server-1.7.10
 # The same switches a JVM run would take: no JMX for log4j (nobody connects to it, and the
 # platform MBean server needs reflection natives), and no Swing console window.
-timeout 120 "$PROGRAM" -Dlog4j2.disable.jmx=true -- nogui 2>&1 | tail -40
+timeout 120 "$PROGRAM" -Dlog4j2.disable.jmx=true -- nogui > "$B/run.txt" 2>&1
+tail -40 "$B/run.txt"
+if [ -n "$RECORDING" ]; then
+    if grep -q "Done (" "$B/run.txt" && [ -s "$RECORDING" ]; then
+        mv -f "$RECORDING" "$FINAL_LIST" && echo "java.home list recorded: $FINAL_LIST"
+    else
+        echo "java.home list NOT recorded: the server did not reach Done (partial list left in $RECORDING)"
+    fi
+fi
