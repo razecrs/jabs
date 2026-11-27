@@ -1216,6 +1216,14 @@ static int32_t zip_insert_hash(zip_deflater *s, int32_t pos) {
     return prev_head;
 }
 
+/* zlib's configuration_table for the lazy levels (4-9): once the pending match is at least
+ * `good` long, the next search walks a quarter of the hash chain; once it is at least `lazy`
+ * long, there is no next search at all. Repetitive input (Minecraft's chunk data, which the
+ * 1.7.10 server compresses at level 6 for every chunk packet) is mostly long matches, where
+ * these two cut most of the work. Levels 1-3 do not search lazily, so theirs are unused. */
+static const int32_t zip_good_tbl[10] = {0, 0, 0, 0, 4, 8, 8, 8, 32, 32};
+static const int32_t zip_lazy_tbl[10] = {0, 0, 0, 0, 4, 16, 16, 32, 128, 258};
+
 static int32_t zip_longest_match(zip_deflater *s, int32_t cur, int32_t *best_dist) {
     static const int32_t chain_tbl[10] = {0, 4, 8, 16, 16, 32, 128, 256, 1024, 4096};
     static const int32_t nice_tbl[10]  = {0, 8, 16, 32, 32, 64, 128, 128, 258, 258};
@@ -1227,6 +1235,7 @@ static int32_t zip_longest_match(zip_deflater *s, int32_t cur, int32_t *best_dis
 
     int32_t limit = (s->strstart > 32767) ? (s->strstart - 32767) : 0;
     int32_t chain = chain_tbl[s->level];
+    if (s->prev_avail && s->prev_len >= zip_good_tbl[s->level]) chain >>= 2;
     int32_t nice = nice_tbl[s->level];
     if (nice > max_len) nice = max_len;
 
@@ -1333,7 +1342,9 @@ static void zip_compress_step(zip_deflater *s, int final_drain) {
 
         int32_t hash_head = zip_insert_hash(s, s->strstart);
         int32_t cur_dist = 0;
-        int32_t cur_len = (hash_head >= 0) ? zip_longest_match(s, hash_head, &cur_dist) : 0;
+        /* A pending match already as long as zlib's max_lazy is taken without looking further. */
+        int skip_search = use_lazy && s->prev_avail && s->prev_len >= zip_lazy_tbl[s->level];
+        int32_t cur_len = (hash_head >= 0 && !skip_search) ? zip_longest_match(s, hash_head, &cur_dist) : 0;
 
         if (use_lazy) {
             if (s->prev_avail) {
