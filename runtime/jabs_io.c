@@ -2,7 +2,7 @@
  * IOExceptions with the JDK's messages. Operating-system work is in jabs_files.c; object layouts
  * come from accessors the compiler generates (jabs_file_path_of, jabs_stream_fd_slot, ...).
  * Shared by WinNTFileSystem and UnixFileSystem, so a new OS needs no change here. */
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 /* A File's path as malloc'd UTF-8; NULL with NullPointerException pending for a null File. */
 static char *path_of(jabs_object *file) {

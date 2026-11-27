@@ -94,22 +94,16 @@ pub struct Report {
 /// Generate a proxy class for every interface list the program can ask for, appending them.
 pub fn generate(classes: &mut Vec<ClassFile>) -> Report {
     let mut report = Report::default();
-    let lists = {
-        let by_name: HashMap<&str, &ClassFile> =
-            classes.iter().map(|c| (c.name.as_str(), c)).collect();
-        let mut lists: BTreeSet<Vec<String>> = annotation_interfaces(classes, &by_name)
-            .into_iter()
-            .map(|a| vec![a])
-            .collect();
-        lists.extend(literal_lists(classes, &by_name));
-        lists
-    };
-    let mut taken: HashSet<String> = classes.iter().map(|c| c.name.clone()).collect();
+    let by_name: HashMap<&str, &ClassFile> = classes.iter().map(|c| (c.name.as_str(), c)).collect();
+    let mut lists: BTreeSet<Vec<String>> = annotation_interfaces(classes, &by_name)
+        .into_iter()
+        .map(|a| vec![a])
+        .collect();
+    lists.extend(literal_lists(classes, &by_name));
+    let mut taken_generated: HashSet<String> = HashSet::new();
     let mut generated = Vec::new();
     let mut number = 0usize;
     for list in lists {
-        let by_name: HashMap<&str, &ClassFile> =
-            classes.iter().map(|c| (c.name.as_str(), c)).collect();
         let result = proxy_package(&list, &by_name).and_then(|(package, access)| {
             // The JVM numbers proxies $Proxy0, $Proxy1, ... in creation order; any free name
             // will do here, since the name is only seen through Class.getName.
@@ -120,7 +114,9 @@ pub fn generate(classes: &mut Vec<ClassFile>) -> Report {
                     format!("{package}/$Proxy{number}")
                 };
                 number += 1;
-                if !taken.contains(&candidate) {
+                if !by_name.contains_key(candidate.as_str())
+                    && !taken_generated.contains(&candidate)
+                {
                     break candidate;
                 }
             };
@@ -128,7 +124,7 @@ pub fn generate(classes: &mut Vec<ClassFile>) -> Report {
         });
         match result {
             Ok(class) => {
-                taken.insert(class.name.clone());
+                taken_generated.insert(class.name.clone());
                 report.proxies.push(Generated {
                     name: class.name.clone(),
                     interfaces: list,
@@ -306,11 +302,21 @@ fn literal_lists(
 ) -> BTreeSet<Vec<String>> {
     let mut out = BTreeSet::new();
     for class in classes {
+        if !class
+            .pool
+            .iter()
+            .any(|c| matches!(c, Constant::Utf8(s) if s == PROXY))
+        {
+            continue;
+        }
         for method in &class.methods {
             let Some(code) = method.code.as_ref() else {
                 continue;
             };
             let code = &code.bytecode;
+            if !code.contains(&0xb8) {
+                continue;
+            }
             let starts = instruction_starts(code);
             if !starts
                 .iter()

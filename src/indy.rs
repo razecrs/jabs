@@ -46,11 +46,22 @@ pub fn desugar(classes: &mut Vec<ClassFile>) -> Report {
     let mut report = Report::default();
     let mut generated = Vec::new();
     for class in classes.iter_mut() {
+        if class.bootstrap_methods.is_empty()
+            || !class
+                .pool
+                .iter()
+                .any(|c| matches!(c, Constant::InvokeDynamic { .. }))
+        {
+            continue;
+        }
         let mut counter = 0usize;
         for m in 0..class.methods.len() {
             let Some(code) = class.methods[m].code.as_ref() else {
                 continue;
             };
+            if !code.bytecode.contains(&0xba) {
+                continue;
+            }
             let sites: Vec<usize> = instruction_starts(&code.bytecode)
                 .into_iter()
                 .filter(|&pc| code.bytecode[pc] == 0xba)

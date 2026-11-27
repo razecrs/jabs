@@ -105,6 +105,32 @@ enum Action {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Compile and link an `--out-dir` C directory in parallel using PCH, tiered optimization, and `.o` caching.
+    Build {
+        /// Output directory written by `jabs compile --out-dir`.
+        out_dir: PathBuf,
+        /// Optional native entry-point C file outside `out_dir` (e.g. `tools/native-boot-entry.c`).
+        #[arg(long)]
+        entry: Option<PathBuf>,
+        /// Output executable path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Hot code optimization level (`0`, `1`, `2`, `3`; default `2`).
+        #[arg(long, default_value_t = 2)]
+        opt: u8,
+        /// Content-addressed `.o` cache directory reused across builds.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Maximum parallel compiler workers (default: CPU thread count).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Disable precompiled headers (`jabs_unit.h.pch`).
+        #[arg(long)]
+        no_pch: bool,
+        /// Treat warnings as errors (`-Wall -Wextra -Werror`).
+        #[arg(long)]
+        strict: bool,
+    },
     /// Download (verified against Mojang's hashes) and launch a vanilla client on the JVM, offline sign-in.
     Client {
         /// Minecraft version id, e.g. `1.21.1` (or omit and pass --instance).
@@ -237,13 +263,14 @@ fn execute(cli: Cli) -> Result<()> {
             if let Some(java) = jdk {
                 let home = jabs::jdk::java_home(&java)?;
                 java_home = Some(home.clone());
-                // The whole class path: the inputs and every JDK module, so a class in neither is
-                // proved absent (NoClassDefFoundError at run time, as on the JVM).
-                let mut known = jabs::jdk::all_class_names(&home)?;
-                known.extend(classes.iter().map(|c| c.name.clone()));
+                let (jdk_mods, all_jdk) = jabs::jdk::modules_and_class_names(&home)?;
+                let mut known = all_jdk;
+                let mut known_in_unit: std::collections::HashSet<String> =
+                    classes.iter().map(|c| c.name.clone()).collect();
+                known.extend(known_in_unit.iter().cloned());
                 known_classes = Some(known);
                 // The JDK's module declarations: its classes get their named modules.
-                jdk_modules = jabs::jdk::modules(&home)?;
+                jdk_modules = jdk_mods;
                 // java.base, plus every module a JVM run of the program loaded classes from or
                 // executed code of (as `coverage` counts them).
                 let mut used = loaded_classes.clone();
@@ -251,17 +278,44 @@ fn execute(cli: Cli) -> Result<()> {
                     used.extend(trace.methods.iter().map(|(class, _, _)| class.clone()));
                 }
                 let mut modules = vec!["java.base".to_string()];
-                for m in jabs::jdk::modules_containing(&home, &used)? {
-                    if !modules.contains(&m) {
-                        modules.push(m);
+                if !used.is_empty() {
+                    let non_base_pkgs: std::collections::HashSet<&str> = jdk_modules
+                        .iter()
+                        .filter(|m| m.declaration.name != "java.base")
+                        .flat_map(|m| m.packages.iter().map(String::as_str))
+                        .collect();
+                    let need_scan: std::collections::BTreeSet<String> = used
+                        .into_iter()
+                        .filter(|c| {
+                            let pkg = c.rfind('/').map_or("", |i| &c[..i]);
+                            non_base_pkgs.contains(pkg)
+                        })
+                        .collect();
+                    if !need_scan.is_empty() {
+                        for m in jabs::jdk::modules_containing(&home, &need_scan)? {
+                            if !modules.contains(&m) {
+                                modules.push(m);
+                            }
+                        }
                     }
                 }
                 eprintln!("JDK modules in the unit: {}", modules.join(", "));
-                for module in &modules {
-                    let (library, _, _) = jabs::jdk::read_module(&home, module)?;
-                    let known: std::collections::HashSet<String> =
-                        classes.iter().map(|c| c.name.clone()).collect();
-                    classes.extend(library.into_iter().filter(|c| !known.contains(&c.name)));
+                let loaded_mods: Vec<(Vec<jabs::classfile::ClassFile>, usize, usize)> =
+                    std::thread::scope(|s| {
+                        let jobs: Vec<_> = modules
+                            .iter()
+                            .map(|module| s.spawn(|| jabs::jdk::read_module(&home, module)))
+                            .collect();
+                        jobs.into_iter()
+                            .map(|j| j.join().unwrap())
+                            .collect::<Result<Vec<_>>>()
+                    })?;
+                for (library, _, _) in loaded_mods {
+                    for class in library {
+                        if known_in_unit.insert(class.name.clone()) {
+                            classes.push(class);
+                        }
+                    }
                 }
             }
             let mut jab_config = None;
@@ -319,8 +373,9 @@ fn execute(cli: Cli) -> Result<()> {
                 jab: jab_config,
                 known_classes,
                 jdk_modules,
+                emit_single_source: out.is_some() || out_dir.is_none(),
             };
-            let compiled = jabs::cgen::compile_unit_with(&classes, Some(&roots), &extras);
+            let compiled = jabs::cgen::compile_unit_owned(classes, Some(&roots), &extras);
             if let (Some(trace), Some(counts)) = (&trace, &compiled.executed_roots) {
                 eprintln!(
                     "executed methods: {} roots; set aside: {} in hidden classes, {} of classes \
@@ -355,6 +410,44 @@ fn execute(cli: Cli) -> Result<()> {
         Action::Hash { file } => {
             let (bytes, sha256) = profile::hash_file(&file)?;
             print_json(serde_json::json!({ "bytes": bytes, "sha256": sha256 }))
+        }
+        Action::Build {
+            out_dir,
+            entry,
+            out,
+            opt,
+            cache,
+            jobs,
+            no_pch,
+            strict,
+        } => {
+            let opt_level = match opt {
+                0 => jabs::build::OptLevel::O0,
+                1 => jabs::build::OptLevel::O1,
+                2 => jabs::build::OptLevel::O2,
+                3 => jabs::build::OptLevel::O3,
+                _ => anyhow::bail!("invalid --opt {opt} (expected 0, 1, 2, or 3)"),
+            };
+            let options = jabs::build::BuildOptions {
+                opt_level,
+                data_opt_level: jabs::build::OptLevel::O0,
+                cold_opt_level: if opt == 0 {
+                    jabs::build::OptLevel::O0
+                } else {
+                    jabs::build::OptLevel::O1
+                },
+                output: out,
+                cache_dir: cache,
+                jobs,
+                use_pch: !no_pch,
+                strict_warnings: strict,
+                ..Default::default()
+            };
+            print_json(jabs::build::build_out_dir(
+                &out_dir,
+                entry.as_deref(),
+                &options,
+            )?)
         }
         Action::Bench { measurements } => {
             let data = serde_json::from_reader(

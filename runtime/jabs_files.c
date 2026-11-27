@@ -12,7 +12,7 @@
 #define _XOPEN_SOURCE 700
 #endif
 #endif
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 /* Per thread, like errno: a thread reads the reason for its own last failure. */
 static _Thread_local char error_text[512];

@@ -5,7 +5,7 @@
  * object layout. Behavior follows JDK 25 on HotSpot as the reference JVM runs it; where that
  * differs between HotSpot's native reflection and the JDK's method-handle accessors, the
  * comment says which one is followed. */
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 #ifdef JABS_HAVE_REFLECTION
 

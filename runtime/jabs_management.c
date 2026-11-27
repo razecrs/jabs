@@ -2,7 +2,7 @@
  * are in src/cgen/management.rs). Handwritten, OS-neutral: OS facts come from jabs_platform.c,
  * thread counts from jabs_thread.c. Needs the class registry (Strings and String[]), so it is
  * part of a program exactly when jabs_io.c is. */
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 /* VMManagementImpl.getVmArguments0: HotSpot's input arguments are the options the VM was
  * created with, one per element as given ("-Dkey=value", "-Dkey"); the launcher's own

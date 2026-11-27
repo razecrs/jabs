@@ -16,18 +16,63 @@ const INNER_CLASS_MODIFIERS: u16 = 0x763F;
 const ACC_SUPER: u16 = 0x0020;
 const ACC_ENUM: u16 = 0x4000;
 
-/// The value kinds in JABS_RK_* order: descriptor code, box class, the word in the JDK's
-/// accessor class name (MethodHandle<word>FieldAccessorImpl) and in its own get/set methods.
+/// The value kinds in JABS_RK_* order: descriptor code, box class, full JDK accessor class name
+/// (`MethodHandle<word>FieldAccessorImpl`), and the word in its own get/set methods.
 const KINDS: [(&str, &str, &str, &str); 9] = [
-    ("Z", "java/lang/Boolean", "Boolean", "Boolean"),
-    ("B", "java/lang/Byte", "Byte", "Byte"),
-    ("C", "java/lang/Character", "Character", "Char"),
-    ("S", "java/lang/Short", "Short", "Short"),
-    ("I", "java/lang/Integer", "Integer", "Int"),
-    ("J", "java/lang/Long", "Long", "Long"),
-    ("F", "java/lang/Float", "Float", "Float"),
-    ("D", "java/lang/Double", "Double", "Double"),
-    ("Ljava/lang/Object;", OBJECT, "Object", ""),
+    (
+        "Z",
+        "java/lang/Boolean",
+        "jdk/internal/reflect/MethodHandleBooleanFieldAccessorImpl",
+        "Boolean",
+    ),
+    (
+        "B",
+        "java/lang/Byte",
+        "jdk/internal/reflect/MethodHandleByteFieldAccessorImpl",
+        "Byte",
+    ),
+    (
+        "C",
+        "java/lang/Character",
+        "jdk/internal/reflect/MethodHandleCharacterFieldAccessorImpl",
+        "Char",
+    ),
+    (
+        "S",
+        "java/lang/Short",
+        "jdk/internal/reflect/MethodHandleShortFieldAccessorImpl",
+        "Short",
+    ),
+    (
+        "I",
+        "java/lang/Integer",
+        "jdk/internal/reflect/MethodHandleIntegerFieldAccessorImpl",
+        "Int",
+    ),
+    (
+        "J",
+        "java/lang/Long",
+        "jdk/internal/reflect/MethodHandleLongFieldAccessorImpl",
+        "Long",
+    ),
+    (
+        "F",
+        "java/lang/Float",
+        "jdk/internal/reflect/MethodHandleFloatFieldAccessorImpl",
+        "Float",
+    ),
+    (
+        "D",
+        "java/lang/Double",
+        "jdk/internal/reflect/MethodHandleDoubleFieldAccessorImpl",
+        "Double",
+    ),
+    (
+        "Ljava/lang/Object;",
+        OBJECT,
+        "jdk/internal/reflect/MethodHandleObjectFieldAccessorImpl",
+        "",
+    ),
 ];
 
 const METHOD: &str = "java/lang/reflect/Method";
@@ -41,10 +86,6 @@ const ITE: &str = "java/lang/reflect/InvocationTargetException";
 const ACCESSOR_INIT: &str =
     "(Ljava/lang/reflect/Field;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodHandle;ZZ)V";
 
-fn accessor_class(word: &str) -> String {
-    format!("jdk/internal/reflect/MethodHandle{word}FieldAccessorImpl")
-}
-
 /// JABS_RR_* classes, in enum order.
 fn record_classes() -> Vec<String> {
     let mut out = vec![
@@ -56,7 +97,7 @@ fn record_classes() -> Vec<String> {
         ITE.to_string(),
     ];
     out.extend(KINDS[..8].iter().map(|k| k.1.to_string()));
-    out.extend(KINDS.iter().map(|k| accessor_class(k.2)));
+    out.extend(KINDS.iter().map(|k| k.2.to_string()));
     out
 }
 
@@ -161,10 +202,10 @@ fn runtime_calls(unit: &Unit) -> Vec<(String, Option<MethodKey>)> {
         key(ITE, "<init>", "(Ljava/lang/Throwable;)V"),
     ));
     for k in &KINDS {
-        let class = accessor_class(k.2);
+        let class = k.2;
         out.push((
             format!("{class}.<init>"),
-            key(&class, "<init>", ACCESSOR_INIT),
+            key(class, "<init>", ACCESSOR_INIT),
         ));
     }
     for (name, descriptor) in [
@@ -564,10 +605,10 @@ pub(super) fn replacement(key: &MethodKey) -> Option<(String, bool)> {
             _ => None,
         };
     }
-    let (index, kind) = KINDS
-        .iter()
-        .enumerate()
-        .find(|(_, k)| accessor_class(k.2) == key.0)?;
+    if !key.0.starts_with("jdk/internal/reflect/MethodHandle") {
+        return None;
+    }
+    let (index, kind) = KINDS.iter().enumerate().find(|(_, k)| k.2 == key.0)?;
     let (code, _, _, word) = *kind;
     let is_reference = index == 8;
     let get_name = format!("get{word}");
@@ -1004,13 +1045,25 @@ pub(super) fn functions(unit: &Unit, inputs: &MetadataInputs) -> String {
     }
     out.push_str("    ;\nconst unsigned char jabs_rbytes[] = {\n");
     for line in tables.bytes.chunks(32) {
-        let bytes: Vec<String> = line.iter().map(|b| format!("0x{b:02x}")).collect();
-        let _ = writeln!(out, "    {},", bytes.join(", "));
+        out.push_str("    ");
+        for (i, b) in line.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "0x{b:02x}");
+        }
+        out.push_str(",\n");
     }
     out.push_str("};\nconst uint32_t jabs_rlists[] = {\n");
     for chunk in tables.lists.chunks(16) {
-        let items: Vec<String> = chunk.iter().map(u32::to_string).collect();
-        let _ = writeln!(out, "    {},", items.join(", "));
+        out.push_str("    ");
+        for (i, item) in chunk.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{item}");
+        }
+        out.push_str(",\n");
     }
     let _ = write!(
         out,
@@ -1063,13 +1116,14 @@ pub(super) fn functions(unit: &Unit, inputs: &MetadataInputs) -> String {
 
 /// The program-specific functions runtime/jabs_reflect.c calls: records, layouts, calls.
 fn support(unit: &Unit, inputs: &MetadataInputs) -> String {
-    let recorded = |name: &str| inputs.recorded.iter().any(|c| c.name == name);
+    let recorded: std::collections::HashSet<&str> =
+        inputs.recorded.iter().map(|c| c.name.as_str()).collect();
     let mut out = String::new();
     // Records and allocation.
     let mut records = String::new();
     let mut news = String::new();
     for (i, name) in record_classes().iter().enumerate() {
-        if !recorded(name) {
+        if !recorded.contains(name.as_str()) {
             let _ = writeln!(records, "    case {i}: return NULL; /* {name} */");
             let _ = writeln!(
                 news,

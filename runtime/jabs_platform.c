@@ -5,7 +5,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #endif
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -202,19 +202,25 @@ int32_t jabs_platform_load_average(double *out, int32_t count) {
 }
 
 int jabs_platform_stack_functions(const void **starts, int max) {
+    if (!starts || max <= 0) return 0;
     void *pcs[1024];
-    int n = (int)RtlCaptureStackBackTrace(0, (DWORD)(max < 1024 ? max : 1024), pcs, NULL);
+    int limit = max < 1024 ? max : 1024;
+    int n = (int)RtlCaptureStackBackTrace(0, (DWORD)limit, pcs, NULL);
     for (int i = 0; i < n; i++) {
         DWORD64 image = 0;
         /* The unwind tables give the start of the function containing each return address. */
-        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry((DWORD64)(uintptr_t)pcs[i] - 1, &image, NULL);
+        PRUNTIME_FUNCTION f = pcs[i] ? RtlLookupFunctionEntry((DWORD64)(uintptr_t)pcs[i] - 1, &image, NULL) : NULL;
         starts[i] = f ? (const void *)(uintptr_t)(image + f->BeginAddress) : NULL;
     }
     return n;
 }
 
 void jabs_sleep_nanos(int64_t nanos) {
-    if (nanos > 0) Sleep((DWORD)((nanos + 999999) / 1000000 > 0x7fffffff ? 0x7fffffff : (nanos + 999999) / 1000000));
+    if (nanos > 0) {
+        /* Divide before rounding up so nanos near INT64_MAX cannot overflow signed int64_t. */
+        int64_t millis = nanos / 1000000 + (nanos % 1000000 != 0);
+        Sleep((DWORD)(millis > 0x7fffffff ? 0x7fffffff : millis));
+    }
 }
 
 int64_t jabs_nano_time(void) {
@@ -375,14 +381,17 @@ static _Unwind_Reason_Code jabs_unwind_frame(struct _Unwind_Context *context, vo
 }
 
 int jabs_platform_stack_functions(const void **starts, int max) {
+    if (!starts || max <= 0) return 0;
     jabs_unwind_state s = { starts, 0, max };
     _Unwind_Backtrace(jabs_unwind_frame, &s);
     return s.count;
 }
 
 void jabs_sleep_nanos(int64_t nanos) {
-    struct timespec t = { (time_t)(nanos / 1000000000), (long)(nanos % 1000000000) };
-    if (nanos > 0) nanosleep(&t, NULL);
+    if (nanos > 0) {
+        struct timespec t = { (time_t)(nanos / 1000000000), (long)(nanos % 1000000000) };
+        nanosleep(&t, NULL);
+    }
 }
 
 int64_t jabs_nano_time(void) {
@@ -430,7 +439,11 @@ char *jabs_platform_gmt_offset_id(void) {
 int64_t jabs_nano_time_adjustment(int64_t offset_seconds) {
     struct timespec now;
     if (timespec_get(&now, TIME_UTC) != TIME_UTC) return -1;
-    int64_t seconds = (int64_t)now.tv_sec - offset_seconds;
+    int64_t sec = (int64_t)now.tv_sec;
+    /* Guard against signed subtraction overflow before range-checking the delta. */
+    if ((offset_seconds < 0 && sec > INT64_MAX + offset_seconds) ||
+        (offset_seconds > 0 && sec < INT64_MIN + offset_seconds)) return -1;
+    int64_t seconds = sec - offset_seconds;
     if (seconds > 0xFFFFFFFFLL || seconds < -0xFFFFFFFFLL) return -1;
     return seconds * 1000000000LL + now.tv_nsec;
 }

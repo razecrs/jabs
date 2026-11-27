@@ -8,8 +8,9 @@
 use crate::classfile::ClassFile;
 use anyhow::{Context, Result, bail};
 use std::{
+    collections::{BTreeSet, HashSet},
     fs,
-    io::Cursor,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -53,9 +54,7 @@ pub fn read_module(home: &Path, module: &str) -> Result<(Vec<ClassFile>, usize, 
     if bytes.len() < 4 || bytes[..4] != JMOD_MAGIC {
         bail!("{} is not a jmod file", path.display());
     }
-    let mut archive = zip::ZipArchive::new(Cursor::new(&bytes[4..]))
-        .with_context(|| format!("read zip in {}", path.display()))?;
-    crate::jar::classes_from_zip(&mut archive, "classes/", &path.display().to_string())
+    crate::jar::classes_from_zip_bytes(&bytes[4..], "classes/", &path.display().to_string())
 }
 
 /// A jmod file seen as its zip: every position is shifted past the 4-byte header, so the zip
@@ -91,13 +90,7 @@ impl std::io::Seek for JmodZip {
     }
 }
 
-/// The JDK modules (by name) that contain at least one of `classes` (internal names), from the
-/// module files' directories alone. A JVM run's loaded classes give the modules a program uses.
-/// Every class name in every module of the JDK at `home` (internal names, from the jmods): the
-/// evidence that a class the program names exists nowhere in the JDK.
-pub fn all_class_names(home: &Path) -> Result<std::collections::BTreeSet<String>> {
-    use std::io::Read;
-    let mut out = std::collections::BTreeSet::new();
+fn jmod_paths(home: &Path, empty_err: Option<&str>) -> Result<Vec<PathBuf>> {
     let dir = home.join("jmods");
     let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
         .with_context(|| format!("list {}", dir.display()))?
@@ -105,31 +98,121 @@ pub fn all_class_names(home: &Path) -> Result<std::collections::BTreeSet<String>
         .filter(|p| p.extension().is_some_and(|x| x == "jmod"))
         .collect();
     entries.sort();
-    if entries.is_empty() {
-        anyhow::bail!(
-            "{} has no jmods: cannot list the JDK's classes",
-            dir.display()
+    if entries.is_empty()
+        && let Some(what) = empty_err
+    {
+        bail!("{} has no jmods: {what}", dir.display());
+    }
+    Ok(entries)
+}
+
+fn open_jmod_zip(path: &Path) -> Result<zip::ZipArchive<JmodZip>> {
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)
+        .with_context(|| format!("read {}", path.display()))?;
+    if magic != JMOD_MAGIC {
+        bail!("{} is not a jmod", path.display());
+    }
+    zip::ZipArchive::new(JmodZip(file))
+        .with_context(|| format!("read the zip in {}", path.display()))
+}
+
+fn collect_archive_class_names(archive: &zip::ZipArchive<JmodZip>, out: &mut Vec<String>) {
+    for name in archive.file_names() {
+        if let Some(class) = name
+            .strip_prefix("classes/")
+            .and_then(|n| n.strip_suffix(".class"))
+            .filter(|n| !n.ends_with("module-info"))
+        {
+            out.push(class.to_string());
+        }
+    }
+}
+
+fn read_module_info(path: &Path, archive: &mut zip::ZipArchive<JmodZip>) -> Result<JdkModule> {
+    let entry = archive
+        .by_name("classes/module-info.class")
+        .with_context(|| format!("{} has no classes/module-info.class", path.display()))?;
+    if entry.size() > MAX_MODULE_INFO_BYTES {
+        bail!(
+            "{}: module-info.class is {} bytes; limit is {MAX_MODULE_INFO_BYTES}",
+            path.display(),
+            entry.size()
         );
     }
-    for path in entries {
-        let mut file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)
-            .with_context(|| format!("read {}", path.display()))?;
-        if magic != JMOD_MAGIC {
-            anyhow::bail!("{} is not a jmod", path.display());
-        }
-        let archive = zip::ZipArchive::new(JmodZip(file))
-            .with_context(|| format!("read the classes of {}", path.display()))?;
-        for name in archive.file_names() {
-            if let Some(class) = name
-                .strip_prefix("classes/")
-                .and_then(|n| n.strip_suffix(".class"))
-                .filter(|n| !n.ends_with("module-info"))
-            {
-                out.insert(class.to_string());
-            }
-        }
+    let mut bytes = Vec::with_capacity(entry.size().min(MAX_MODULE_INFO_BYTES) as usize);
+    entry
+        .take(MAX_MODULE_INFO_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read module-info.class in {}", path.display()))?;
+    if bytes.len() as u64 > MAX_MODULE_INFO_BYTES {
+        bail!("{}: module-info.class is too large", path.display());
+    }
+    let class = ClassFile::parse(&bytes)
+        .with_context(|| format!("parse module-info.class in {}", path.display()))?;
+    let module = class.reflect.module;
+    let Some(declaration) = module.declaration else {
+        bail!(
+            "{}: module-info.class has no Module attribute",
+            path.display()
+        );
+    };
+    let Some(packages) = module.packages else {
+        bail!(
+            "{}: module-info.class has no ModulePackages attribute",
+            path.display()
+        );
+    };
+    Ok(JdkModule {
+        declaration,
+        packages,
+        resolution: module.resolution.unwrap_or(0),
+        class_bytes: bytes,
+    })
+}
+
+fn run_jmod_workers<T: Send>(
+    entries: &[PathBuf],
+    f: impl Fn(&Path) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    if entries.len() <= 1 {
+        return entries.iter().map(|p| f(p)).collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(entries.len());
+    let chunk_size = entries.len().div_ceil(workers);
+    let results: Vec<Result<Vec<T>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(|| chunk.iter().map(|p| f(p)).collect::<Result<Vec<T>>>()))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("jmod worker thread panicked"))
+            .collect()
+    });
+    let mut out = Vec::with_capacity(entries.len());
+    for chunk in results {
+        out.extend(chunk?);
+    }
+    Ok(out)
+}
+
+/// Every class name in every module of the JDK at `home` (internal names, from the jmods): the
+/// evidence that a class the program names exists nowhere in the JDK.
+pub fn all_class_names(home: &Path) -> Result<BTreeSet<String>> {
+    let entries = jmod_paths(home, Some("cannot list the JDK's classes"))?;
+    let per_jmod = run_jmod_workers(&entries, |path| {
+        let archive = open_jmod_zip(path)?;
+        let mut names = Vec::with_capacity(archive.len());
+        collect_archive_class_names(&archive, &mut names);
+        Ok(names)
+    })?;
+    let mut out = BTreeSet::new();
+    for names in per_jmod {
+        out.extend(names);
     }
     Ok(out)
 }
@@ -154,109 +237,77 @@ pub struct JdkModule {
 /// without one, or one without a Module or ModulePackages attribute, is an error: every module
 /// of a JDK image has both (jlink and the jmod tool write ModulePackages).
 pub fn modules(home: &Path) -> Result<Vec<JdkModule>> {
-    use std::io::Read;
-    let dir = home.join("jmods");
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
-        .with_context(|| format!("list {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "jmod"))
-        .collect();
-    entries.sort();
-    if entries.is_empty() {
-        bail!(
-            "{} has no jmods: cannot read the JDK's modules",
-            dir.display()
-        );
+    let entries = jmod_paths(home, Some("cannot read the JDK's modules"))?;
+    let parsed = run_jmod_workers(&entries, |path| {
+        let mut archive = open_jmod_zip(path)?;
+        read_module_info(path, &mut archive)
+    })?;
+    collect_unique_modules(&entries, parsed)
+}
+
+/// Read both [`modules`] and [`all_class_names`] in a single parallel pass over the JDK's jmods.
+pub fn modules_and_class_names(home: &Path) -> Result<(Vec<JdkModule>, BTreeSet<String>)> {
+    let entries = jmod_paths(home, Some("cannot read the JDK's modules"))?;
+    let per_jmod = run_jmod_workers(&entries, |path| {
+        let mut archive = open_jmod_zip(path)?;
+        let mut names = Vec::with_capacity(archive.len());
+        collect_archive_class_names(&archive, &mut names);
+        let module = read_module_info(path, &mut archive)?;
+        Ok((module, names))
+    })?;
+    let mut raw_modules = Vec::with_capacity(per_jmod.len());
+    let mut class_names = BTreeSet::new();
+    for (module, names) in per_jmod {
+        raw_modules.push(module);
+        class_names.extend(names);
     }
-    let mut out: Vec<JdkModule> = Vec::new();
-    for path in entries {
-        let mut file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)
-            .with_context(|| format!("read {}", path.display()))?;
-        if magic != JMOD_MAGIC {
-            bail!("{} is not a jmod", path.display());
-        }
-        let mut archive = zip::ZipArchive::new(JmodZip(file))
-            .with_context(|| format!("read the zip in {}", path.display()))?;
-        let entry = archive
-            .by_name("classes/module-info.class")
-            .with_context(|| format!("{} has no classes/module-info.class", path.display()))?;
-        if entry.size() > MAX_MODULE_INFO_BYTES {
-            bail!(
-                "{}: module-info.class is {} bytes; limit is {MAX_MODULE_INFO_BYTES}",
-                path.display(),
-                entry.size()
-            );
-        }
-        let mut bytes = Vec::new();
-        entry
-            .take(MAX_MODULE_INFO_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("read module-info.class in {}", path.display()))?;
-        if bytes.len() as u64 > MAX_MODULE_INFO_BYTES {
-            bail!("{}: module-info.class is too large", path.display());
-        }
-        let class = ClassFile::parse(&bytes)
-            .with_context(|| format!("parse module-info.class in {}", path.display()))?;
-        let module = class.reflect.module;
-        let Some(declaration) = module.declaration else {
-            bail!(
-                "{}: module-info.class has no Module attribute",
-                path.display()
-            );
-        };
-        let Some(packages) = module.packages else {
-            bail!(
-                "{}: module-info.class has no ModulePackages attribute",
-                path.display()
-            );
-        };
-        if out.iter().any(|m| m.declaration.name == declaration.name) {
+    let modules = collect_unique_modules(&entries, raw_modules)?;
+    Ok((modules, class_names))
+}
+
+fn collect_unique_modules(entries: &[PathBuf], parsed: Vec<JdkModule>) -> Result<Vec<JdkModule>> {
+    let mut seen = HashSet::with_capacity(parsed.len());
+    let mut out = Vec::with_capacity(parsed.len());
+    for (path, module) in entries.iter().zip(parsed) {
+        if !seen.insert(module.declaration.name.clone()) {
             bail!(
                 "{}: module {} is declared twice",
                 path.display(),
-                declaration.name
+                module.declaration.name
             );
         }
-        out.push(JdkModule {
-            declaration,
-            packages,
-            resolution: module.resolution.unwrap_or(0),
-            class_bytes: bytes,
-        });
+        out.push(module);
     }
     out.sort_by(|a, b| a.declaration.name.cmp(&b.declaration.name));
     Ok(out)
 }
 
-pub fn modules_containing(
-    home: &Path,
-    classes: &std::collections::BTreeSet<String>,
-) -> Result<Vec<String>> {
-    use std::io::Read;
-    let mut out = Vec::new();
-    let dir = home.join("jmods");
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
-        .with_context(|| format!("list {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "jmod"))
-        .collect();
-    entries.sort();
-    for path in entries {
-        let mut file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+/// The JDK modules (by name) that contain at least one of `classes` (internal names), from the
+/// module files' directories alone. A JVM run's loaded classes give the modules a program uses.
+pub fn modules_containing(home: &Path, classes: &BTreeSet<String>) -> Result<Vec<String>> {
+    let entries = jmod_paths(home, None)?;
+    if entries.is_empty() || classes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hits = run_jmod_workers(&entries, |path| {
+        let Ok(mut file) = fs::File::open(path) else {
+            return Ok(false);
+        };
         let mut magic = [0u8; 4];
         if file.read_exact(&mut magic).is_err() || magic != JMOD_MAGIC {
-            continue;
+            return Ok(false);
         }
         let Ok(archive) = zip::ZipArchive::new(JmodZip(file)) else {
-            continue;
+            return Ok(false);
         };
-        let used = archive.file_names().any(|name| {
+        Ok(archive.file_names().any(|name| {
             name.strip_prefix("classes/")
                 .and_then(|n| n.strip_suffix(".class"))
                 .is_some_and(|n| classes.contains(n))
-        });
+        }))
+    })?;
+    let mut out = Vec::new();
+    for (path, used) in entries.iter().zip(hits) {
         if used {
             let module = path.file_stem().unwrap().to_string_lossy().into_owned();
             out.push(module);

@@ -362,6 +362,12 @@ impl<'a> Cursor<'a> {
 
 /// Decode JVM modified UTF-8 (encoded NUL, surrogate pairs as two 3-byte units).
 pub fn decode_modified_utf8(bytes: &[u8]) -> Result<String> {
+    // Non-NUL ASCII is already valid UTF-8; skip the UTF-16 buffer.
+    if bytes.iter().all(|&b| b != 0 && b < 0x80)
+        && let Ok(s) = std::str::from_utf8(bytes)
+    {
+        return Ok(s.to_owned());
+    }
     Ok(String::from_utf16_lossy(&modified_utf8_units(bytes)?))
 }
 
@@ -490,14 +496,44 @@ pub enum AnnotationAttribute {
     Default,
 }
 
+/// Walk an annotation-carrying attribute's payload, validating structure and trailing bytes.
+fn walk_annotation_attribute(
+    data: &[u8],
+    kind: AnnotationAttribute,
+    used: &mut dyn FnMut(u16, AnnotationIndex),
+) -> Result<()> {
+    let mut c = Cursor::new(data);
+    match kind {
+        AnnotationAttribute::Annotations => {
+            for _ in 0..c.u16()? {
+                walk_annotation(&mut c, 0, used)?;
+            }
+        }
+        AnnotationAttribute::ParameterAnnotations => {
+            for _ in 0..c.u8()? {
+                for _ in 0..c.u16()? {
+                    walk_annotation(&mut c, 0, used)?;
+                }
+            }
+        }
+        AnnotationAttribute::Default => walk_element_value(&mut c, 0, used)?,
+    }
+    if c.remaining() != 0 {
+        bail!(
+            "{} trailing bytes after an annotation attribute",
+            c.remaining()
+        );
+    }
+    Ok(())
+}
+
 /// Every constant-pool index an annotation attribute's payload names, so the binary can keep
 /// exactly the constants `Class.getConstantPool()` must answer for it. Fails on malformed or
 /// trailing bytes rather than guess.
 pub fn annotation_pool_indices(data: &[u8], kind: AnnotationAttribute) -> Result<Vec<u16>> {
-    Ok(annotation_references(data, kind)?
-        .into_iter()
-        .map(|(index, _)| index)
-        .collect())
+    let mut out = Vec::new();
+    walk_annotation_attribute(data, kind, &mut |index, _| out.push(index))?;
+    Ok(out)
 }
 
 /// Every constant-pool index an annotation attribute's payload names, in order, with what it
@@ -507,30 +543,8 @@ pub fn annotation_references(
     data: &[u8],
     kind: AnnotationAttribute,
 ) -> Result<Vec<(u16, AnnotationIndex)>> {
-    let mut c = Cursor::new(data);
     let mut out = Vec::new();
-    let mut used = |i: u16, what: AnnotationIndex| out.push((i, what));
-    match kind {
-        AnnotationAttribute::Annotations => {
-            for _ in 0..c.u16()? {
-                walk_annotation(&mut c, 0, &mut used)?;
-            }
-        }
-        AnnotationAttribute::ParameterAnnotations => {
-            for _ in 0..c.u8()? {
-                for _ in 0..c.u16()? {
-                    walk_annotation(&mut c, 0, &mut used)?;
-                }
-            }
-        }
-        AnnotationAttribute::Default => walk_element_value(&mut c, 0, &mut used)?,
-    }
-    if c.remaining() != 0 {
-        bail!(
-            "{} trailing bytes after an annotation attribute",
-            c.remaining()
-        );
-    }
+    walk_annotation_attribute(data, kind, &mut |i, what| out.push((i, what)))?;
     Ok(out)
 }
 
@@ -676,6 +690,7 @@ impl ClassFile {
             bail!("empty constant pool");
         }
         let mut raw_utf8: Vec<(u16, &[u8])> = Vec::new();
+        let mut has_string = false;
         let mut pool = Vec::with_capacity(count);
         pool.push(Constant::Unusable);
         while pool.len() < count {
@@ -702,7 +717,10 @@ impl ClassFile {
                     Constant::Unusable
                 }
                 7 => Constant::Class(c.u16()?),
-                8 => Constant::String(c.u16()?),
+                8 => {
+                    has_string = true;
+                    Constant::String(c.u16()?)
+                }
                 9 => Constant::FieldRef {
                     class: c.u16()?,
                     name_and_type: c.u16()?,
@@ -741,17 +759,19 @@ impl ClassFile {
             };
             pool.push(entry);
         }
-        let literal_texts: std::collections::HashSet<u16> = pool
-            .iter()
-            .filter_map(|c| match c {
-                Constant::String(i) => Some(*i),
-                _ => None,
-            })
-            .collect();
         let mut string_units = std::collections::HashMap::new();
-        for (index, bytes) in raw_utf8 {
-            if literal_texts.contains(&index) {
-                string_units.insert(index, modified_utf8_units(bytes)?);
+        if has_string {
+            let literal_texts: std::collections::HashSet<u16> = pool
+                .iter()
+                .filter_map(|c| match c {
+                    Constant::String(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            for (index, bytes) in raw_utf8 {
+                if literal_texts.contains(&index) {
+                    string_units.insert(index, modified_utf8_units(bytes)?);
+                }
             }
         }
         let access = c.u16()?;
@@ -783,18 +803,27 @@ impl ClassFile {
                         }
                         "RuntimeVisibleAnnotations" => {
                             annotations = parse_annotation_types(data, &pool)?;
-                            annotation_pool_indices(data, AnnotationAttribute::Annotations)?;
+                            walk_annotation_attribute(
+                                data,
+                                AnnotationAttribute::Annotations,
+                                &mut |_, _| {},
+                            )?;
                             reflect.annotations = Some(data.to_vec());
                         }
                         "RuntimeVisibleParameterAnnotations" => {
-                            annotation_pool_indices(
+                            walk_annotation_attribute(
                                 data,
                                 AnnotationAttribute::ParameterAnnotations,
+                                &mut |_, _| {},
                             )?;
                             reflect.parameter_annotations = Some(data.to_vec());
                         }
                         "AnnotationDefault" => {
-                            annotation_pool_indices(data, AnnotationAttribute::Default)?;
+                            walk_annotation_attribute(
+                                data,
+                                AnnotationAttribute::Default,
+                                &mut |_, _| {},
+                            )?;
                             reflect.annotation_default = Some(data.to_vec());
                         }
                         "Signature" => {
@@ -829,7 +858,11 @@ impl ClassFile {
                     reflect.signature = Some(utf8(&pool, single_index(attr, data)?)?.to_owned());
                 }
                 "RuntimeVisibleAnnotations" => {
-                    annotation_pool_indices(data, AnnotationAttribute::Annotations)?;
+                    walk_annotation_attribute(
+                        data,
+                        AnnotationAttribute::Annotations,
+                        &mut |_, _| {},
+                    )?;
                     reflect.annotations = Some(data.to_vec());
                 }
                 "InnerClasses" => reflect.inner_classes = parse_inner_classes(data, &pool)?,

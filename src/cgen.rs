@@ -24,9 +24,10 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write,
-    rc::Rc,
+    sync::{Arc, RwLock},
 };
 
 mod boot_extras;
@@ -1266,11 +1267,11 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
         ("Float", "F", "float"),
         ("Double", "D", "double"),
     ];
-    let at = |ty: &str| format!("(*({ty} *)((char *)a0 + a1))");
+    let addr = "((uintptr_t)a0 + (uintptr_t)a1)";
     // The address of an atomic access, checked for natural alignment.
     let atomic_at = |ty: &str| {
         format!(
-            "{ty} *p = ({ty} *)((char *)a0 + a1); if ((uintptr_t)p % sizeof *p != 0) jabs_not_compiled(\"jdk/internal/misc/Unsafe.{name} at a misaligned address\");"
+            "{ty} *p = ({ty} *){addr}; if ((uintptr_t)p % sizeof *p != 0) jabs_not_compiled(\"jdk/internal/misc/Unsafe.{name} at a misaligned address\");"
         )
     };
     for (word, code, ty) in TYPES {
@@ -1280,10 +1281,16 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
             format!("({ty})a2")
         };
         if name == format!("get{word}") && descriptor == format!("(Ljava/lang/Object;J){code}") {
-            return Some((format!("return {};", at(ty)), false));
+            return Some((
+                format!("{{ {ty} v; memcpy(&v, (const void *){addr}, sizeof v); return v; }}"),
+                false,
+            ));
         }
         if name == format!("put{word}") && descriptor == format!("(Ljava/lang/Object;J{code})V") {
-            return Some((format!("{} = {value};", at(ty)), false));
+            return Some((
+                format!("{{ {ty} v = {value}; memcpy((void *){addr}, &v, sizeof v); }}"),
+                false,
+            ));
         }
         if name == format!("get{word}Volatile")
             && descriptor == format!("(Ljava/lang/Object;J){code}")
@@ -1345,10 +1352,10 @@ fn unsafe_intrinsic(name: &str, descriptor: &str) -> Option<(String, bool)> {
         }
         ("freeMemory0", "(J)V") => "free((void *)(intptr_t)a0);",
         ("setMemory0", "(Ljava/lang/Object;JJB)V") => {
-            "memset((char *)a0 + a1, (unsigned char)a3, (size_t)a2);"
+            "if (a2 > 0) memset((void *)((uintptr_t)a0 + (uintptr_t)a1), (unsigned char)a3, (size_t)a2);"
         }
         ("copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V") => {
-            "memmove((char *)a2 + a3, (char *)a0 + a1, (size_t)a4);"
+            "if (a4 > 0) memmove((void *)((uintptr_t)a2 + (uintptr_t)a3), (const void *)((uintptr_t)a0 + (uintptr_t)a1), (size_t)a4);"
         }
         ("arrayBaseOffset0", "(Ljava/lang/Class;)I") => {
             "return (int32_t)((sizeof(jabs_array) + 7) & ~(size_t)7);"
@@ -1528,18 +1535,44 @@ fn declarations_for(code: &str) -> String {
     out
 }
 
-/// Split method definitions into roughly equal groups for parallel compilation.
-fn method_chunks(methods: &[String], files: usize) -> Vec<String> {
-    let total: usize = methods.iter().map(String::len).sum();
-    let target = (total / files.max(1)).max(1);
-    let mut chunks = vec![String::new()];
-    for m in methods {
-        if chunks.last().unwrap().len() >= target {
-            chunks.push(String::new());
-        }
-        chunks.last_mut().unwrap().push_str(m);
+/// Split method definitions into IR/CFG cost-balanced groups for parallel compilation.
+fn method_chunks(methods: &[(usize, String)], files: usize) -> Vec<String> {
+    if methods.is_empty() {
+        return Vec::new();
     }
-    chunks
+    let total_cost: usize = methods.iter().map(|(c, _)| *c).sum();
+    let num_chunks = (total_cost / 128).clamp(1, files.max(1)).min(methods.len());
+    if num_chunks == 1 {
+        let cap: usize = methods.iter().map(|(_, s)| s.len()).sum();
+        let mut out = String::with_capacity(cap);
+        for (_, s) in methods {
+            out.push_str(s);
+        }
+        return vec![out];
+    }
+    // Deterministic LPT assignment: largest methods first, then emit each bucket in original order.
+    let mut order: Vec<usize> = (0..methods.len()).collect();
+    order.sort_by_key(|&i| (Reverse(methods[i].0), i));
+    let mut loads = vec![0usize; num_chunks];
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); num_chunks];
+    for idx in order {
+        let min_b = (0..num_chunks).min_by_key(|&b| loads[b]).unwrap();
+        loads[min_b] += methods[idx].0;
+        buckets[min_b].push(idx);
+    }
+    buckets
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .map(|mut b| {
+            b.sort_unstable();
+            let cap: usize = b.iter().map(|&i| methods[i].1.len()).sum();
+            let mut out = String::with_capacity(cap);
+            for i in b {
+                out.push_str(&methods[i].1);
+            }
+            out
+        })
+        .collect()
 }
 
 /// One type from a descriptor: `code` is I J F D Z B C S, `L` (with `class`) or `V` for void.
@@ -1836,7 +1869,11 @@ pub type MethodKey = (String, String, String);
 /// Stable 64-bit ID of an interface method signature; independent of which classes exist.
 pub fn selector(name: &str, descriptor: &str) -> u64 {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("{name}\0{descriptor}").as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(descriptor.as_bytes());
+    let digest = hasher.finalize();
     u64::from_be_bytes(digest[..8].try_into().unwrap())
 }
 
@@ -1866,30 +1903,59 @@ struct Slot {
     owner: String,
 }
 
-/// A memoized superclass chain, or why it could not be built.
-type ChainResult<'a> = std::result::Result<Rc<Vec<&'a ClassFile>>, String>;
+/// A memoized superclass or superinterface list, or why it could not be built.
+type ChainResult<'a> = std::result::Result<Arc<Vec<&'a ClassFile>>, String>;
 
-/// The classes compiled together, with hierarchy queries over them.
+/// The classes compiled together, with thread-safe memoized hierarchy queries over them.
 struct Unit<'a> {
     classes: HashMap<&'a str, &'a ClassFile>,
     /// Class-name interning so verification types stay `Copy`.
-    names: RefCell<(Vec<String>, HashMap<String, u32>)>,
-    vtables: RefCell<HashMap<String, Rc<Vec<Slot>>>>,
-    chains: RefCell<HashMap<String, ChainResult<'a>>>,
-    itables: RefCell<HashMap<String, Rc<Vec<ItableEntry>>>>,
+    names: RwLock<(Vec<String>, HashMap<String, u32>)>,
+    vtables: RwLock<HashMap<String, Arc<Vec<Slot>>>>,
+    chains: RwLock<HashMap<String, ChainResult<'a>>>,
+    superinterfaces: RwLock<HashMap<String, ChainResult<'a>>>,
+    itables: RwLock<HashMap<String, Arc<Vec<ItableEntry>>>>,
+    signatures: RwLock<HashMap<String, std::result::Result<Arc<Signature>, String>>>,
+    selectors: RwLock<HashMap<String, HashMap<String, u64>>>,
+    structural: RwLock<HashMap<&'a str, Option<String>>>,
+    caller_sensitive: HashSet<(&'a str, &'a str, &'a str)>,
+    caller_sensitive_sigs: HashSet<(&'a str, &'a str)>,
     /// Every class that exists on the program's class path (its jars and the whole JDK), when
     /// known: a class outside it is absent, which the JVM reports as NoClassDefFoundError.
-    known: Option<std::collections::HashSet<String>>,
+    known: Option<HashSet<String>>,
 }
 
 impl<'a> Unit<'a> {
     fn new(classes: &'a [ClassFile]) -> Self {
+        let mut caller_sensitive = HashSet::new();
+        let mut caller_sensitive_sigs = HashSet::new();
+        for c in classes {
+            for m in &c.methods {
+                if m.annotations
+                    .iter()
+                    .any(|a| a == "Ljdk/internal/reflect/CallerSensitive;")
+                {
+                    caller_sensitive.insert((
+                        c.name.as_str(),
+                        m.name.as_str(),
+                        m.descriptor.as_str(),
+                    ));
+                    caller_sensitive_sigs.insert((m.name.as_str(), m.descriptor.as_str()));
+                }
+            }
+        }
         Unit {
             classes: classes.iter().map(|c| (c.name.as_str(), c)).collect(),
-            names: RefCell::new((Vec::new(), HashMap::new())),
-            vtables: RefCell::new(HashMap::new()),
-            chains: RefCell::new(HashMap::new()),
-            itables: RefCell::new(HashMap::new()),
+            names: RwLock::new((Vec::new(), HashMap::new())),
+            vtables: RwLock::new(HashMap::new()),
+            chains: RwLock::new(HashMap::new()),
+            superinterfaces: RwLock::new(HashMap::new()),
+            itables: RwLock::new(HashMap::new()),
+            signatures: RwLock::new(HashMap::new()),
+            selectors: RwLock::new(HashMap::new()),
+            structural: RwLock::new(HashMap::new()),
+            caller_sensitive,
+            caller_sensitive_sigs,
             known: None,
         }
     }
@@ -1907,7 +1973,13 @@ impl<'a> Unit<'a> {
         self.classes.get(name).copied()
     }
     fn intern(&self, name: &str) -> u32 {
-        let mut names = self.names.borrow_mut();
+        {
+            let names = self.names.read().unwrap();
+            if let Some(&id) = names.1.get(name) {
+                return id;
+            }
+        }
+        let mut names = self.names.write().unwrap();
         if let Some(&id) = names.1.get(name) {
             return id;
         }
@@ -1917,38 +1989,93 @@ impl<'a> Unit<'a> {
         id
     }
     fn name(&self, id: u32) -> String {
-        self.names.borrow().0[id as usize].clone()
+        self.names.read().unwrap().0[id as usize].clone()
+    }
+    fn with_name<R>(&self, id: u32, f: impl FnOnce(&str) -> R) -> R {
+        let names = self.names.read().unwrap();
+        f(&names.0[id as usize])
+    }
+    fn with_two_names<R>(&self, x: u32, y: u32, f: impl FnOnce(&str, &str) -> R) -> R {
+        let names = self.names.read().unwrap();
+        f(&names.0[x as usize], &names.0[y as usize])
+    }
+    fn selector(&self, name: &str, descriptor: &str) -> u64 {
+        {
+            let map = self.selectors.read().unwrap();
+            if let Some(&s) = map.get(name).and_then(|m| m.get(descriptor)) {
+                return s;
+            }
+        }
+        let s = selector(name, descriptor);
+        let mut map = self.selectors.write().unwrap();
+        *map.entry(name.to_string())
+            .or_default()
+            .entry(descriptor.to_string())
+            .or_insert(s)
+    }
+    fn signature(&self, descriptor: &str) -> Result<Arc<Signature>> {
+        {
+            let sigs = self.signatures.read().unwrap();
+            if let Some(cached) = sigs.get(descriptor) {
+                return cached.clone().map_err(|e| anyhow!(e));
+            }
+        }
+        let computed = parse_signature(descriptor)
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+        let mut sigs = self.signatures.write().unwrap();
+        let entry = sigs
+            .entry(descriptor.to_string())
+            .or_insert(computed)
+            .clone();
+        entry.map_err(|e| anyhow!(e))
+    }
+    fn structural_problem_cached(&self, class: &'a ClassFile) -> Option<String> {
+        {
+            let cache = self.structural.read().unwrap();
+            if let Some(res) = cache.get(class.name.as_str()) {
+                return res.clone();
+            }
+        }
+        let computed = if let Err(e) = self.chain(&class.name) {
+            Some(format!("class hierarchy incomplete: {e}"))
+        } else if let Err(e) = self.superinterfaces_arc(&class.name) {
+            Some(format!("class hierarchy incomplete: {e}"))
+        } else {
+            None
+        };
+        let mut cache = self.structural.write().unwrap();
+        cache.entry(class.name.as_str()).or_insert(computed).clone()
     }
     /// The class and its superclasses up to (not including) java/lang/Object; fails if a link is outside the unit.
-    fn chain(&self, name: &str) -> Result<Rc<Vec<&'a ClassFile>>> {
-        if let Some(known) = self.chains.borrow().get(name) {
-            return known.clone().map_err(|e| anyhow!(e));
+    fn chain(&self, name: &str) -> Result<Arc<Vec<&'a ClassFile>>> {
+        {
+            let chains = self.chains.read().unwrap();
+            if let Some(known) = chains.get(name) {
+                return known.clone().map_err(|e| anyhow!(e));
+            }
         }
         let computed = self
             .compute_chain(name)
-            .map(Rc::new)
+            .map(Arc::new)
             .map_err(|e| e.to_string());
-        self.chains
-            .borrow_mut()
-            .insert(name.to_string(), computed.clone());
-        computed.map_err(|e| anyhow!(e))
+        let mut chains = self.chains.write().unwrap();
+        let entry = chains.entry(name.to_string()).or_insert(computed).clone();
+        entry.map_err(|e| anyhow!(e))
     }
     /// Walk superclass links without memoization.
     fn compute_chain(&self, name: &str) -> Result<Vec<&'a ClassFile>> {
         let mut out = Vec::new();
-        let mut current = name.to_string();
+        let mut current = name;
         while current != OBJECT {
-            let Some(class) = self.get(&current) else {
+            let Some(class) = self.get(current) else {
                 bail!("{current} is not in the compilation unit");
             };
             if out.len() > 10_000 {
                 bail!("superclass cycle at {current}");
             }
             out.push(class);
-            current = class
-                .super_name
-                .clone()
-                .unwrap_or_else(|| OBJECT.to_string());
+            current = class.super_name.as_deref().unwrap_or(OBJECT);
         }
         Ok(out)
     }
@@ -1963,25 +2090,45 @@ impl<'a> Unit<'a> {
         self.get(name)
             .is_some_and(|c| c.access & ACC_INTERFACE != 0)
     }
-    /// All superinterfaces of a class, direct and indirect, in declaration order without repeats.
-    fn superinterfaces(&self, name: &str) -> Result<Vec<&'a ClassFile>> {
-        let mut out: Vec<&ClassFile> = Vec::new();
-        let mut pending: Vec<String> = Vec::new();
+    /// Memoized superinterfaces list shared via `Arc`.
+    fn superinterfaces_arc(&self, name: &str) -> Result<Arc<Vec<&'a ClassFile>>> {
+        {
+            let ifaces = self.superinterfaces.read().unwrap();
+            if let Some(known) = ifaces.get(name) {
+                return known.clone().map_err(|e| anyhow!(e));
+            }
+        }
+        let computed = self
+            .compute_superinterfaces(name)
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+        let mut ifaces = self.superinterfaces.write().unwrap();
+        let entry = ifaces.entry(name.to_string()).or_insert(computed).clone();
+        entry.map_err(|e| anyhow!(e))
+    }
+    fn compute_superinterfaces(&self, name: &str) -> Result<Vec<&'a ClassFile>> {
+        let mut out: Vec<&'a ClassFile> = Vec::new();
+        let mut seen: HashSet<&'a str> = HashSet::new();
+        let mut pending: Vec<&'a str> = Vec::new();
         for class in self.chain(name)?.iter() {
-            pending.extend(class.interfaces.iter().cloned());
+            pending.extend(class.interfaces.iter().map(String::as_str));
         }
         let mut i = 0;
         while i < pending.len() {
-            let Some(iface) = self.get(&pending[i]) else {
+            let Some(iface) = self.get(pending[i]) else {
                 bail!("interface {} is not in the compilation unit", pending[i]);
             };
-            if !out.iter().any(|c| c.name == iface.name) {
+            if seen.insert(iface.name.as_str()) {
                 out.push(iface);
-                pending.extend(iface.interfaces.iter().cloned());
+                pending.extend(iface.interfaces.iter().map(String::as_str));
             }
             i += 1;
         }
         Ok(out)
+    }
+    /// All superinterfaces of a class, direct and indirect, in declaration order without repeats.
+    fn superinterfaces(&self, name: &str) -> Result<Vec<&'a ClassFile>> {
+        self.superinterfaces_arc(name).map(|v| (*v).clone())
     }
     /// JVMS 5.4.3.3: find a method in the class or its superclasses.
     fn resolve_method(
@@ -2034,7 +2181,7 @@ impl<'a> Unit<'a> {
             if let Some(f) = find(class) {
                 return Ok((class, f));
             }
-            for iface in self.superinterfaces(&class.name)? {
+            for &iface in self.superinterfaces_arc(&class.name)?.iter() {
                 if let Some(f) = find(iface) {
                     return Ok((iface, f));
                 }
@@ -2052,7 +2199,8 @@ impl<'a> Unit<'a> {
         let first = self
             .get(iface)
             .ok_or_else(|| anyhow!("{iface} is not in the compilation unit"))?;
-        for class in std::iter::once(first).chain(self.superinterfaces(iface)?) {
+        for class in std::iter::once(first).chain(self.superinterfaces_arc(iface)?.iter().copied())
+        {
             if let Some(m) = class.methods.iter().find(|m| {
                 m.name == name && m.descriptor == descriptor && m.access & ACC_STATIC == 0
             }) {
@@ -2065,18 +2213,21 @@ impl<'a> Unit<'a> {
     }
     /// Interface dispatch table of a class: for every method of every superinterface, the
     /// implementation selected per JVMS 5.4.6, sorted by selector.
-    fn itable(&self, name: &str) -> Rc<Vec<ItableEntry>> {
-        if let Some(t) = self.itables.borrow().get(name) {
-            return t.clone();
+    fn itable(&self, name: &str) -> Arc<Vec<ItableEntry>> {
+        {
+            let itables = self.itables.read().unwrap();
+            if let Some(t) = itables.get(name) {
+                return t.clone();
+            }
         }
         let mut entries: Vec<ItableEntry> = Vec::new();
-        if let (Ok(chain), Ok(ifaces)) = (self.chain(name), self.superinterfaces(name)) {
-            let mut seen = BTreeSet::new();
-            for iface in &ifaces {
+        if let (Ok(chain), Ok(ifaces)) = (self.chain(name), self.superinterfaces_arc(name)) {
+            let mut seen: HashSet<(&str, &str)> = HashSet::new();
+            for iface in ifaces.iter() {
                 for m in iface.methods.iter().filter(|m| {
                     m.access & (ACC_STATIC | ACC_PRIVATE) == 0 && !m.name.starts_with('<')
                 }) {
-                    if !seen.insert((m.name.clone(), m.descriptor.clone())) {
+                    if !seen.insert((m.name.as_str(), m.descriptor.as_str())) {
                         continue;
                     }
                     // 1. A method in the class or a superclass wins (abstract ones throw when called).
@@ -2117,9 +2268,9 @@ impl<'a> Unit<'a> {
                                 .filter(|c| {
                                     !candidates.iter().any(|other| {
                                         other.name != c.name
-                                            && self.superinterfaces(&other.name).is_ok_and(|sup| {
-                                                sup.iter().any(|s| s.name == c.name)
-                                            })
+                                            && self.superinterfaces_arc(&other.name).is_ok_and(
+                                                |sup| sup.iter().any(|s| s.name == c.name),
+                                            )
                                     })
                                 })
                                 .collect();
@@ -2135,7 +2286,7 @@ impl<'a> Unit<'a> {
                         }
                     };
                     entries.push(ItableEntry {
-                        selector: selector(&m.name, &m.descriptor),
+                        selector: self.selector(&m.name, &m.descriptor),
                         name: m.name.clone(),
                         descriptor: m.descriptor.clone(),
                         target,
@@ -2152,11 +2303,9 @@ impl<'a> Unit<'a> {
                 pair[1].name
             );
         }
-        let entries = Rc::new(entries);
-        self.itables
-            .borrow_mut()
-            .insert(name.to_string(), entries.clone());
-        entries
+        let entries = Arc::new(entries);
+        let mut itables = self.itables.write().unwrap();
+        itables.entry(name.to_string()).or_insert(entries).clone()
     }
     /// Whether a method declared in `owner` with `access` is overridden by a method in class `by` (JVMS 5.4.5).
     fn overrides(owner: &str, access: u16, by: &str) -> bool {
@@ -2165,9 +2314,12 @@ impl<'a> Unit<'a> {
             && (access & PUBLIC_OR_PROTECTED != 0 || package(owner) == package(by))
     }
     /// Vtable of a class: the superclass's slots (overridden where applicable), then new methods.
-    fn vtable(&self, name: &str) -> Result<Rc<Vec<Slot>>> {
-        if let Some(v) = self.vtables.borrow().get(name) {
-            return Ok(v.clone());
+    fn vtable(&self, name: &str) -> Result<Arc<Vec<Slot>>> {
+        {
+            let vtables = self.vtables.read().unwrap();
+            if let Some(v) = vtables.get(name) {
+                return Ok(v.clone());
+            }
         }
         let class = self
             .get(name)
@@ -2211,11 +2363,9 @@ impl<'a> Unit<'a> {
                 }
             }
         }
-        let slots = Rc::new(slots);
-        self.vtables
-            .borrow_mut()
-            .insert(name.to_string(), slots.clone());
-        Ok(slots)
+        let slots = Arc::new(slots);
+        let mut vtables = self.vtables.write().unwrap();
+        Ok(vtables.entry(name.to_string()).or_insert(slots).clone())
     }
 }
 
@@ -2339,7 +2489,7 @@ impl Cx<'_, '_> {
     fn assignable(&self, v: VType, target: &str) -> bool {
         match v {
             VType::Null => true,
-            VType::Obj(id) => self.name_assignable(&self.unit.name(id), target),
+            VType::Obj(id) => self.unit.with_name(id, |n| self.name_assignable(n, target)),
             _ => false,
         }
     }
@@ -2371,7 +2521,9 @@ impl Cx<'_, '_> {
             (a, b) if a == b => Some(a),
             (VType::Null, o @ VType::Obj(_)) | (o @ VType::Obj(_), VType::Null) => Some(o),
             (VType::Obj(x), VType::Obj(y)) => {
-                let common = self.merge_names(&self.unit.name(x), &self.unit.name(y), 0);
+                let common = self
+                    .unit
+                    .with_two_names(x, y, |nx, ny| self.merge_names(nx, ny, 0));
                 Some(VType::Obj(self.unit.intern(&common)))
             }
             _ => None,
@@ -2521,7 +2673,7 @@ struct Step {
 }
 
 /// Verify one instruction against the frame and report its control flow and dependencies.
-fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) -> Result<Step> {
+fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, &str>) -> Result<Step> {
     let pc = insn.pc;
     let unit = cx.unit;
     let this = &cx.class.name;
@@ -2535,23 +2687,29 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             class,
             name,
             descriptor,
-        } if outside(class) => Some((class.clone(), name.clone(), descriptor.clone(), false, None)),
+        } if outside(class) => Some((
+            class.as_str(),
+            name.as_str(),
+            descriptor.as_str(),
+            false,
+            None,
+        )),
         Op::InvokeVirtual(m) | Op::InvokeInterface(m) if outside(&m.class) => Some((
-            m.class.clone(),
-            m.name.clone(),
-            m.descriptor.clone(),
+            m.class.as_str(),
+            m.name.as_str(),
+            m.descriptor.as_str(),
             true,
             None,
         )),
         Op::InvokeSpecial(m) if outside(&m.class) => {
             if m.name == "<init>" {
-                let s = parse_signature(&m.descriptor)?;
+                let s = unit.signature(&m.descriptor)?;
                 for p in s.params.iter().rev() {
                     frame.pop_ty(cx, p, pc)?;
                 }
                 let parent = cx.class.super_name.as_deref().unwrap_or(OBJECT);
                 match frame.pop(pc)? {
-                    v @ VType::Uninit(at) if news.get(&at) == Some(&m.class) => {
+                    v @ VType::Uninit(at) if news.get(&at).copied() == Some(m.class.as_str()) => {
                         frame.initialize(v, VType::Obj(unit.intern(&m.class)));
                     }
                     VType::UninitThis
@@ -2576,9 +2734,9 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 return Ok(out);
             }
             Some((
-                m.class.clone(),
-                m.name.clone(),
-                m.descriptor.clone(),
+                m.class.as_str(),
+                m.name.as_str(),
+                m.descriptor.as_str(),
                 true,
                 None,
             ))
@@ -2588,9 +2746,9 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             name,
             descriptor,
         } if outside(class) => Some((
-            class.clone(),
-            name.clone(),
-            descriptor.clone(),
+            class.as_str(),
+            name.as_str(),
+            descriptor.as_str(),
             false,
             Some(true),
         )),
@@ -2599,23 +2757,23 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             name,
             descriptor,
         } if outside(class) => Some((
-            class.clone(),
-            name.clone(),
-            descriptor.clone(),
+            class.as_str(),
+            name.as_str(),
+            descriptor.as_str(),
             false,
             Some(false),
         )),
         Op::GetField(m) if outside(&m.class) => Some((
-            m.class.clone(),
-            m.name.clone(),
-            m.descriptor.clone(),
+            m.class.as_str(),
+            m.name.as_str(),
+            m.descriptor.as_str(),
             true,
             Some(true),
         )),
         Op::PutField(m) if outside(&m.class) => Some((
-            m.class.clone(),
-            m.name.clone(),
-            m.descriptor.clone(),
+            m.class.as_str(),
+            m.name.as_str(),
+            m.descriptor.as_str(),
             true,
             Some(false),
         )),
@@ -2624,7 +2782,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
     if let Some((class, name, descriptor, receiver, field)) = unresolved {
         match field {
             None => {
-                let s = parse_signature(&descriptor)?;
+                let s = unit.signature(descriptor)?;
                 for p in s.params.iter().rev() {
                     frame.pop_ty(cx, p, pc)?;
                 }
@@ -2636,7 +2794,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 }
             }
             Some(is_get) => {
-                let ty = parse_type(&descriptor, &name)?;
+                let ty = parse_type(descriptor, name)?;
                 if !is_get {
                     frame.pop_ty(cx, &ty, pc)?;
                 }
@@ -2648,8 +2806,8 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 }
             }
         }
-        out.resolved = Some(if unit.absent(&class) {
-            Resolved::Absent(class.clone())
+        out.resolved = Some(if unit.absent(class) {
+            Resolved::Absent(class.to_string())
         } else {
             Resolved::Unresolved(format!(
                 "{class}.{name}{descriptor}: {class} is not in the compilation unit"
@@ -2824,7 +2982,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             if target.access & ACC_STATIC == 0 {
                 bail!("pc {pc}: invokestatic of instance method {name}");
             }
-            let s = parse_signature(descriptor)?;
+            let s = unit.signature(descriptor)?;
             for p in s.params.iter().rev() {
                 frame.pop_ty(cx, p, pc)?;
             }
@@ -2929,7 +3087,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
         Op::ArrayLength => {
             let array = frame.pop(pc)?;
             if !matches!(array, VType::Null)
-                && !matches!(array, VType::Obj(id) if unit.name(id).starts_with('['))
+                && !matches!(array, VType::Obj(id) if unit.with_name(id, |n| n.starts_with('[')))
             {
                 bail!("pc {pc}: arraylength of {}", cx.describe(array));
             }
@@ -2948,10 +3106,13 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             }
             frame.pop_prim(Kind::I, pc)?;
             let array = frame.pop(pc)?;
+            let mut elem_to_intern: Option<String> = None;
             let element = match array {
                 VType::Null => None,
-                VType::Obj(id) if unit.name(id).starts_with('[') => {
-                    let name = unit.name(id);
+                VType::Obj(id) => unit.with_name(id, |name| {
+                    if !name.starts_with('[') {
+                        bail!("pc {pc}: array access on {name}");
+                    }
                     let e = name.as_bytes()[1] as char;
                     let fits = match *family {
                         'A' => matches!(e, 'L' | '['),
@@ -2961,16 +3122,17 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                     if !fits {
                         bail!("pc {pc}: element access of kind {family} on {name}");
                     }
-                    Some(e)
-                }
+                    if !storing && *family == 'A' {
+                        elem_to_intern = element_class(name);
+                    }
+                    Ok(Some(e))
+                })?,
                 other => bail!("pc {pc}: array access on {}", cx.describe(other)),
             };
             if !storing {
                 let pushed = match (*family, &array) {
                     ('A', VType::Null) => VType::Null,
-                    ('A', VType::Obj(id)) => {
-                        VType::Obj(unit.intern(&element_class(&unit.name(*id)).unwrap()))
-                    }
+                    ('A', VType::Obj(_)) => VType::Obj(unit.intern(&elem_to_intern.unwrap())),
                     ('B' | 'C' | 'S', _) => VType::I,
                     (f, _) => VType::prim(kind_of(f).unwrap()),
                 };
@@ -3060,7 +3222,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             if target.access & ACC_STATIC != 0 || m.name.starts_with('<') {
                 bail!("pc {pc}: invokevirtual of {} on an array", m.name);
             }
-            let s = parse_signature(&m.descriptor)?;
+            let s = unit.signature(&m.descriptor)?;
             for p in s.params.iter().rev() {
                 frame.pop_ty(cx, p, pc)?;
             }
@@ -3074,7 +3236,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
         }
         Op::InvokeVirtual(m) if m.class == VAR_HANDLE && var_handle_mode(&m.name).is_some() => {
             // Signature polymorphic: the call site's descriptor is the access's type.
-            let s = parse_signature(&m.descriptor)?;
+            let s = unit.signature(&m.descriptor)?;
             for p in s.params.iter().rev() {
                 frame.pop_ty(cx, p, pc)?;
             }
@@ -3093,8 +3255,8 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 Ok(found) => found,
                 // A default method inherited from a superinterface: dispatch like invokeinterface.
                 Err(e) => {
-                    let found = unit.superinterfaces(&m.class).ok().and_then(|ifaces| {
-                        ifaces.into_iter().find_map(|i| {
+                    let found = unit.superinterfaces_arc(&m.class).ok().and_then(|ifaces| {
+                        ifaces.iter().copied().find_map(|i| {
                             i.methods
                                 .iter()
                                 .find(|x| {
@@ -3108,7 +3270,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                     let Some((iface, _)) = found else {
                         return Err(e);
                     };
-                    let s = parse_signature(&m.descriptor)?;
+                    let s = unit.signature(&m.descriptor)?;
                     for p in s.params.iter().rev() {
                         frame.pop_ty(cx, p, pc)?;
                     }
@@ -3118,7 +3280,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                     }
                     let target = (iface.name.clone(), m.name.clone(), m.descriptor.clone());
                     out.resolved = Some(Resolved::Call(CallKind::Interface {
-                        selector: selector(&m.name, &m.descriptor),
+                        selector: unit.selector(&m.name, &m.descriptor),
                         target,
                     }));
                     return Ok(out);
@@ -3127,7 +3289,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             if target.access & ACC_STATIC != 0 {
                 bail!("pc {pc}: invokevirtual of static method {}", m.name);
             }
-            let s = parse_signature(&m.descriptor)?;
+            let s = unit.signature(&m.descriptor)?;
             for p in s.params.iter().rev() {
                 frame.pop_ty(cx, p, pc)?;
             }
@@ -3184,7 +3346,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                     })
                 })
             });
-            let s = parse_signature(&m.descriptor)?;
+            let s = unit.signature(&m.descriptor)?;
             if let Some(Some(target)) = object_method {
                 for p in s.params.iter().rev() {
                     frame.pop_ty(cx, p, pc)?;
@@ -3218,7 +3380,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
             // No dependency on implementations: uncompiled ones are stubs in the receiver's table.
             let target = (declaring.name.clone(), m.name.clone(), m.descriptor.clone());
             out.resolved = Some(Resolved::Call(CallKind::Interface {
-                selector: selector(&m.name, &m.descriptor),
+                selector: unit.selector(&m.name, &m.descriptor),
                 target,
             }));
         }
@@ -3232,7 +3394,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                     m.name
                 );
             }
-            let s = parse_signature(&m.descriptor)?;
+            let s = unit.signature(&m.descriptor)?;
             for p in s.params.iter().rev() {
                 frame.pop_ty(cx, p, pc)?;
             }
@@ -3252,7 +3414,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                     VType::UninitThis if parent == OBJECT => {
                         frame.initialize(VType::UninitThis, VType::Obj(unit.intern(this)));
                     }
-                    v @ VType::Uninit(at) if news.get(&at).map(String::as_str) == Some(OBJECT) => {
+                    v @ VType::Uninit(at) if news.get(&at).copied() == Some(OBJECT) => {
                         frame.initialize(v, VType::Obj(unit.intern(OBJECT)));
                     }
                     other => bail!("pc {pc}: Object.<init> called on {}", cx.describe(other)),
@@ -3260,7 +3422,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 out.resolved = Some(Resolved::Call(CallKind::ObjectInit));
                 return Ok(out);
             }
-            let s = parse_signature(&m.descriptor)?;
+            let s = unit.signature(&m.descriptor)?;
             for p in s.params.iter().rev() {
                 frame.pop_ty(cx, p, pc)?;
             }
@@ -3277,7 +3439,7 @@ fn step(insn: &Insn, frame: &mut Frame, cx: &Cx, news: &HashMap<u32, String>) ->
                 }
                 match frame.pop(pc)? {
                     // The constructor must belong to exactly the class that `new` created.
-                    v @ VType::Uninit(at) if news.get(&at) == Some(&m.class) => {
+                    v @ VType::Uninit(at) if news.get(&at).copied() == Some(m.class.as_str()) => {
                         frame.initialize(v, VType::Obj(unit.intern(&m.class)));
                     }
                     VType::UninitThis
@@ -3369,10 +3531,10 @@ fn analyze<'a>(
         Err(DecodeError::Malformed(e)) => return Err(format!("malformed bytecode: {e:#}")),
     };
     // Which class each `new` creates, so constructor calls can be matched to it.
-    let news: HashMap<u32, String> = insns
+    let news: HashMap<u32, &str> = insns
         .iter()
         .filter_map(|i| match &i.op {
-            Op::New { class } => Some((i.pc, class.clone())),
+            Op::New { class } => Some((i.pc, class.as_str())),
             _ => None,
         })
         .collect();
@@ -3412,8 +3574,8 @@ fn analyze<'a>(
         .enumerate()
         .map(|(i, insn)| (insn.pc, i))
         .collect();
-    // Exception handlers: (start, end, catch). Catch classes must be Throwables in the unit.
-    let mut handlers: Vec<(u32, u32, Catch)> = Vec::new();
+    // Exception handlers: (start, end, catch, interned thrown id). Catch classes must be Throwables in the unit.
+    let mut handlers: Vec<(u32, u32, Catch, u32)> = Vec::new();
     for h in &code.handlers {
         let class = if h.catch_type == 0 {
             None
@@ -3432,6 +3594,7 @@ fn analyze<'a>(
         if !index.contains_key(&(h.handler_pc as u32)) {
             return Err(format!("handler pc {} is not an instruction", h.handler_pc));
         }
+        let thrown_id = unit.intern(class.as_deref().unwrap_or(THROWABLE));
         handlers.push((
             h.start_pc as u32,
             h.end_pc as u32,
@@ -3439,6 +3602,7 @@ fn analyze<'a>(
                 class,
                 handler: h.handler_pc as u32,
             },
+            thrown_id,
         ));
     }
     let mut frames: Vec<Option<Frame>> = vec![None; insns.len()];
@@ -3467,24 +3631,39 @@ fn analyze<'a>(
         frames[i] = Some(frame.clone());
         // Every instruction in a try range may transfer to its handlers with its incoming locals
         // and only the exception on the stack.
-        for (start, end, catch) in &handlers {
+        let mut checked_uninit = false;
+        for (start, end, catch, thrown_id) in &handlers {
             if *start <= pc && pc < *end {
-                if frame
-                    .locals
-                    .iter()
-                    .any(|v| matches!(v, VType::UninitThis | VType::Uninit(_)))
-                {
-                    return Err(format!(
-                        "pc {pc}: try range covers an object before its constructor ran"
-                    ));
+                if !checked_uninit {
+                    if frame
+                        .locals
+                        .iter()
+                        .any(|v| matches!(v, VType::UninitThis | VType::Uninit(_)))
+                    {
+                        return Err(format!(
+                            "pc {pc}: try range covers an object before its constructor ran"
+                        ));
+                    }
+                    checked_uninit = true;
                 }
-                let thrown = catch.class.as_deref().unwrap_or(THROWABLE);
+                targets.insert(catch.handler);
+                let h_idx = index[&catch.handler];
+                if let Some(existing) = &frames[h_idx]
+                    && existing.stack.len() == 1
+                    && existing.stack[0] == VType::Obj(*thrown_id)
+                    && existing
+                        .locals
+                        .iter()
+                        .zip(&frame.locals)
+                        .all(|(e, l)| *e == *l || *e == VType::Top)
+                {
+                    continue;
+                }
                 let entry = Frame {
-                    stack: vec![VType::Obj(unit.intern(thrown))],
+                    stack: vec![VType::Obj(*thrown_id)],
                     locals: frame.locals.clone(),
                 };
-                targets.insert(catch.handler);
-                work.push((index[&catch.handler], entry));
+                work.push((h_idx, entry));
             }
         }
         let mut next = frame;
@@ -3521,8 +3700,8 @@ fn analyze<'a>(
     for insn in &insns {
         let chain: Vec<Catch> = handlers
             .iter()
-            .filter(|(start, end, _)| *start <= insn.pc && insn.pc < *end)
-            .map(|(_, _, c)| c.clone())
+            .filter(|(start, end, _, _)| *start <= insn.pc && insn.pc < *end)
+            .map(|(_, _, c, _)| c.clone())
             .collect();
         if chain.is_empty() {
             continue;
@@ -3896,6 +4075,12 @@ fn caller_sensitive(unit: &Unit, op: &Op) -> bool {
         }
         _ => return false,
     };
+    if !unit
+        .caller_sensitive_sigs
+        .contains(&(name.as_str(), descriptor.as_str()))
+    {
+        return false;
+    }
     // getCallerClass is itself @CallerSensitive, but it reads the caller; it must not replace it.
     if class == "jdk/internal/reflect/Reflection" && name == "getCallerClass" {
         return false;
@@ -3904,10 +4089,12 @@ fn caller_sensitive(unit: &Unit, op: &Op) -> bool {
         c.methods
             .iter()
             .find(|m| &m.name == name && &m.descriptor == descriptor)
-            .map(|m| {
-                m.annotations
-                    .iter()
-                    .any(|a| a == "Ljdk/internal/reflect/CallerSensitive;")
+            .map(|_| {
+                unit.caller_sensitive.contains(&(
+                    c.name.as_str(),
+                    name.as_str(),
+                    descriptor.as_str(),
+                ))
             })
     };
     if let Some(found) = unit.get(class).and_then(declared) {
@@ -3970,6 +4157,7 @@ fn emit_method(
     method: &Member,
     sig: &Signature,
     a: &Analyzed,
+    literal_ids: &HashMap<Vec<u16>, u32>,
 ) {
     let code = method.code.as_ref().unwrap();
     let ret_default = if sig.ret.code == 'V' {
@@ -3984,13 +4172,18 @@ fn emit_method(
     );
     let synchronized = method.access & ACC_SYNCHRONIZED != 0;
     if synchronized {
-        // The body gets a private name; the public symbol is the locking wrapper below.
+        // The body gets an always-inlined helper; the public symbol is the locking wrapper below,
+        // so -O2 never leaves __sync un-inlined and missing from jabs_frames[].
         let body = format!(
             "{}__sync",
             symbol(&class.name, &method.name, &method.descriptor)
         );
         let params = c_params(method.access & ACC_STATIC != 0, sig, true);
-        let _ = writeln!(out, "static {} {body}({params}) {{", c_type(sig.ret.code));
+        let _ = writeln!(
+            out,
+            "JABS_ALWAYS_INLINE {} {body}({params}) {{",
+            c_type(sig.ret.code)
+        );
     } else {
         let _ = writeln!(out, "{} {{", prototype(&class.name, method, sig));
     }
@@ -4026,7 +4219,7 @@ fn emit_method(
     // Emit a call: arguments (and the receiver, for instance methods) come off the stack.
     let call = |kind: &CallKind, descriptor: &str, d: usize, exit: &str| -> String {
         let npe = throw("java/lang/NullPointerException", exit);
-        let callee = parse_signature(descriptor).unwrap();
+        let callee = unit.signature(descriptor).unwrap();
         let base = d - callee.params.len();
         let (key, receiver) = match kind {
             CallKind::Direct(key) => {
@@ -4391,8 +4584,8 @@ fn emit_method(
                 class_record(target)
             ),
             Op::LdcString(units) => format!(
-                "s[{d}].a = {}(); if (!s[{d}].a) {exit}",
-                literal_symbol(units)
+                "s[{d}].a = jabs_literal({}u); if (!s[{d}].a) {exit}",
+                literal_ids[units]
             ),
             Op::LdcClass(name) => format!(
                 "s[{d}].a = jabs_class_object(\"{}\"); if (!s[{d}].a) {exit}",
@@ -4696,114 +4889,97 @@ fn constant_string(class: &ClassFile, field: &Member) -> Option<Vec<u16>> {
     }
 }
 
-/// C name of the function returning the (interned) String object for a literal.
-fn literal_symbol(units: &[u16]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for u in units {
-        hasher.update(u.to_le_bytes());
-    }
-    format!("jl_{:x}", hasher.finalize())[..27].to_string()
-}
-
-/// Emit one function per distinct string literal. Each builds its String once (Latin-1 when every
-/// char fits in a byte, else UTF-16 in the target's byte order, as the JDK's compact strings do)
-/// and returns the same object afterwards, so equal literals are the same object everywhere.
-fn emit_literals(out: &mut String, literals: &BTreeSet<Vec<u16>>, intern_table: bool) {
+/// Emit a compact string-literal table (`jabs_literals[]`), atomic cache (`jabs_literal_cache[]`),
+/// and slow-path constructor (`jabs_literal_get`) shared by all compiled methods and static fields.
+fn emit_literals(out: &mut String, literals: &[Vec<u16>], intern_table: bool) {
     if literals.is_empty() {
         return;
     }
     let string = object_struct(STRING);
     let record = class_record(STRING);
+    let mut latin1_bytes: Vec<u8> = Vec::new();
+    let mut utf16_units: Vec<u16> = Vec::new();
+    let mut descs: Vec<(usize, usize, u8)> = Vec::with_capacity(literals.len());
     for units in literals {
-        let latin1 = units.iter().all(|&u| u <= 0xFF);
-        let bytes = |little: bool| -> String {
-            let mut b: Vec<String> = Vec::new();
-            for &u in units {
-                if latin1 {
-                    b.push(format!("{}", u as u8));
-                } else if little {
-                    b.extend([format!("{}", u & 0xFF), format!("{}", u >> 8)]);
-                } else {
-                    b.extend([format!("{}", u >> 8), format!("{}", u & 0xFF)]);
-                }
-            }
-            if b.is_empty() {
-                "0".to_string()
-            } else {
-                b.join(",")
-            }
-        };
-        let length = if latin1 { units.len() } else { units.len() * 2 };
-        let name = literal_symbol(units);
-        let _ = writeln!(out, "jabs_object *{name}(void) {{");
-        // Threads may build the same literal at once; the first one stored wins, so every thread
-        // gets the same object.
-        let _ = writeln!(out, "    static _Atomic(jabs_object *) interned;");
-        let _ = writeln!(
-            out,
-            "    jabs_object *cached = atomic_load_explicit(&interned, memory_order_acquire);"
-        );
-        let _ = writeln!(out, "    if (cached) return cached;");
-        let _ = writeln!(out, "    if ({}() != 0) return NULL;", init_symbol(STRING));
-        if latin1 {
-            let _ = writeln!(
-                out,
-                "    static const unsigned char bytes[] = {{ {} }};",
-                bytes(true)
-            );
+        if units.iter().all(|&u| u <= 0xFF) {
+            let offset = latin1_bytes.len();
+            latin1_bytes.extend(units.iter().map(|&u| u as u8));
+            descs.push((offset, units.len(), 0));
         } else {
-            let _ = writeln!(
-                out,
-                "#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__"
-            );
-            let _ = writeln!(
-                out,
-                "    static const unsigned char bytes[] = {{ {} }};",
-                bytes(false)
-            );
-            let _ = writeln!(out, "#else");
-            let _ = writeln!(
-                out,
-                "    static const unsigned char bytes[] = {{ {} }};",
-                bytes(true)
-            );
-            let _ = writeln!(out, "#endif");
+            let offset = utf16_units.len();
+            utf16_units.extend_from_slice(units);
+            descs.push((offset, units.len() * 2, 1));
         }
-        let _ = writeln!(
-            out,
-            "    jabs_object *value = jabs_new_array({length}, 1, JABS_COMPONENT_PRIMITIVE, NULL, \"[B\", NULL);"
-        );
-        let _ = writeln!(out, "    if (!value) return NULL;");
-        let _ = writeln!(
-            out,
-            "    memcpy(jabs_array_data((jabs_array *)value), bytes, {length});"
-        );
-        let _ = writeln!(out, "    jabs_object *s = jabs_new(&{record});");
-        let _ = writeln!(out, "    if (!s) return NULL;");
-        let _ = writeln!(
-            out,
-            "    (({string} *)s)->{} = value;",
-            instance_field("value")
-        );
-        let _ = writeln!(
-            out,
-            "    (({string} *)s)->{} = {};",
-            instance_field("coder"),
-            if latin1 { 0 } else { 1 }
-        );
-        // Literals and String.intern share one table, so equal contents give the same object.
-        if intern_table {
-            let _ = writeln!(out, "    s = jabs_string_intern(s);");
-            let _ = writeln!(out, "    if (!s) return NULL;");
-        }
-        let _ = writeln!(out, "    jabs_object *expected = NULL;");
-        let _ = writeln!(
-            out,
-            "    if (!atomic_compare_exchange_strong_explicit(&interned, &expected, s, memory_order_acq_rel, memory_order_acquire)) return expected;"
-        );
-        let _ = writeln!(out, "    return s;\n}}");
     }
+    out.push_str("static const unsigned char jabs_lit_latin1[] = {\n");
+    if latin1_bytes.is_empty() {
+        out.push_str("    0\n");
+    } else {
+        for chunk in latin1_bytes.chunks(24) {
+            out.push_str("   ");
+            for b in chunk {
+                let _ = write!(out, " {b},");
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str("};\nstatic const uint16_t jabs_lit_utf16[] = {\n");
+    if utf16_units.is_empty() {
+        out.push_str("    0\n");
+    } else {
+        for chunk in utf16_units.chunks(16) {
+            out.push_str("   ");
+            for u in chunk {
+                let _ = write!(out, " 0x{u:04x}u,");
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "};\ntypedef struct { uint32_t offset; uint32_t byte_len; uint8_t coder; } jabs_literal_desc;\nstatic const jabs_literal_desc jabs_literals[] = {\n",
+    );
+    for (offset, byte_len, coder) in &descs {
+        let _ = writeln!(out, "    {{ {offset}u, {byte_len}u, {coder} }},");
+    }
+    let _ = writeln!(
+        out,
+        "}};\n_Atomic(jabs_object *) jabs_literal_cache[{count}];",
+        count = literals.len()
+    );
+    let intern_line = if intern_table {
+        "    s = jabs_string_intern(s);\n    if (!s) return NULL;\n"
+    } else {
+        ""
+    };
+    let _ = write!(
+        out,
+        r#"
+jabs_object *jabs_literal_get(uint32_t id) {{
+    jabs_object *cached = atomic_load_explicit(&jabs_literal_cache[id], memory_order_acquire);
+    if (cached) return cached;
+    if ({init}() != 0) return NULL;
+    const jabs_literal_desc *d = &jabs_literals[id];
+    jabs_object *value = jabs_new_array((int32_t)d->byte_len, 1, JABS_COMPONENT_PRIMITIVE, NULL, "[B", NULL);
+    if (!value) return NULL;
+    if (d->byte_len > 0) {{
+        const void *src = d->coder == 0
+            ? (const void *)&jabs_lit_latin1[d->offset]
+            : (const void *)&jabs_lit_utf16[d->offset];
+        memcpy(jabs_array_data((jabs_array *)value), src, d->byte_len);
+    }}
+    jabs_object *s = jabs_new(&{record});
+    if (!s) return NULL;
+    (({string} *)s)->{value_field} = value;
+    (({string} *)s)->{coder_field} = d->coder;
+{intern_line}    jabs_object *expected = NULL;
+    if (!atomic_compare_exchange_strong_explicit(&jabs_literal_cache[id], &expected, s, memory_order_acq_rel, memory_order_acquire)) return expected;
+    return s;
+}}
+"#,
+        init = init_symbol(STRING),
+        value_field = instance_field("value"),
+        coder_field = instance_field("coder"),
+    );
     out.push('\n');
 }
 
@@ -4832,36 +5008,35 @@ fn error_stub_symbol(class: &str, name: &str, descriptor: &str) -> String {
     mangled("jxe_", &[class, name, descriptor])
 }
 
-/// Write one typed stub function with the given body.
-fn write_stub(out: &mut String, name: &str, sig: &Signature, body: &str) {
+/// Format one typed stub declaration + definition with external linkage (for sharding across `unit_0_stubs_*.c`).
+fn format_stub(name: &str, sig: &Signature, body: &str) -> (String, String) {
     let unused: String = (0..sig.params.len())
         .map(|i| format!(" (void)a{i};"))
         .collect();
-    let _ = writeln!(
-        out,
-        "static {} {name}({}) {{ (void)self;{unused} {body} }}",
-        c_type(sig.ret.code),
-        c_params(false, sig, true)
-    );
+    let ret_ty = c_type(sig.ret.code);
+    let params = c_params(false, sig, true);
+    let decl = format!("{ret_ty} {name}({params});\n");
+    let def = format!("{ret_ty} {name}({params}) {{ (void)self;{unused} {body} }}\n");
+    (decl, def)
 }
 
-/// Emit typed stubs for vtable and interface-table entries without live code. Abstract methods
-/// throw AbstractMethodError and ambiguous defaults IncompatibleClassChangeError, as Java does;
-/// anything else stops with a diagnostic (the JVM backend must run the profile until that
-/// method compiles). Stubs keep each class's code independent of which subclasses exist, so
+/// Collect typed stubs for vtable and interface-table entries without live code: `(decl, def)` pairs.
+/// Abstract methods throw AbstractMethodError and ambiguous defaults IncompatibleClassChangeError,
+/// as Java does; anything else stops with a diagnostic (the JVM backend must run the profile until
+/// that method compiles). Stubs keep each class's code independent of which subclasses exist, so
 /// per-class caching stays valid when mods add subclasses.
-fn emit_stubs(
-    out: &mut String,
+fn collect_stubs(
     unit: &Unit,
     recorded: &[&ClassFile],
     live: &dyn Fn(&str, &MethodKey) -> bool,
-) {
+) -> Vec<(String, String)> {
+    let mut stubs = Vec::new();
     let mut done = BTreeSet::new();
-    let mut stub_for = |out: &mut String, key: &MethodKey| {
+    let mut stub_for = |stubs: &mut Vec<(String, String)>, key: &MethodKey| {
         if !done.insert(key.clone()) {
             return;
         }
-        let Ok(sig) = parse_signature(&key.2) else {
+        let Ok(sig) = unit.signature(&key.2) else {
             return;
         };
         let is_abstract = unit
@@ -4898,25 +5073,23 @@ fn emit_stubs(
                 c_escape(&format!("{}.{}{}", key.0, key.1, key.2))
             )
         };
-        write_stub(out, &stub_symbol(key), &sig, &body);
+        stubs.push(format_stub(&stub_symbol(key), &sig, &body));
     };
     for class in recorded {
-        for slot in unit
-            .vtable(&class.name)
-            .map(|v| (*v).clone())
-            .unwrap_or_default()
-        {
-            let key = (
-                slot.owner.clone(),
-                slot.name.clone(),
-                slot.descriptor.clone(),
-            );
-            if !live(&class.name, &key) {
-                stub_for(out, &key);
+        if let Ok(vt) = unit.vtable(&class.name) {
+            for slot in vt.iter() {
+                let key = (
+                    slot.owner.clone(),
+                    slot.name.clone(),
+                    slot.descriptor.clone(),
+                );
+                if !live(&class.name, &key) {
+                    stub_for(&mut stubs, &key);
+                }
             }
         }
         for entry in unit.itable(&class.name).iter() {
-            let Ok(sig) = parse_signature(&entry.descriptor) else {
+            let Ok(sig) = unit.signature(&entry.descriptor) else {
                 continue;
             };
             let ret = if sig.ret.code == 'V' {
@@ -4925,7 +5098,7 @@ fn emit_stubs(
                 "return 0;"
             };
             match &entry.target {
-                ItableTarget::Impl(key) if !live(&class.name, key) => stub_for(out, key),
+                ItableTarget::Impl(key) if !live(&class.name, key) => stub_for(&mut stubs, key),
                 ItableTarget::Impl(_) => {}
                 ItableTarget::Abstract | ItableTarget::Ambiguous => {
                     let error = raise(if matches!(entry.target, ItableTarget::Abstract) {
@@ -4934,12 +5107,12 @@ fn emit_stubs(
                         "java/lang/IncompatibleClassChangeError"
                     });
                     let name = error_stub_symbol(&class.name, &entry.name, &entry.descriptor);
-                    write_stub(out, &name, &sig, &format!("{error} {ret}"));
+                    stubs.push(format_stub(&name, &sig, &format!("{error} {ret}")));
                 }
             }
         }
     }
-    out.push('\n');
+    stubs
 }
 
 /// Emit the runtime record of an interface (used by instanceof, checkcast and array stores).
@@ -4954,12 +5127,15 @@ fn emit_interface_record(
     recorded: &BTreeSet<&str>,
 ) {
     let supers: Vec<String> = unit
-        .superinterfaces(&iface.name)
-        .unwrap_or_default()
-        .iter()
-        .filter(|i| i.name != iface.name && recorded.contains(i.name.as_str()))
-        .map(|i| class_record(&i.name))
-        .collect();
+        .superinterfaces_arc(&iface.name)
+        .map(|ifaces| {
+            ifaces
+                .iter()
+                .filter(|i| i.name != iface.name && recorded.contains(i.name.as_str()))
+                .map(|i| class_record(&i.name))
+                .collect()
+        })
+        .unwrap_or_default();
     let (list, count) = if supers.is_empty() {
         ("NULL".to_string(), 0)
     } else {
@@ -5002,24 +5178,25 @@ fn emit_class_record(
                 "(void (*)(void)){}",
                 symbol(&key.0, &key.1, &key.2)
             ))
-        } else if parse_signature(&key.2).is_ok() {
+        } else if unit.signature(&key.2).is_ok() {
             Some(format!("(void (*)(void)){}", stub_symbol(key)))
         } else {
             None
         }
     };
     let vtable_name = mangled("jv_", &[&class.name]);
-    let slots = unit
+    let entries: Vec<String> = unit
         .vtable(&class.name)
-        .map(|v| (*v).clone())
-        .unwrap_or_default();
-    let entries: Vec<String> = slots
-        .iter()
-        .map(|s| {
-            function(&(s.owner.clone(), s.name.clone(), s.descriptor.clone()))
-                .unwrap_or_else(|| "0".into())
+        .map(|slots| {
+            slots
+                .iter()
+                .map(|s| {
+                    function(&(s.owner.clone(), s.name.clone(), s.descriptor.clone()))
+                        .unwrap_or_else(|| "0".into())
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     let entries = if entries.is_empty() {
         "0".to_string()
     } else {
@@ -5037,7 +5214,7 @@ fn emit_class_record(
         .filter_map(|e| {
             let f = match &e.target {
                 ItableTarget::Impl(key) => function(key)?,
-                _ if parse_signature(&e.descriptor).is_ok() => {
+                _ if unit.signature(&e.descriptor).is_ok() => {
                     format!(
                         "(void (*)(void)){}",
                         error_stub_symbol(&class.name, &e.name, &e.descriptor)
@@ -5060,11 +5237,13 @@ fn emit_class_record(
         (itable_name, itable.len())
     };
     let ifaces: Vec<String> = unit
-        .superinterfaces(&class.name)
-        .unwrap_or_default()
-        .iter()
-        .map(|i| format!("&{}", class_record(&i.name)))
-        .collect();
+        .superinterfaces_arc(&class.name)
+        .map(|list| {
+            list.iter()
+                .map(|i| format!("&{}", class_record(&i.name)))
+                .collect()
+        })
+        .unwrap_or_default();
     let ifaces_name = mangled("jn_", &[&class.name]);
     let (ifaces_ref, ifaces_len) = if ifaces.is_empty() {
         ("NULL".to_string(), 0)
@@ -5600,7 +5779,8 @@ fn app_loader_functions(
                 && f.access & ACC_STATIC == 0
         })
     });
-    let have_loader = recorded.iter().any(|c| c.name == APP_LOADER)
+    let recorded_set: HashSet<&str> = recorded.iter().map(|r| r.name.as_str()).collect();
+    let have_loader = recorded_set.contains(APP_LOADER)
         && unit.get(APP_LOADER).is_some_and(|c| {
             c.fields
                 .iter()
@@ -5609,7 +5789,7 @@ fn app_loader_functions(
     // Sorted names, for bsearch.
     let names: Vec<&String> = app_classes
         .iter()
-        .filter(|n| recorded.iter().any(|r| &r.name == *n))
+        .filter(|n| recorded_set.contains(n.as_str()))
         .collect();
     let _ = writeln!(out, "static const char *const jabs_app_class_names[] = {{");
     for n in &names {
@@ -6465,7 +6645,7 @@ static jabs_object *jabs_vh_new(char kind, uint8_t shape, int64_t offset, void *
     size_t at = jabs_vh_offset();
     jabs_object *o = (jabs_object *)calloc(1, at + sizeof(jabs_vh));
     if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
-    jabs_heap_bytes += (int64_t)(at + sizeof(jabs_vh));
+    atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)(at + sizeof(jabs_vh)), memory_order_relaxed);
     o->cls = &{record};
     jabs_vh *h = (jabs_vh *)((char *)o + at);
     h->kind = kind; h->shape = shape; h->offset = offset; h->address = address; h->scale = scale; h->big_endian = big_endian;
@@ -6488,11 +6668,11 @@ jabs_object *jabs_vh_with_exact(jabs_object *o, int32_t exact) {{
     size_t size = jabs_vh_offset() + sizeof(jabs_vh);
     jabs_object *copy = (jabs_object *)calloc(1, size);
     if (!copy) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
-    jabs_heap_bytes += (int64_t)size;
+    atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)size, memory_order_relaxed);
     memcpy(copy, o, size);
     /* A new object: its own lock word and identity hash. */
     copy->monitor = 0;
-    atomic_store(&copy->hash, 0);
+    atomic_store_explicit(&copy->hash, 0, memory_order_relaxed);
     (({vh_struct} *)copy)->{exact} = (uint8_t)(exact != 0);
     return copy;
 }}
@@ -6832,6 +7012,26 @@ jabs_object *jabs_class_module(jabs_object *c) {{
     )
 }
 
+fn format_resource_entry(index: usize, data: &[u8]) -> String {
+    let mut out = String::with_capacity(64 + data.len() * 4 + (data.len() / 4096) * 3);
+    let _ = write!(
+        out,
+        "static const unsigned char jabs_resource_{index}[{}] = \"",
+        data.len() + 1
+    );
+    for (j, &b) in data.iter().enumerate() {
+        if j > 0 && j % 4096 == 0 {
+            out.push_str("\"\n\"");
+        }
+        out.push('\\');
+        out.push((b'0' + (b >> 6)) as char);
+        out.push((b'0' + ((b >> 3) & 7)) as char);
+        out.push((b'0' + (b & 7)) as char);
+    }
+    out.push_str("\";\n");
+    out
+}
+
 /// `resources.c`: the embedded resource table (`jabs_resources`, ended by a NULL name) and what
 /// runtime/jabs_jab.c needs to know about the program's .jab (mode 0 when it has none).
 pub fn resources_file(
@@ -6839,7 +7039,37 @@ pub fn resources_file(
     jab: Option<&JabConfig>,
     java_home: Option<&str>,
 ) -> String {
-    let mut out = String::from("#include \"jabs_unit.h\"\n");
+    let total_bytes: usize = resources.iter().map(|(_, d)| d.len()).sum();
+    let encoded: Vec<String> = if resources.len() >= 8 || total_bytes >= 65_536 {
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(resources.len().max(1));
+        let chunk_size = resources.len().div_ceil(threads).max(1);
+        let mut results: Vec<String> = vec![String::new(); resources.len()];
+        std::thread::scope(|scope| {
+            let mut rest = results.as_mut_slice();
+            for (chunk_idx, chunk) in resources.chunks(chunk_size).enumerate() {
+                let base = chunk_idx * chunk_size;
+                let (dst, tail) = rest.split_at_mut(chunk.len());
+                rest = tail;
+                scope.spawn(move || {
+                    for (offset, (_, data)) in chunk.iter().enumerate() {
+                        dst[offset] = format_resource_entry(base + offset, data);
+                    }
+                });
+            }
+        });
+        results
+    } else {
+        resources
+            .iter()
+            .enumerate()
+            .map(|(i, (_, data))| format_resource_entry(i, data))
+            .collect()
+    };
+    let cap: usize = 64 + encoded.iter().map(String::len).sum::<usize>() + resources.len() * 64;
+    let mut out = String::with_capacity(cap);
+    out.push_str("#include \"jabs_runtime.h\"\n");
     let (mode, id, home, log) = match jab {
         None => (0, "", "", ""),
         Some(JabConfig {
@@ -6858,19 +7088,8 @@ pub fn resources_file(
         c_escape(home),
         c_escape(log)
     );
-    for (i, (_, data)) in resources.iter().enumerate() {
-        let _ = write!(
-            out,
-            "static const unsigned char jabs_resource_{i}[{}] = \"",
-            data.len() + 1
-        );
-        for (j, b) in data.iter().enumerate() {
-            if j > 0 && j % 4096 == 0 {
-                out.push_str("\"\n\"");
-            }
-            let _ = write!(out, "\\{b:03o}");
-        }
-        out.push_str("\";\n");
+    for s in encoded {
+        out.push_str(&s);
     }
     out.push_str("const jabs_resource jabs_resources[] = {\n");
     for (i, (name, data)) in resources.iter().enumerate() {
@@ -7141,13 +7360,15 @@ fn init_prerequisites(unit: &Unit, class: &ClassFile) -> Vec<String> {
     if let Some(parent) = class.super_name.as_deref().filter(|p| *p != OBJECT) {
         out.push(parent.to_string());
     }
-    for iface in unit.superinterfaces(&class.name).unwrap_or_default() {
-        if iface
-            .methods
-            .iter()
-            .any(|m| m.access & (ACC_STATIC | ACC_ABSTRACT) == 0)
-        {
-            out.push(iface.name.clone());
+    if let Ok(ifaces) = unit.superinterfaces_arc(&class.name) {
+        for iface in ifaces.iter() {
+            if iface
+                .methods
+                .iter()
+                .any(|m| m.access & (ACC_STATIC | ACC_ABSTRACT) == 0)
+            {
+                out.push(iface.name.clone());
+            }
         }
     }
     out
@@ -7156,7 +7377,12 @@ fn init_prerequisites(unit: &Unit, class: &ClassFile) -> Vec<String> {
 /// Emit a class's static field storage and initialization function (JVMS 5.5). The state and
 /// its lock live in the runtime (`jabs_class_init` in jabs_rt.h, the procedure in
 /// jabs_thread.c); an initialized class costs one acquire load.
-fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
+fn emit_statics_and_init(
+    out: &mut String,
+    unit: &Unit,
+    class: &ClassFile,
+    literal_ids: &HashMap<Vec<u16>, u32>,
+) {
     let init = init_symbol(&class.name);
     let state = format!("{init}_state");
     let mut constants = String::new();
@@ -7181,12 +7407,12 @@ fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
         } else if let Some(units) = constant_string(class, f) {
             let _ = writeln!(
                 constants,
-                "    {sym} = {}(); if (!{sym}) {{ jabs_class_init_end(&{state}, false); return -1; }}",
-                literal_symbol(&units)
+                "    {sym} = jabs_literal({}u); if (!{sym}) {{ jabs_class_init_end(&{state}, false); return -1; }}",
+                literal_ids[&units]
             );
         }
     }
-    let _ = writeln!(out, "\nstatic jabs_class_init {state};");
+    let _ = writeln!(out, "\njabs_class_init {state};");
     let _ = writeln!(out, "int {init}(void) {{");
     let _ = writeln!(out, "    if (jabs_class_initialized(&{state})) return 0;");
     let _ = writeln!(out, "    int step = jabs_class_init_begin(&{state});");
@@ -7213,14 +7439,8 @@ fn emit_statics_and_init(out: &mut String, unit: &Unit, class: &ClassFile) {
 }
 
 /// Why a class's hierarchy keeps it from being initialized, or None if it is complete in the unit.
-fn structural_problem(unit: &Unit, class: &ClassFile) -> Option<String> {
-    if let Err(e) = unit.chain(&class.name) {
-        return Some(format!("class hierarchy incomplete: {e}"));
-    }
-    if let Err(e) = unit.superinterfaces(&class.name) {
-        return Some(format!("class hierarchy incomplete: {e}"));
-    }
-    None
+fn structural_problem<'a>(unit: &Unit<'a>, class: &'a ClassFile) -> Option<String> {
+    unit.structural_problem_cached(class)
 }
 
 /// Classes whose init function emitted code may call: the methods' own classes, their init
@@ -7313,7 +7533,7 @@ fn emit_reached_stubs(
         else {
             continue;
         };
-        let Ok(sig) = parse_signature(&target.2) else {
+        let Ok(sig) = unit.signature(&target.2) else {
             continue;
         };
         let reason = match results.get(target) {
@@ -7444,21 +7664,320 @@ fn intern_node(
     at
 }
 
+type MethodOutcome = std::result::Result<(Signature, Analyzed, Option<(String, bool)>), String>;
+
+/// Analyze one method against `unit`: pure per method, safe to call in parallel.
+fn analyze_method<'a>(
+    unit: &Unit<'a>,
+    have_classes: bool,
+    class: &'a ClassFile,
+    method: &'a Member,
+) -> (MethodKey, MethodOutcome) {
+    let key = (
+        class.name.clone(),
+        method.name.clone(),
+        method.descriptor.clone(),
+    );
+    let result = (|| {
+        if let Some(reason) = structural_problem(unit, class) {
+            return Err(reason);
+        }
+        let sig = (*unit
+            .signature(&method.descriptor)
+            .map_err(|e| e.to_string())?)
+        .clone();
+        if let Some(body) = replacement(&key, have_classes) {
+            return Ok((sig, Analyzed::empty(), Some(body)));
+        }
+        if method.access & ACC_NATIVE != 0 {
+            let found = management::intrinsic(unit, &key, have_classes)
+                .or_else(|| net::intrinsic(&key, have_classes))
+                .or_else(|| nio_fs::intrinsic(&key, have_classes))
+                .or_else(|| modules::intrinsic(&key))
+                .or_else(|| stack::intrinsic(&key, have_classes))
+                .or_else(|| method_handles::intrinsic(&key, have_classes))
+                .or_else(|| unsafe_rt::intrinsic(&key, have_classes))
+                .or_else(|| zip::intrinsic(&key, have_classes))
+                .or_else(|| boot_extras::intrinsic(&key, have_classes))
+                .or_else(|| intrinsic(&key, have_classes));
+            let Some(body) = found else {
+                return Err("native method without a JABS implementation".to_string());
+            };
+            return Ok((sig, Analyzed::empty(), Some(body)));
+        }
+        let analyzed = analyze(unit, class, method, &sig)?;
+        Ok((sig, analyzed, None))
+    })();
+    (key, result)
+}
+
+/// Demand-driven, wave-parallel method analysis and class-initialization cache.
+struct AnalysisCache<'a> {
+    unit: &'a Unit<'a>,
+    have_classes: bool,
+    results: BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    intrinsics: HashMap<MethodKey, (String, bool)>,
+    init_ok: HashMap<String, std::result::Result<(), String>>,
+}
+
+impl<'a> AnalysisCache<'a> {
+    fn new(unit: &'a Unit<'a>, have_classes: bool) -> Self {
+        AnalysisCache {
+            unit,
+            have_classes,
+            results: BTreeMap::new(),
+            intrinsics: HashMap::new(),
+            init_ok: HashMap::new(),
+        }
+    }
+
+    fn insert_outcome(&mut self, key: MethodKey, outcome: MethodOutcome) {
+        match outcome {
+            Ok((sig, analyzed, intrinsic)) => {
+                if let Some(body) = intrinsic {
+                    self.intrinsics.insert(key.clone(), body);
+                }
+                self.results.insert(key, Ok((sig, analyzed)));
+            }
+            Err(reason) => {
+                self.results.insert(key, Err(reason));
+            }
+        }
+    }
+
+    /// Analyze all `(&ClassFile, &Member)` pairs in parallel using `std::thread::scope`.
+    fn analyze_batch(&mut self, batch: Vec<(&'a ClassFile, &'a Member)>) {
+        if batch.is_empty() {
+            return;
+        }
+        let unit = self.unit;
+        let have_classes = self.have_classes;
+        if batch.len() < 16 {
+            for (class, method) in batch {
+                let (key, outcome) = analyze_method(unit, have_classes, class, method);
+                self.insert_outcome(key, outcome);
+            }
+            return;
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(batch.len());
+        let chunk_size = batch.len().div_ceil(threads).max(1);
+        let chunk_results: Vec<Vec<_>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&(class, method)| {
+                                analyze_method(unit, have_classes, class, method)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for chunk in chunk_results {
+            for (key, outcome) in chunk {
+                self.insert_outcome(key, outcome);
+            }
+        }
+    }
+
+    /// Ensure every method in `keys` (that exists in `unit`) is analyzed, running in parallel.
+    fn ensure_analyzed(&mut self, keys: &[MethodKey]) {
+        let mut seen: HashSet<(&str, &str, &str)> = HashSet::new();
+        let mut batch: Vec<(&'a ClassFile, &'a Member)> = Vec::new();
+        for key in keys {
+            if self.results.contains_key(key)
+                || !seen.insert((key.0.as_str(), key.1.as_str(), key.2.as_str()))
+            {
+                continue;
+            }
+            if let Some(class) = self.unit.get(&key.0)
+                && let Some(method) = class
+                    .methods
+                    .iter()
+                    .find(|m| m.name == key.1 && m.descriptor == key.2)
+            {
+                batch.push((class, method));
+            }
+        }
+        self.analyze_batch(batch);
+    }
+
+    fn ensure_one(&mut self, key: &MethodKey) {
+        if self.results.contains_key(key) {
+            return;
+        }
+        if let Some(class) = self.unit.get(&key.0)
+            && let Some(method) = class
+                .methods
+                .iter()
+                .find(|m| m.name == key.1 && m.descriptor == key.2)
+        {
+            let (k, outcome) = analyze_method(self.unit, self.have_classes, class, method);
+            self.insert_outcome(k, outcome);
+        }
+    }
+
+    fn is_compiled(&mut self, key: &MethodKey) -> bool {
+        self.ensure_one(key);
+        matches!(self.results.get(key), Some(Ok(_)))
+    }
+
+    /// Memoized class-initializability check (replaces the full-unit fixpoint scan).
+    fn check_init(&mut self, name: &str) -> bool {
+        if let Some(res) = self.init_ok.get(name) {
+            return res.is_ok();
+        }
+        let Some(class) = self.unit.get(name) else {
+            self.init_ok.insert(
+                name.to_string(),
+                Err(format!("{name} is not in the compilation unit")),
+            );
+            return false;
+        };
+        if let Some(reason) = structural_problem(self.unit, class) {
+            self.init_ok.insert(name.to_string(), Err(reason));
+            return false;
+        }
+        if class
+            .methods
+            .iter()
+            .any(|m| m.name == "<clinit>" && m.descriptor == "()V")
+        {
+            let clinit = (name.to_string(), "<clinit>".to_string(), "()V".to_string());
+            self.ensure_one(&clinit);
+            if let Some(Err(reason)) = self.results.get(&clinit) {
+                self.init_ok.insert(
+                    name.to_string(),
+                    Err(format!(
+                        "static initializer of {name} not compiled: {reason}"
+                    )),
+                );
+                return false;
+            }
+        }
+        for p in init_prerequisites(self.unit, class) {
+            if !self.check_init(&p) {
+                let reason = self
+                    .init_ok
+                    .get(&p)
+                    .and_then(|r| r.as_ref().err())
+                    .cloned()
+                    .unwrap_or_else(|| format!("{p} is not in the compilation unit"));
+                self.init_ok.insert(name.to_string(), Err(reason));
+                return false;
+            }
+        }
+        self.init_ok.insert(name.to_string(), Ok(()));
+        true
+    }
+
+    /// Pre-analyze all `<clinit>()V` methods reachable along `init_prerequisites` of `names` in parallel.
+    fn ensure_inits_batch(&mut self, names: &[String]) {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = Vec::new();
+        let mut clinits: Vec<MethodKey> = Vec::new();
+        for n in names {
+            if !self.init_ok.contains_key(n) && visited.insert(n.clone()) {
+                stack.push(n.clone());
+            }
+        }
+        while let Some(name) = stack.pop() {
+            let Some(class) = self.unit.get(&name) else {
+                continue;
+            };
+            if structural_problem(self.unit, class).is_some() {
+                continue;
+            }
+            if class
+                .methods
+                .iter()
+                .any(|m| m.name == "<clinit>" && m.descriptor == "()V")
+            {
+                clinits.push((name.clone(), "<clinit>".to_string(), "()V".to_string()));
+            }
+            for p in init_prerequisites(self.unit, class) {
+                if !self.init_ok.contains_key(&p) && visited.insert(p.clone()) {
+                    stack.push(p);
+                }
+            }
+        }
+        self.ensure_analyzed(&clinits);
+        for n in names {
+            self.check_init(n);
+        }
+    }
+}
+
+/// Flood blocker categories through the dependency graph built from `nodes` and `dependents`.
+fn flood_poisoned(
+    unit: &Unit,
+    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    init_ok: &HashMap<String, std::result::Result<(), String>>,
+    nodes: Vec<Node>,
+    dependents: Vec<Vec<usize>>,
+    ok_keys: impl IntoIterator<Item = MethodKey>,
+) -> BTreeMap<MethodKey, Vec<String>> {
+    let mut seeds: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (at, node) in nodes.iter().enumerate() {
+        let category = match node {
+            Node::Method(m) => match results.get(m) {
+                Some(Ok(_)) => continue,
+                Some(Err(reason)) => blocker_category(reason),
+                None => MISSING_METHOD.to_string(),
+            },
+            Node::Class(c) => match init_ok.get(c) {
+                Some(Ok(())) => continue,
+                Some(Err(reason)) => blocker_category(reason),
+                None if unit.get(c).is_some() => unreachable!("class init_ok missing for {c}"),
+                None => OUTSIDE_CLASS.to_string(),
+            },
+        };
+        seeds.entry(category).or_default().push(at);
+    }
+
+    let mut out: BTreeMap<MethodKey, Vec<String>> = BTreeMap::new();
+    for key in ok_keys {
+        out.insert(key, Vec::new());
+    }
+    let mut seen = vec![false; nodes.len()];
+    let mut work: Vec<usize> = Vec::new();
+    for (category, starts) in &seeds {
+        seen.fill(false);
+        work.clear();
+        work.extend(starts);
+        while let Some(at) = work.pop() {
+            if seen[at] {
+                continue;
+            }
+            seen[at] = true;
+            if let Node::Method(key) = &nodes[at]
+                && let Some(categories) = out.get_mut(key)
+            {
+                categories.push(category.clone());
+            }
+            for &next in &dependents[at] {
+                if !seen[next] {
+                    work.push(next);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// For every compiled method, the blocker categories whose not-compiled code it can reach,
 /// sorted. Empty means self-contained: every method it may call directly and every class it may
 /// initialize (with its whole initializer) is native too.
-///
-/// Nodes are methods and class initializations; an edge points from a dependency to what
-/// depends on it. Seeds are methods that did not compile, called methods that do not exist, and
-/// classes that cannot be initialized (including ones outside the unit). Each seed gets the
-/// category of its reason, and each category is flooded through the dependents on its own, so a
-/// method learns every category that poisons it, not just that something does. That is one
-/// linear pass per category: a few dozen, never one per seed.
 fn poisoned_by(
     unit: &Unit,
     classes: &[ClassFile],
     results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
-    initializable: &BTreeSet<String>,
     init_ok: &HashMap<String, std::result::Result<(), String>>,
 ) -> BTreeMap<MethodKey, Vec<String>> {
     let mut index: HashMap<Node, usize> = HashMap::new();
@@ -7516,58 +8035,125 @@ fn poisoned_by(
             dependents[from].push(me);
         }
     }
+    let ok_keys = results
+        .iter()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(k, _)| k.clone());
+    flood_poisoned(unit, results, init_ok, nodes, dependents, ok_keys)
+}
 
-    let mut seeds: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (at, node) in nodes.iter().enumerate() {
-        let category = match node {
-            Node::Method(m) => match results.get(m) {
-                Some(Ok(_)) => continue,
-                Some(Err(reason)) => blocker_category(reason),
-                None => MISSING_METHOD.to_string(),
-            },
-            Node::Class(c) => {
-                if initializable.contains(c) {
-                    continue;
-                }
-                match init_ok.get(c) {
-                    Some(Err(reason)) => blocker_category(reason),
-                    _ => OUTSIDE_CLASS.to_string(),
-                }
-            }
-        };
-        seeds.entry(category).or_default().push(at);
-    }
+/// Demand-driven `poisoned_by` scoped to the transitive dependency closure of `scope_ok`.
+fn poisoned_by_scoped(
+    cache: &mut AnalysisCache,
+    scope_ok: &[MethodKey],
+) -> BTreeMap<MethodKey, Vec<String>> {
+    let mut index: HashMap<Node, usize> = HashMap::new();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut dependents: Vec<Vec<usize>> = Vec::new();
+    let mut seen_methods: HashSet<MethodKey> = HashSet::new();
+    let mut seen_classes: HashSet<String> = HashSet::new();
+    let mut method_work: Vec<MethodKey> = scope_ok.to_vec();
+    let mut class_work: Vec<String> = Vec::new();
 
-    let mut out: BTreeMap<MethodKey, Vec<String>> = BTreeMap::new();
-    for (key, result) in results {
-        if result.is_ok() {
-            out.insert(key.clone(), Vec::new());
-        }
-    }
-    let mut seen = vec![false; nodes.len()];
-    let mut work: Vec<usize> = Vec::new();
-    for (category, starts) in &seeds {
-        seen.fill(false);
-        work.clear();
-        work.extend(starts);
-        while let Some(at) = work.pop() {
-            if seen[at] {
+    while !method_work.is_empty() || !class_work.is_empty() {
+        while let Some(key) = method_work.pop() {
+            if !seen_methods.insert(key.clone()) {
                 continue;
             }
-            seen[at] = true;
-            if let Node::Method(key) = &nodes[at]
-                && let Some(categories) = out.get_mut(key)
-            {
-                categories.push(category.clone());
-            }
-            for &next in &dependents[at] {
-                if !seen[next] {
-                    work.push(next);
+            cache.ensure_one(&key);
+            let me = intern_node(
+                Node::Method(key.clone()),
+                &mut index,
+                &mut nodes,
+                &mut dependents,
+            );
+            let deps: Vec<Dep> = match cache.results.get(&key) {
+                Some(Ok((_, a))) => a.deps.iter().cloned().collect(),
+                _ => continue,
+            };
+            if key.1 != "<clinit>" {
+                let class = intern_node(
+                    Node::Class(key.0.clone()),
+                    &mut index,
+                    &mut nodes,
+                    &mut dependents,
+                );
+                dependents[class].push(me);
+                if !seen_classes.contains(&key.0) {
+                    class_work.push(key.0.clone());
                 }
+            }
+            for dep in deps {
+                let from = match &dep {
+                    Dep::Method(m) => {
+                        if !seen_methods.contains(m) {
+                            method_work.push(m.clone());
+                        }
+                        Node::Method(m.clone())
+                    }
+                    Dep::Init(c) => {
+                        if !seen_classes.contains(c) {
+                            class_work.push(c.clone());
+                        }
+                        Node::Class(c.clone())
+                    }
+                };
+                let from = intern_node(from, &mut index, &mut nodes, &mut dependents);
+                dependents[from].push(me);
+            }
+        }
+        while let Some(c) = class_work.pop() {
+            if !seen_classes.insert(c.clone()) {
+                continue;
+            }
+            cache.check_init(&c);
+            let me = intern_node(
+                Node::Class(c.clone()),
+                &mut index,
+                &mut nodes,
+                &mut dependents,
+            );
+            let Some(class) = cache.unit.get(&c) else {
+                continue;
+            };
+            if class
+                .methods
+                .iter()
+                .any(|m| m.name == "<clinit>" && m.descriptor == "()V")
+            {
+                let clinit = (c.clone(), "<clinit>".to_string(), "()V".to_string());
+                cache.ensure_one(&clinit);
+                if cache.results.contains_key(&clinit) {
+                    if !seen_methods.contains(&clinit) {
+                        method_work.push(clinit.clone());
+                    }
+                    let from = intern_node(
+                        Node::Method(clinit),
+                        &mut index,
+                        &mut nodes,
+                        &mut dependents,
+                    );
+                    dependents[from].push(me);
+                }
+            }
+            for p in init_prerequisites(cache.unit, class) {
+                if !seen_classes.contains(&p) {
+                    class_work.push(p.clone());
+                }
+                let from = intern_node(Node::Class(p), &mut index, &mut nodes, &mut dependents);
+                dependents[from].push(me);
             }
         }
     }
-    out
+
+    flood_poisoned(
+        cache.unit,
+        &cache.results,
+        &cache.init_ok,
+        nodes,
+        dependents,
+        scope_ok.iter().cloned(),
+    )
 }
 
 /// Compile a set of classes together into one C unit.
@@ -7590,30 +8176,25 @@ struct ReachFrom<'a> {
     extras: &'a UnitExtras,
     /// The compiled methods of `extras.executed_methods` (see executed_roots).
     executed: &'a [MethodKey],
-    /// What reflection and proxies add (src/cgen/reflect.rs).
-    reflect: reflect::ReachInputs<'a>,
+    /// Generated proxy classes from `proxy::generate`.
+    proxies: &'a [crate::proxy::Generated],
 }
 
-/// Everything reachable from the root classes. `new K` makes K's compiled vtable implementations
-/// reachable, since virtual calls may now dispatch to them; vtables of classes never
-/// instantiated hold stubs, which no call can reach because no such object exists.
-fn reachable(
-    unit: &Unit,
-    classes: &[ClassFile],
-    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
-    intrinsics: &HashMap<MethodKey, (String, bool)>,
-    initializable: &BTreeSet<String>,
-    from: &ReachFrom,
+/// Demand-driven, wave-parallel reachability from `roots` (only analyzes queried methods).
+fn reachable<'a>(
+    unit: &'a Unit<'a>,
+    classes: &'a [ClassFile],
+    cache: &RefCell<AnalysisCache<'a>>,
+    from: &ReachFrom<'_>,
 ) -> Emission {
     let ReachFrom {
         roots,
         extras,
         executed,
-        reflect: reach_inputs,
-    } = from;
+        proxies,
+    } = *from;
     let loaded = &extras.loaded_classes;
     let startup = extras.startup;
-    let compiled = |k: &MethodKey| matches!(results.get(k), Some(Ok(_)));
     let mut out = Emission {
         methods: BTreeSet::new(),
         records: BTreeSet::new(),
@@ -7629,25 +8210,22 @@ fn reachable(
                 return;
             }
             *done = true;
-            let startup = (
+            let startup_key = (
                 SYSTEM.to_string(),
                 "initPhase1".to_string(),
                 "()V".to_string(),
             );
-            if compiled(&startup) {
-                work.push(startup);
+            if cache.borrow_mut().is_compiled(&startup_key) {
+                work.push(startup_key);
                 pending_inits.push(SYSTEM.to_string());
                 pending_inits.extend(VM_PREINITIALIZED.iter().map(|c| c.to_string()));
                 pending_inits.push(BOOT_LOADER.to_string());
                 pending_inits.push("java/lang/ClassLoader".to_string());
-                let vm_level = (
+                work.push((
                     "jdk/internal/misc/VM".to_string(),
                     "initLevel".to_string(),
                     "(I)V".to_string(),
-                );
-                if compiled(&vm_level) {
-                    work.push(vm_level);
-                }
+                ));
             }
         };
     if startup || roots.contains(APP_LOADER) {
@@ -7657,14 +8235,13 @@ fn reachable(
         pending_inits.push(class.name.clone());
         for m in &class.methods {
             let key = (class.name.clone(), m.name.clone(), m.descriptor.clone());
-            if compiled(&key) {
+            if matches!(cache.borrow().results.get(&key), Some(Ok(_))) {
                 work.push(key);
             }
         }
     }
     // A record for `class` also needs records for its superclasses and superinterfaces.
     let add_records = |name: &str, records: &mut BTreeSet<String>| {
-        // The class itself (Object's own chain is empty), then its superclasses.
         if unit.get(name).is_some() {
             records.insert(name.to_string());
         }
@@ -7673,31 +8250,62 @@ fn reachable(
                 records.insert(c.name.clone());
             }
         }
-        for i in unit.superinterfaces(name).unwrap_or_default() {
-            records.insert(i.name.clone());
+        if let Ok(ifaces) = unit.superinterfaces_arc(name) {
+            for i in ifaces.iter() {
+                records.insert(i.name.clone());
+            }
         }
     };
-    // Objects of `class` now exist: their vtable and interface-table implementations are reachable.
-    let implementations = |class: &str| -> Vec<MethodKey> {
-        let mut keys: Vec<MethodKey> = unit
-            .vtable(class)
-            .map(|v| (*v).clone())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|slot| (slot.owner, slot.name, slot.descriptor))
-            .collect();
-        keys.extend(unit.itable(class).iter().filter_map(|e| match &e.target {
-            ItableTarget::Impl(k) => Some(k.clone()),
-            _ => None,
-        }));
-        keys
+    // Reverse index for Rapid Type Analysis: `(name, descriptor) -> [MethodKey]` of instantiated classes.
+    let mut called: HashSet<(String, String)> = HashSet::new();
+    let mut impls_by_sig: HashMap<(String, String), Vec<MethodKey>> = HashMap::new();
+    let mut seen_impls: HashSet<MethodKey> = HashSet::new();
+    let instantiate = |class: &str,
+                       instantiated: &mut BTreeSet<String>,
+                       called: &HashSet<(String, String)>,
+                       impls_by_sig: &mut HashMap<(String, String), Vec<MethodKey>>,
+                       seen_impls: &mut HashSet<MethodKey>,
+                       work: &mut Vec<MethodKey>| {
+        if !instantiated.insert(class.to_string()) {
+            return;
+        }
+        let mut register = |key: MethodKey| {
+            if seen_impls.insert(key.clone()) {
+                let sig = (key.1.clone(), key.2.clone());
+                if called.contains(&sig) {
+                    work.push(key.clone());
+                }
+                impls_by_sig.entry(sig).or_default().push(key);
+            }
+        };
+        if let Ok(vt) = unit.vtable(class) {
+            for slot in vt.iter() {
+                register((
+                    slot.owner.clone(),
+                    slot.name.clone(),
+                    slot.descriptor.clone(),
+                ));
+            }
+        }
+        for e in unit.itable(class).iter() {
+            if let ItableTarget::Impl(k) = &e.target {
+                register(k.clone());
+            }
+        }
     };
-    // Methods a real JVM run executed (UnitExtras::executed_methods): some may be called only
-    // by name (log4j calls its plugins' factories through Method.invoke), so each is a root, and
-    // its class is recorded (reflection lists only recorded classes) and initialized, as a root
-    // class is. A <clinit> runs through its class's initialization, which keeps it only when the
-    // class can be initialized natively. No class is marked instantiated here; see
-    // UnitExtras::executed_methods for why.
+    let call_selector = |name: String,
+                         descriptor: String,
+                         called: &mut HashSet<(String, String)>,
+                         impls_by_sig: &HashMap<(String, String), Vec<MethodKey>>,
+                         work: &mut Vec<MethodKey>| {
+        let sig = (name, descriptor);
+        if called.insert(sig.clone())
+            && let Some(impls) = impls_by_sig.get(&sig)
+        {
+            work.extend(impls.iter().cloned());
+        }
+    };
+
     for key in executed.iter() {
         add_records(&key.0, &mut out.records);
         pending_inits.push(key.0.clone());
@@ -7705,15 +8313,9 @@ fn reachable(
             work.push(key.clone());
         }
     }
-    // Rapid Type Analysis: an implementation is reachable only when its class is instantiated AND
-    // some reachable code calls its (name, descriptor) virtually or through an interface.
-    let mut called: BTreeSet<(String, String)> = BTreeSet::new();
-    // A whole program's VarHandles are runtime-made instances of VarHandle's record.
     if roots.contains(APP_LOADER) && unit.get(VAR_HANDLE).is_some() {
         add_records(VAR_HANDLE, &mut out.records);
     }
-    // The JDK's startup picks the console charset by name from the host it runs on (MS1252,
-    // UTF-8, ...), so with startup compiled in every standard charset stays loadable by name.
     let mut loaded = loaded.clone();
     if startup || roots.contains(APP_LOADER) {
         loaded.extend(
@@ -7724,7 +8326,6 @@ fn reachable(
                 .map(|c| c.name.clone()),
         );
     }
-    // Classes observed loading on the JVM may be loaded by name and created with newInstance.
     for name in loaded.iter().map(String::as_str) {
         let Some(class) = unit.get(name) else {
             continue;
@@ -7735,39 +8336,40 @@ fn reachable(
         add_records(name, &mut out.records);
         pending_inits.push(name.to_string());
         if class.access & (ACC_INTERFACE | ACC_ABSTRACT) == 0 {
-            let ctor = (name.to_string(), "<init>".to_string(), "()V".to_string());
-            if compiled(&ctor) {
-                work.push(ctor);
-            }
-            if out.instantiated.insert(name.to_string()) {
-                work.extend(
-                    implementations(name)
-                        .into_iter()
-                        .filter(|k| compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))),
-                );
-            }
+            work.push((name.to_string(), "<init>".to_string(), "()V".to_string()));
+            instantiate(
+                name,
+                &mut out.instantiated,
+                &called,
+                &mut impls_by_sig,
+                &mut seen_impls,
+                &mut work,
+            );
         }
     }
-    // The runtime may raise any VM exception, so those classes have instances.
     for (name, _) in VM_EXCEPTIONS {
         if unit.get(name).is_some() && unit.chain(name).is_ok() {
             add_records(name, &mut out.records);
-            if out.instantiated.insert(name.to_string()) {
-                work.extend(
-                    implementations(name)
-                        .into_iter()
-                        .filter(|k| compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))),
-                );
-            }
+            instantiate(
+                name,
+                &mut out.instantiated,
+                &called,
+                &mut impls_by_sig,
+                &mut seen_impls,
+                &mut work,
+            );
         }
     }
     let mut needs_classes = false;
+    let mut needs_classes_done = false;
     let mut unsafe_init_reached = false;
     let mut unsafe_alloc_reached = false;
+    let mut annotation_loads: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut annotation_loads_done: HashSet<String> = HashSet::new();
+    let mut annotation_parser_seen = false;
     loop {
-        // Class objects (and the String names they carry) now exist: make their code reachable.
-        if needs_classes {
-            // Class objects, their String names, and the main thread the registry creates.
+        if needs_classes && !needs_classes_done {
+            needs_classes_done = true;
             let thread_classes = [
                 "java/lang/Thread",
                 "java/lang/Thread$FieldHolder",
@@ -7779,39 +8381,73 @@ fn reachable(
                     continue;
                 }
                 add_records(name, &mut out.records);
-                if out.instantiated.insert(name.to_string()) {
-                    work.extend(
-                        implementations(name).into_iter().filter(|k| {
-                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
-                        }),
-                    );
+                let is_new = !out.instantiated.contains(name);
+                instantiate(
+                    name,
+                    &mut out.instantiated,
+                    &called,
+                    &mut impls_by_sig,
+                    &mut seen_impls,
+                    &mut work,
+                );
+                if is_new {
                     pending_inits.push(name.to_string());
                 }
             }
         }
-        while let Some(class) = pending_inits.pop() {
-            if !initializable.contains(&class) || !out.inits.insert(class.clone()) {
-                continue;
-            }
-            let clinit = (class.clone(), "<clinit>".to_string(), "()V".to_string());
-            if compiled(&clinit) {
-                work.push(clinit);
-            }
-            if let Some(c) = unit.get(&class) {
-                pending_inits.extend(init_prerequisites(unit, c));
+        if !pending_inits.is_empty() {
+            let batch_inits: Vec<String> = pending_inits
+                .drain(..)
+                .filter(|c| !out.inits.contains(c))
+                .collect();
+            if !batch_inits.is_empty() {
+                cache.borrow_mut().ensure_inits_batch(&batch_inits);
+                let mut stack = batch_inits;
+                while let Some(class) = stack.pop() {
+                    if !cache.borrow_mut().check_init(&class) || !out.inits.insert(class.clone()) {
+                        continue;
+                    }
+                    work.push((class.clone(), "<clinit>".to_string(), "()V".to_string()));
+                    if let Some(c) = unit.get(&class) {
+                        stack.extend(init_prerequisites(unit, c));
+                    }
+                }
             }
         }
-        let Some(key) = work.pop() else {
-            // Reflection reaches code that no instruction names (src/cgen/reflect.rs): add it,
-            // and stop only when it adds nothing.
-            let reached = reflect::reach(
-                unit,
-                &out.records,
-                &out.instantiated,
-                &out.methods,
-                &compiled,
-                reach_inputs,
-            );
+        if work.is_empty() {
+            if !annotation_parser_seen {
+                annotation_parser_seen = out
+                    .methods
+                    .iter()
+                    .any(|m| m.0 == "sun/reflect/annotation/AnnotationParser");
+            }
+            if annotation_parser_seen {
+                for name in &out.records {
+                    if annotation_loads_done.insert(name.clone())
+                        && let Some(class) = unit.get(name)
+                    {
+                        let names = crate::proxy::annotation_loaded_classes(class);
+                        if !names.is_empty() {
+                            annotation_loads.insert(name.clone(), names);
+                        }
+                    }
+                }
+            }
+            let reached = {
+                let compiled_fn = |k: &MethodKey| cache.borrow_mut().is_compiled(k);
+                let reach_inputs = reflect::ReachInputs {
+                    proxies,
+                    annotation_loads: &annotation_loads,
+                };
+                reflect::reach(
+                    unit,
+                    &out.records,
+                    &out.instantiated,
+                    &out.methods,
+                    &compiled_fn,
+                    &reach_inputs,
+                )
+            };
             let mut stack_records = stack::reach(unit, &out.records, &out.methods);
             stack_records.extend(boot_extras::reach(unit, &out.records, &out.methods));
             stack_records.extend(method_handles::reach(unit, &out.records, &out.methods));
@@ -7825,22 +8461,29 @@ fn reachable(
             for class in reached.instantiated {
                 add_records(&class, &mut out.records);
                 pending_inits.push(class.clone());
-                if out.instantiated.insert(class.clone()) {
-                    work.extend(
-                        implementations(&class).into_iter().filter(|k| {
-                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
-                        }),
-                    );
-                }
+                instantiate(
+                    &class,
+                    &mut out.instantiated,
+                    &called,
+                    &mut impls_by_sig,
+                    &mut seen_impls,
+                    &mut work,
+                );
             }
             work.extend(reached.methods);
-            // Any class whose Class object is reachable (via LDC, reflection, loaded list, ...)
-            // can flow across methods into Unsafe.{ensureClassInitialized, shouldBeInitialized0,
-            // allocateInstance}.
             if unsafe_init_reached || unsafe_alloc_reached {
                 let recorded: Vec<String> = out.records.iter().cloned().collect();
+                let mut check_candidates = Vec::new();
+                for class in &recorded {
+                    if !out.inits.contains(class) {
+                        check_candidates.push(class.clone());
+                    }
+                }
+                if !check_candidates.is_empty() {
+                    cache.borrow_mut().ensure_inits_batch(&check_candidates);
+                }
                 for class in recorded {
-                    if initializable.contains(&class) && !out.inits.contains(&class) {
+                    if cache.borrow_mut().check_init(&class) && !out.inits.contains(&class) {
                         pending_inits.push(class.clone());
                         progressed = true;
                     }
@@ -7848,12 +8491,17 @@ fn reachable(
                         && let Some(c) = unit.get(&class)
                         && c.access & (ACC_INTERFACE | ACC_ABSTRACT) == 0
                         && unit.chain(&class).is_ok()
-                        && out.instantiated.insert(class.clone())
+                        && !out.instantiated.contains(&class)
                     {
                         progressed = true;
-                        work.extend(implementations(&class).into_iter().filter(|k| {
-                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
-                        }));
+                        instantiate(
+                            &class,
+                            &mut out.instantiated,
+                            &called,
+                            &mut impls_by_sig,
+                            &mut seen_impls,
+                            &mut work,
+                        );
                     }
                 }
             }
@@ -7861,221 +8509,219 @@ fn reachable(
                 break;
             }
             continue;
-        };
-        if !out.methods.insert(key.clone()) {
-            continue;
         }
-        if key.0 == "java/lang/StackTraceElement$HashedModules"
-            && key.1 == "hashedModules"
-            && key.2 == "()Ljava/util/Set;"
-        {
-            let empty_set = (
-                "java/util/Collections".to_string(),
-                "emptySet".to_string(),
-                "()Ljava/util/Set;".to_string(),
-            );
-            if compiled(&empty_set) {
-                work.push(empty_set);
+        // Wave-parallel analysis of all pending methods in `work`.
+        let mut wave: Vec<MethodKey> = Vec::new();
+        let mut seen_wave: HashSet<MethodKey> = HashSet::new();
+        for key in work.drain(..) {
+            if !out.methods.contains(&key) && seen_wave.insert(key.clone()) {
+                wave.push(key);
             }
         }
-        if key.0 == CLASS && key.1 == "getModule" && key.2 == "()Ljava/lang/Module;" {
-            enqueue_startup(&mut work, &mut pending_inits, &mut startup_enqueued);
-            if unit.get(BOOT_LOADER).is_some() {
-                pending_inits.push(BOOT_LOADER.to_string());
-            }
-            if !extras.app_classes.is_empty() && unit.get(APP_LOADER).is_some() {
-                add_records(APP_LOADER, &mut out.records);
-                pending_inits.push(APP_LOADER.to_string());
-            }
-        }
-        if (key.0 == UNSAFE || key.0 == "sun/misc/Unsafe")
-            && matches!(
-                (key.1.as_str(), key.2.as_str()),
-                ("ensureClassInitialized", "(Ljava/lang/Class;)V")
-                    | ("ensureClassInitialized0", "(Ljava/lang/Class;)V")
-                    | ("shouldBeInitialized", "(Ljava/lang/Class;)Z")
-                    | ("shouldBeInitialized0", "(Ljava/lang/Class;)Z")
-                    | ("allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;")
-            )
-        {
-            unsafe_init_reached = true;
-            if key.1 == "allocateInstance" {
-                unsafe_alloc_reached = true;
-            }
-        }
-        if key.0 == THREAD && key.1 == "start0" && key.2 == "()V" {
-            // jabs_thread_start calls run() virtually, then (as HotSpot's JavaThread::exit does)
-            // Thread.dispatchUncaughtException and Thread.exit.
-            for (name, descriptor) in [
-                ("exit", "()V"),
-                ("dispatchUncaughtException", "(Ljava/lang/Throwable;)V"),
-            ] {
-                let end = (THREAD.to_string(), name.to_string(), descriptor.to_string());
-                if compiled(&end) {
-                    work.push(end);
-                }
-            }
-            let run = ("run".to_string(), "()V".to_string());
-            if called.insert(run.clone()) {
-                for class in &out.instantiated {
-                    work.extend(
-                        implementations(class)
-                            .into_iter()
-                            .filter(|k| k.1 == run.0 && k.2 == run.1 && compiled(k)),
-                    );
-                }
-            }
-        }
-        // Java methods a native calls from C: a management native that builds an object
-        // (management::glue), the net natives' InetAddresses and exceptions (net::glue).
-        let mut from_c = net::called_by(&key);
-        from_c.extend(nio_fs::called_by(&key));
-        from_c.extend(modules::called_by(&key, !extras.jdk_modules.is_empty()));
-        from_c.extend(stack::called_by(&key));
-        from_c.extend(method_handles::called_by(&key));
-        from_c.extend(unsafe_rt::called_by(&key));
-        from_c.extend(boot_extras::called_by(&key));
-        from_c.extend(zip::called_by(&key));
-        if let Some((class, descriptor)) = management::constructed_by(&key) {
-            from_c.push((class, "<init>", descriptor));
-        }
-        for (class, name, descriptor) in from_c {
-            if unit.get(class).is_none() || unit.chain(class).is_err() {
+        cache.borrow_mut().ensure_analyzed(&wave);
+        for key in wave {
+            let compiled = matches!(cache.borrow().results.get(&key), Some(Ok(_)));
+            if !compiled || !out.methods.insert(key.clone()) {
                 continue;
             }
-            add_records(class, &mut out.records);
-            pending_inits.push(class.to_string());
-            let callee = (class.to_string(), name.to_string(), descriptor.to_string());
-            if compiled(&callee) {
-                work.push(callee);
+            if key.0 == "java/lang/StackTraceElement$HashedModules"
+                && key.1 == "hashedModules"
+                && key.2 == "()Ljava/util/Set;"
+            {
+                work.push((
+                    "java/util/Collections".to_string(),
+                    "emptySet".to_string(),
+                    "()Ljava/util/Set;".to_string(),
+                ));
             }
-            if name == "<init>" && out.instantiated.insert(class.to_string()) {
-                work.extend(
-                    implementations(class)
-                        .into_iter()
-                        .filter(|k| compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))),
+            if key.0 == CLASS && key.1 == "getModule" && key.2 == "()Ljava/lang/Module;" {
+                enqueue_startup(&mut work, &mut pending_inits, &mut startup_enqueued);
+                if unit.get(BOOT_LOADER).is_some() {
+                    pending_inits.push(BOOT_LOADER.to_string());
+                }
+                if !extras.app_classes.is_empty() && unit.get(APP_LOADER).is_some() {
+                    add_records(APP_LOADER, &mut out.records);
+                    pending_inits.push(APP_LOADER.to_string());
+                }
+            }
+            if (key.0 == UNSAFE || key.0 == "sun/misc/Unsafe")
+                && matches!(
+                    (key.1.as_str(), key.2.as_str()),
+                    ("ensureClassInitialized", "(Ljava/lang/Class;)V")
+                        | ("ensureClassInitialized0", "(Ljava/lang/Class;)V")
+                        | ("shouldBeInitialized", "(Ljava/lang/Class;)Z")
+                        | ("shouldBeInitialized0", "(Ljava/lang/Class;)Z")
+                        | ("allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;")
+                )
+            {
+                unsafe_init_reached = true;
+                if key.1 == "allocateInstance" {
+                    unsafe_alloc_reached = true;
+                }
+            }
+            if key.0 == THREAD && key.1 == "start0" && key.2 == "()V" {
+                for (name, descriptor) in [
+                    ("exit", "()V"),
+                    ("dispatchUncaughtException", "(Ljava/lang/Throwable;)V"),
+                ] {
+                    work.push((THREAD.to_string(), name.to_string(), descriptor.to_string()));
+                }
+                call_selector(
+                    "run".to_string(),
+                    "()V".to_string(),
+                    &mut called,
+                    &impls_by_sig,
+                    &mut work,
                 );
             }
-        }
-        let Some(Ok((_, analyzed))) = results.get(&key) else {
-            continue;
-        };
-        if intrinsics
-            .get(&key)
-            .is_some_and(|(_, needs_classes)| *needs_classes)
-        {
-            needs_classes = true;
-        }
-        for catch in analyzed.dispatch.iter().flatten() {
-            if let Some(c) = &catch.class {
-                add_records(c, &mut out.records);
+            let mut from_c = net::called_by(&key);
+            from_c.extend(nio_fs::called_by(&key));
+            from_c.extend(modules::called_by(&key, !extras.jdk_modules.is_empty()));
+            from_c.extend(stack::called_by(&key));
+            from_c.extend(method_handles::called_by(&key));
+            from_c.extend(unsafe_rt::called_by(&key));
+            from_c.extend(boot_extras::called_by(&key));
+            from_c.extend(zip::called_by(&key));
+            if let Some((class, descriptor)) = management::constructed_by(&key) {
+                from_c.push((class, "<init>", descriptor));
             }
-        }
-        pending_inits.push(key.0.clone());
-        for dep in &analyzed.deps {
-            match dep {
-                Dep::Method(m) if compiled(m) => work.push(m.clone()),
-                Dep::Method(_) => {}
-                Dep::Init(c) => pending_inits.push(c.clone()),
-            }
-        }
-        for resolved in analyzed.resolved.values() {
-            let target = match resolved {
-                Resolved::Call(
-                    CallKind::Virtual { target, .. } | CallKind::Interface { target, .. },
-                ) => target,
-                _ => continue,
-            };
-            let selector = (target.1.clone(), target.2.clone());
-            if called.insert(selector.clone()) {
-                for class in &out.instantiated {
-                    work.extend(
-                        implementations(class)
-                            .into_iter()
-                            .filter(|k| k.1 == selector.0 && k.2 == selector.1 && compiled(k)),
+            for (class, name, descriptor) in from_c {
+                if unit.get(class).is_none() || unit.chain(class).is_err() {
+                    continue;
+                }
+                add_records(class, &mut out.records);
+                pending_inits.push(class.to_string());
+                work.push((class.to_string(), name.to_string(), descriptor.to_string()));
+                if name == "<init>" {
+                    instantiate(
+                        class,
+                        &mut out.instantiated,
+                        &called,
+                        &mut impls_by_sig,
+                        &mut seen_impls,
+                        &mut work,
                     );
                 }
             }
-        }
-        // Track interprocedural reachability of Unsafe class-init / allocateInstance natives.
-        if analyzed.insns.iter().any(|i| {
-            matches!(&i.op, Op::InvokeVirtual(m) | Op::InvokeSpecial(m)
-            if (m.class == UNSAFE || m.class == "sun/misc/Unsafe")
-            && matches!(
-                (m.name.as_str(), m.descriptor.as_str()),
-                ("ensureClassInitialized", "(Ljava/lang/Class;)V")
-                    | ("ensureClassInitialized0", "(Ljava/lang/Class;)V")
-                    | ("shouldBeInitialized", "(Ljava/lang/Class;)Z")
-                    | ("shouldBeInitialized0", "(Ljava/lang/Class;)Z")
-                    | ("allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;")
-            ))
-        }) {
-            unsafe_init_reached = true;
-        }
-        if analyzed.insns.iter().any(|i| {
-            matches!(&i.op, Op::InvokeVirtual(m) | Op::InvokeSpecial(m)
-                if (m.class == UNSAFE || m.class == "sun/misc/Unsafe")
-                && m.name == "allocateInstance"
-                && m.descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;")
-        }) {
-            unsafe_alloc_reached = true;
-        }
-        for insn in &analyzed.insns {
-            if caller_sensitive(unit, &insn.op) && unit.get(&key.0).is_some() {
-                add_records(&key.0, &mut out.records);
+            let cache_ref = cache.borrow();
+            let Some(Ok((_, analyzed))) = cache_ref.results.get(&key) else {
+                continue;
+            };
+            if cache_ref.intrinsics.get(&key).is_some_and(|(_, nc)| *nc) {
+                needs_classes = true;
             }
-            match &insn.op {
-                Op::New { class } => {
-                    if unit.get(class).is_some() {
-                        add_records(class, &mut out.records);
-                        if out.instantiated.insert(class.clone()) {
-                            work.extend(implementations(class).into_iter().filter(|k| {
-                                compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
-                            }));
+            for catch in analyzed.dispatch.iter().flatten() {
+                if let Some(c) = &catch.class {
+                    add_records(c, &mut out.records);
+                }
+            }
+            pending_inits.push(key.0.clone());
+            for dep in &analyzed.deps {
+                match dep {
+                    Dep::Method(m) => work.push(m.clone()),
+                    Dep::Init(c) => pending_inits.push(c.clone()),
+                }
+            }
+            for resolved in analyzed.resolved.values() {
+                let target = match resolved {
+                    Resolved::Call(
+                        CallKind::Virtual { target, .. } | CallKind::Interface { target, .. },
+                    ) => target,
+                    _ => continue,
+                };
+                call_selector(
+                    target.1.clone(),
+                    target.2.clone(),
+                    &mut called,
+                    &impls_by_sig,
+                    &mut work,
+                );
+            }
+            if analyzed.insns.iter().any(|i| {
+                matches!(&i.op, Op::InvokeVirtual(m) | Op::InvokeSpecial(m)
+                if (m.class == UNSAFE || m.class == "sun/misc/Unsafe")
+                && matches!(
+                    (m.name.as_str(), m.descriptor.as_str()),
+                    ("ensureClassInitialized", "(Ljava/lang/Class;)V")
+                        | ("ensureClassInitialized0", "(Ljava/lang/Class;)V")
+                        | ("shouldBeInitialized", "(Ljava/lang/Class;)Z")
+                        | ("shouldBeInitialized0", "(Ljava/lang/Class;)Z")
+                        | ("allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;")
+                ))
+            }) {
+                unsafe_init_reached = true;
+            }
+            if analyzed.insns.iter().any(|i| {
+                matches!(&i.op, Op::InvokeVirtual(m) | Op::InvokeSpecial(m)
+                    if (m.class == UNSAFE || m.class == "sun/misc/Unsafe")
+                    && m.name == "allocateInstance"
+                    && m.descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;")
+            }) {
+                unsafe_alloc_reached = true;
+            }
+            for insn in &analyzed.insns {
+                if caller_sensitive(unit, &insn.op) && unit.get(&key.0).is_some() {
+                    add_records(&key.0, &mut out.records);
+                }
+                match &insn.op {
+                    Op::New { class } => {
+                        if unit.get(class).is_some() {
+                            add_records(class, &mut out.records);
+                            instantiate(
+                                class,
+                                &mut out.instantiated,
+                                &called,
+                                &mut impls_by_sig,
+                                &mut seen_impls,
+                                &mut work,
+                            );
                         }
                     }
-                }
-                // A class literal is what reflection works on (isAssignableFrom, isInstance,
-                // getSuperclass), so its class keeps a record.
-                Op::LdcClass(name) => {
-                    needs_classes = true;
-                    if let Some(c) = name
-                        .strip_prefix('[')
-                        .and_then(|_| element_class(name))
-                        .or_else(|| (!name.starts_with('[')).then(|| name.clone()))
-                        .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
+                    Op::LdcClass(name) => {
+                        needs_classes = true;
+                        if let Some(c) = name
+                            .strip_prefix('[')
+                            .and_then(|_| element_class(name))
+                            .or_else(|| (!name.starts_with('[')).then(|| name.clone()))
+                            .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
+                        {
+                            add_records(&c, &mut out.records);
+                        }
+                    }
+                    Op::LdcString(_) => {
+                        add_records(STRING, &mut out.records);
+                        instantiate(
+                            STRING,
+                            &mut out.instantiated,
+                            &called,
+                            &mut impls_by_sig,
+                            &mut seen_impls,
+                            &mut work,
+                        );
+                    }
+                    Op::CheckCast { class } | Op::InstanceOf { class }
+                        if class.starts_with('[') =>
                     {
-                        add_records(&c, &mut out.records);
+                        if let Some(c) = element_class(class)
+                            .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
+                        {
+                            add_records(&c, &mut out.records);
+                        }
                     }
-                }
-                Op::LdcString(_) => {
-                    add_records(STRING, &mut out.records);
-                    if out.instantiated.insert(STRING.to_string()) {
-                        work.extend(implementations(STRING).into_iter().filter(|k| {
-                            compiled(k) && called.contains(&(k.1.clone(), k.2.clone()))
-                        }));
+                    Op::MultiANewArray { class, .. } => {
+                        if let Some(c) = innermost_class(class).filter(|c| unit.get(c).is_some()) {
+                            add_records(c, &mut out.records);
+                        }
                     }
-                }
-                Op::CheckCast { class } | Op::InstanceOf { class } if class.starts_with('[') => {
-                    if let Some(c) = element_class(class)
-                        .filter(|c| !c.starts_with('[') && unit.get(c).is_some())
+                    Op::ANewArray { class }
+                    | Op::CheckCast { class }
+                    | Op::InstanceOf { class }
+                        if !class.starts_with('[') && unit.get(class).is_some() =>
                     {
-                        add_records(&c, &mut out.records);
+                        add_records(class, &mut out.records);
                     }
+                    _ => {}
                 }
-                // The innermost element class, however many levels: the allocation passes its
-                // record (emit_method), so it must have one.
-                Op::MultiANewArray { class, .. } => {
-                    if let Some(c) = innermost_class(class).filter(|c| unit.get(c).is_some()) {
-                        add_records(c, &mut out.records);
-                    }
-                }
-                Op::ANewArray { class } | Op::CheckCast { class } | Op::InstanceOf { class }
-                    if !class.starts_with('[') && unit.get(class).is_some() =>
-                {
-                    add_records(class, &mut out.records);
-                }
-                _ => {}
             }
         }
     }
@@ -8141,7 +8787,6 @@ const MODULES_C: &str = include_str!("../runtime/jabs_modules.c");
 const MODULES_H: &str = include_str!("../runtime/jabs_modules.h");
 
 /// What a program needs beyond its classes.
-#[derive(Default)]
 pub struct UnitExtras {
     /// Classes the application class loader defines (the rest belong to the boot loader).
     pub app_classes: BTreeSet<String>,
@@ -8185,6 +8830,26 @@ pub struct UnitExtras {
     /// declaration gives (src/cgen/modules.rs). Empty: every class is in its loader's unnamed
     /// module (no module encapsulation).
     pub jdk_modules: Vec<crate::jdk::JdkModule>,
+    /// Whether to also assemble the monolithic `CompiledUnit::c_source` string.
+    /// Defaults to `true`; CLI `--out-dir` without `--out` sets this to `false`.
+    pub emit_single_source: bool,
+}
+
+impl Default for UnitExtras {
+    fn default() -> Self {
+        UnitExtras {
+            app_classes: BTreeSet::new(),
+            resources: Vec::new(),
+            java_home: None,
+            loaded_classes: BTreeSet::new(),
+            executed_methods: BTreeSet::new(),
+            startup: false,
+            jab: None,
+            known_classes: None,
+            jdk_modules: Vec::new(),
+            emit_single_source: true,
+        }
+    }
 }
 
 /// A program's .jab, as the generated C knows it.
@@ -8203,7 +8868,7 @@ pub struct JabConfig {
 fn executed_roots(
     unit: &Unit,
     executed: &BTreeSet<MethodKey>,
-    compiled: &BTreeSet<MethodKey>,
+    is_compiled: &mut dyn FnMut(&MethodKey) -> bool,
 ) -> (Vec<MethodKey>, ExecutedRoots) {
     let mut roots = Vec::new();
     let mut counts = ExecutedRoots::default();
@@ -8224,7 +8889,7 @@ fn executed_roots(
             counts.abstract_in_unit += 1;
             continue;
         }
-        if !compiled.contains(key) {
+        if !is_compiled(key) {
             counts.not_compiled += 1;
             continue;
         }
@@ -8232,6 +8897,34 @@ fn executed_roots(
         roots.push(key.clone());
     }
     (roots, counts)
+}
+
+/// Group items into up to `max_shards` non-empty strings, keeping at least `min_per_shard` items each.
+fn shard_strings(items: &[String], max_shards: usize, min_per_shard: usize) -> Vec<String> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let shards = (items.len() / min_per_shard.max(1))
+        .clamp(1, max_shards.max(1))
+        .min(items.len());
+    let per = items.len().div_ceil(shards);
+    items
+        .chunks(per)
+        .map(|chunk| {
+            let cap: usize = chunk.iter().map(String::len).sum();
+            let mut s = String::with_capacity(cap);
+            for item in chunk {
+                s.push_str(item);
+            }
+            s
+        })
+        .collect()
+}
+
+fn strip_includes(text: &str) -> String {
+    text.replacen("#include \"jabs_unit.h\"\n", "", 1)
+        .replacen("#include \"jabs_runtime.h\"\n", "", 1)
+        .replacen("#include \"jabs_unit_internal.h\"\n", "", 1)
 }
 
 /// Compile a set of classes together into one C unit, emitting only what is reachable from
@@ -8249,8 +8942,16 @@ pub fn compile_unit_with(
     roots: Option<&BTreeSet<String>>,
     extras: &UnitExtras,
 ) -> CompiledUnit {
+    compile_unit_owned(classes.to_vec(), roots, extras)
+}
+
+/// Like `compile_unit_with`, taking ownership of `classes` to avoid cloning the entire unit.
+pub fn compile_unit_owned(
+    mut owned: Vec<ClassFile>,
+    roots: Option<&BTreeSet<String>>,
+    extras: &UnitExtras,
+) -> CompiledUnit {
     // invokedynamic call sites become calls into generated classes (see indy.rs).
-    let mut owned = classes.to_vec();
     let indy = crate::indy::desugar(&mut owned);
     // java.lang.reflect.Proxy classes, generated for every interface list the program can ask
     // for (see proxy.rs).
@@ -8290,224 +8991,141 @@ pub fn compile_unit_with(
     }
     let roots = roots.as_ref();
     let have_classes = classes_available(&unit);
-    let mut intrinsics: HashMap<MethodKey, (String, bool)> = HashMap::new();
-    let mut results: BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>> =
-        BTreeMap::new();
-    for class in classes {
-        let structural = structural_problem(&unit, class);
-        for method in &class.methods {
-            let key = (
-                class.name.clone(),
-                method.name.clone(),
-                method.descriptor.clone(),
-            );
-            let result = (|| {
-                if let Some(reason) = &structural {
-                    return Err(reason.clone());
-                }
+    let cache = RefCell::new(AnalysisCache::new(&unit, have_classes));
 
-                let sig = parse_signature(&method.descriptor).map_err(|e| e.to_string())?;
-                if let Some(body) = replacement(&key, have_classes) {
-                    intrinsics.insert(key.clone(), body);
-                    return Ok((sig, Analyzed::empty()));
+    let (executed_counts, emission, poisoned, self_contained) = match roots {
+        None => {
+            let all_methods: Vec<(&ClassFile, &Member)> = classes
+                .iter()
+                .flat_map(|c| c.methods.iter().map(move |m| (c, m)))
+                .collect();
+            {
+                let mut c = cache.borrow_mut();
+                c.analyze_batch(all_methods);
+                for class in classes {
+                    c.check_init(&class.name);
                 }
-                if method.access & ACC_NATIVE != 0 {
-                    let found = management::intrinsic(&unit, &key, have_classes)
-                        .or_else(|| net::intrinsic(&key, have_classes))
-                        .or_else(|| nio_fs::intrinsic(&key, have_classes))
-                        .or_else(|| modules::intrinsic(&key))
-                        .or_else(|| stack::intrinsic(&key, have_classes))
-                        .or_else(|| method_handles::intrinsic(&key, have_classes))
-                        .or_else(|| unsafe_rt::intrinsic(&key, have_classes))
-                        .or_else(|| zip::intrinsic(&key, have_classes))
-                        .or_else(|| boot_extras::intrinsic(&key, have_classes))
-                        .or_else(|| intrinsic(&key, have_classes));
-                    let Some(body) = found else {
-                        return Err("native method without a JABS implementation".to_string());
-                    };
-                    intrinsics.insert(key.clone(), body);
-                    return Ok((sig, Analyzed::empty()));
-                }
-                let analyzed = analyze(&unit, class, method, &sig)?;
-                Ok((sig, analyzed))
-            })();
-            results.insert(key, result);
-        }
-    }
-    // A class can be initialized natively when its hierarchy is in the unit, its <clinit> body
-    // compiles and its prerequisites can be initialized. Calls to methods that did not compile
-    // no longer block their callers: they reach a stub that stops with a diagnostic only if it
-    // actually runs. Failures only spread, so iterating until nothing changes terminates.
-    let mut init_ok: HashMap<String, std::result::Result<(), String>> = classes
-        .iter()
-        .map(|c| {
-            (
-                c.name.clone(),
-                structural_problem(&unit, c).map_or(Ok(()), Err),
-            )
-        })
-        .collect();
-    loop {
-        let mut changed = false;
-        for class in classes {
-            if init_ok[&class.name].is_err() {
-                continue;
             }
-            let clinit = (
-                class.name.clone(),
-                "<clinit>".to_string(),
-                "()V".to_string(),
-            );
-            let problem = match results.get(&clinit) {
-                Some(Err(reason)) => Some(format!(
-                    "static initializer of {} not compiled: {reason}",
-                    class.name
-                )),
-                _ => init_prerequisites(&unit, class).into_iter().find_map(|p| {
-                    match init_ok.get(&p) {
-                        Some(Ok(())) => None,
-                        Some(Err(reason)) => Some(reason.clone()),
-                        None => Some(format!("{p} is not in the compilation unit")),
-                    }
-                }),
+            let (_executed, executed_counts) =
+                executed_roots(&unit, &extras.executed_methods, &mut |k| {
+                    matches!(cache.borrow().results.get(k), Some(Ok(_)))
+                });
+            let c = cache.borrow();
+            let compiled: BTreeSet<MethodKey> = c
+                .results
+                .iter()
+                .filter(|(_, r)| r.is_ok())
+                .map(|(k, _)| k.clone())
+                .collect();
+            let initializable: BTreeSet<String> = classes
+                .iter()
+                .filter(|cls| c.init_ok.get(&cls.name).is_some_and(Result::is_ok))
+                .map(|cls| cls.name.clone())
+                .collect();
+            let poisoned = poisoned_by(&unit, classes, &c.results, &c.init_ok);
+            let mut self_contained: BTreeSet<MethodKey> = BTreeSet::new();
+            for (key, categories) in &poisoned {
+                if categories.is_empty() {
+                    self_contained.insert(key.clone());
+                }
+            }
+            let laid_out_all: Vec<&ClassFile> = classes
+                .iter()
+                .filter(|cls| cls.access & ACC_INTERFACE == 0 && unit.chain(&cls.name).is_ok())
+                .collect();
+            let emission = Emission {
+                methods: compiled,
+                records: laid_out_all
+                    .iter()
+                    .map(|cls| cls.name.clone())
+                    .chain(
+                        classes
+                            .iter()
+                            .filter(|cls| cls.access & ACC_INTERFACE != 0)
+                            .map(|cls| cls.name.clone()),
+                    )
+                    .collect(),
+                instantiated: laid_out_all.iter().map(|cls| cls.name.clone()).collect(),
+                inits: initializable,
             };
-            if let Some(problem) = problem {
-                init_ok.insert(class.name.clone(), Err(problem));
-                changed = true;
+            (executed_counts, emission, poisoned, self_contained)
+        }
+        Some(roots) => {
+            // Demand-driven analysis: seed with root classes' methods + non-abstract executed methods.
+            let mut seed_keys: Vec<MethodKey> = Vec::new();
+            for class in classes.iter().filter(|c| roots.contains(&c.name)) {
+                for m in &class.methods {
+                    seed_keys.push((class.name.clone(), m.name.clone(), m.descriptor.clone()));
+                }
             }
+            for key in &extras.executed_methods {
+                if let Some(class) = unit.get(&key.0)
+                    && let Some(m) = class
+                        .methods
+                        .iter()
+                        .find(|m| m.name == key.1 && m.descriptor == key.2)
+                    && m.access & ACC_ABSTRACT == 0
+                {
+                    seed_keys.push(key.clone());
+                }
+            }
+            cache.borrow_mut().ensure_analyzed(&seed_keys);
+            let (executed, executed_counts) =
+                executed_roots(&unit, &extras.executed_methods, &mut |k| {
+                    cache.borrow_mut().is_compiled(k)
+                });
+            let emission = reachable(
+                &unit,
+                classes,
+                &cache,
+                &ReachFrom {
+                    roots,
+                    extras,
+                    executed: &executed,
+                    proxies: &proxies.proxies,
+                },
+            );
+            let mut scope_ok: Vec<MethodKey> = Vec::new();
+            {
+                let mut seen_ok = HashSet::new();
+                let c = cache.borrow();
+                for k in emission.methods.iter().chain(executed.iter()) {
+                    if matches!(c.results.get(k), Some(Ok(_))) && seen_ok.insert(k.clone()) {
+                        scope_ok.push(k.clone());
+                    }
+                }
+            }
+            let poisoned = poisoned_by_scoped(&mut cache.borrow_mut(), &scope_ok);
+            let mut self_contained: BTreeSet<MethodKey> = BTreeSet::new();
+            for (key, categories) in &poisoned {
+                if categories.is_empty() {
+                    self_contained.insert(key.clone());
+                }
+            }
+            (executed_counts, emission, poisoned, self_contained)
         }
-        if !changed {
-            break;
-        }
-    }
-    let compiled: BTreeSet<MethodKey> = results
-        .iter()
-        .filter(|(_, r)| r.is_ok())
-        .map(|(k, _)| k.clone())
-        .collect();
-    let (executed, executed_counts) = executed_roots(&unit, &extras.executed_methods, &compiled);
-    let initializable: BTreeSet<String> = classes
-        .iter()
-        .filter(|c| init_ok[&c.name].is_ok())
-        .map(|c| c.name.clone())
-        .collect();
-    let poisoned = poisoned_by(&unit, classes, &results, &initializable, &init_ok);
-    let mut self_contained: BTreeSet<MethodKey> = BTreeSet::new();
-    for (key, categories) in &poisoned {
-        if categories.is_empty() {
-            self_contained.insert(key.clone());
-        }
-    }
-    let laid_out_all: Vec<&ClassFile> = classes
+    };
+    let cache = cache.into_inner();
+    let results = &cache.results;
+    let intrinsics = &cache.intrinsics;
+    let init_ok = &cache.init_ok;
+
+    let mut laid_out: Vec<&ClassFile> = classes
         .iter()
         .filter(|c| c.access & ACC_INTERFACE == 0 && unit.chain(&c.name).is_ok())
         .collect();
-    let emission = match roots {
-        Some(roots) => reachable(
-            &unit,
-            classes,
-            &results,
-            &intrinsics,
-            &initializable,
-            &ReachFrom {
-                roots,
-                extras,
-                executed: &executed,
-                reflect: reflect::ReachInputs {
-                    proxies: &proxies.proxies,
-                    annotation_loads: &crate::proxy::loaded_by_annotations(classes),
-                },
-            },
-        ),
-        None => Emission {
-            methods: compiled.clone(),
-            records: laid_out_all
-                .iter()
-                .map(|c| c.name.clone())
-                .chain(
-                    classes
-                        .iter()
-                        .filter(|c| c.access & ACC_INTERFACE != 0)
-                        .map(|c| c.name.clone()),
-                )
-                .collect(),
-            instantiated: laid_out_all.iter().map(|c| c.name.clone()).collect(),
-            inits: initializable.clone(),
-        },
-    };
-
-    let mut source = String::new();
-    let _ = writeln!(
-        source,
-        "/* Generated by JABS from {} classes. */",
-        classes.len()
-    );
-    source.push_str(RUNTIME_PRELUDE);
-    source.push('\n');
-    // Reflection needs the class registry: runtime/jabs_reflect.c compiles to nothing without it.
-    if have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING) {
-        source.push_str("#define JABS_HAVE_REFLECTION 1\n");
-    }
-    source.push_str(REFLECT_H);
-    source.push('\n');
-    source.push_str(MODULES_H);
-    source.push('\n');
-    // Layouts for every class whose hierarchy is complete, superclasses first (types only).
-    let mut laid_out = laid_out_all.clone();
     laid_out.sort_by_key(|c| {
         (
             unit.chain(&c.name).map(|ch| ch.len()).unwrap_or(0),
             c.name.clone(),
         )
     });
-    for class in &laid_out {
-        emit_object_layout(&mut source, class);
-    }
-    for class in classes {
-        for method in &class.methods {
-            let key = (
-                class.name.clone(),
-                method.name.clone(),
-                method.descriptor.clone(),
-            );
-            if let (true, Some(Ok((sig, _)))) = (emission.methods.contains(&key), results.get(&key))
-            {
-                let _ = writeln!(source, "{};", prototype(&class.name, method, sig));
-            }
-        }
-    }
-    // Every class whose initialization emitted code may trigger: real or stub.
-    for class in emitted_init_targets(&unit, &results, &emission) {
-        let _ = writeln!(source, "int {}(void);", init_symbol(&class));
-    }
-    // Callers reach not-compiled methods through stubs under the real symbol: declare those too.
-    for key in reached_stub_targets(&results, &emission) {
-        let Some(class) = unit.get(&key.0) else {
-            continue;
-        };
-        let Some(method) = class
-            .methods
-            .iter()
-            .find(|m| m.name == key.1 && m.descriptor == key.2)
-        else {
-            continue;
-        };
-        if let Ok(sig) = parse_signature(&key.2) {
-            let _ = writeln!(source, "{};", prototype(&key.0, method, &sig));
-        }
-    }
-    source.push_str("\n/* @@definitions@@ */\n");
-    // A vtable entry is real code only for instantiated classes; everything else is a stub.
-    let live = |class: &str, key: &MethodKey| {
-        emission.instantiated.contains(class) && emission.methods.contains(key)
-    };
     let recorded: Vec<&ClassFile> = laid_out
         .iter()
         .copied()
         .filter(|c| emission.records.contains(&c.name))
         .collect();
-    emit_stubs(&mut source, &unit, &recorded, &live);
-    // Interface records first: class records point at them.
+    let recorded_names: BTreeSet<&str> = recorded.iter().map(|c| c.name.as_str()).collect();
     let mut interface_records: BTreeSet<&str> = emission
         .records
         .iter()
@@ -8515,35 +9133,15 @@ pub fn compile_unit_with(
         .filter(|n| unit.is_interface(n))
         .collect();
     for class in &recorded {
-        for i in unit.superinterfaces(&class.name).unwrap_or_default() {
-            interface_records.insert(&i.name);
+        if let Ok(ifaces) = unit.superinterfaces_arc(&class.name) {
+            for i in ifaces.iter() {
+                interface_records.insert(&i.name);
+            }
         }
     }
-    for name in &interface_records {
-        emit_interface_record(
-            &mut source,
-            &unit,
-            unit.get(name).unwrap(),
-            &interface_records,
-        );
-    }
-    let recorded_names: BTreeSet<&str> = recorded.iter().map(|c| c.name.as_str()).collect();
-    for class in &recorded {
-        emit_class_record(&mut source, &unit, class, &live);
-    }
-    // Arrays inherit Object's methods: a virtual call of hashCode, equals or toString on an
-    // array (an Object-typed receiver, as in HashMap.hash) dispatches through Object's vtable.
-    let array_vtable = if recorded_names.contains(OBJECT) {
-        mangled("jv_", &[OBJECT])
-    } else {
-        "NULL".to_string()
-    };
-    let _ = writeln!(
-        source,
-        "const jabs_class jabs_array_class_record = {{ \"[\", 0, {array_vtable}, NULL, NULL, 0, NULL, 0, 0, 0 }};"
-    );
-    emit_vm_throwables(&mut source, &recorded_names);
-    let mut literals: BTreeSet<Vec<u16>> = emission
+
+    // Collect string literals before generating code so `jabs_runtime.h` and emitters share IDs.
+    let mut literal_set: BTreeSet<Vec<u16>> = emission
         .methods
         .iter()
         .filter_map(|k| results.get(k)?.as_ref().ok())
@@ -8554,7 +9152,7 @@ pub fn compile_unit_with(
         })
         .collect();
     for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
-        literals.extend(
+        literal_set.extend(
             class
                 .fields
                 .iter()
@@ -8562,20 +9160,162 @@ pub fn compile_unit_with(
                 .filter_map(|f| constant_string(class, f)),
         );
     }
+    let literals: Vec<Vec<u16>> = literal_set.into_iter().collect();
+    let literal_ids: HashMap<Vec<u16>, u32> = literals
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.clone(), i as u32))
+        .collect();
+
     let registry =
         have_classes && emission.records.contains(CLASS) && emission.records.contains(STRING);
     let registry_emitted = registry;
-    emit_literals(&mut source, &literals, registry);
-    // Generated classes are left out of stack traces, as the JVM leaves out hidden classes.
-    let hidden_classes: BTreeSet<String> = indy
-        .defined_by
-        .iter()
-        .map(|(generated, _)| generated.clone())
-        .chain(proxies.proxies.iter().map(|p| p.name.clone()))
-        .collect();
+
+    // 1. jabs_runtime.h (shared prelude without unit-specific layouts/prototypes).
+    let mut runtime_header = String::from("#ifndef JABS_RUNTIME_H\n#define JABS_RUNTIME_H\n");
+    let _ = writeln!(
+        runtime_header,
+        "/* Generated by JABS from {} classes. */",
+        classes.len()
+    );
+    runtime_header.push_str(RUNTIME_PRELUDE);
+    runtime_header.push('\n');
     if registry {
+        runtime_header.push_str("#define JABS_HAVE_REFLECTION 1\n");
+    }
+    runtime_header.push_str(REFLECT_H);
+    runtime_header.push('\n');
+    runtime_header.push_str(MODULES_H);
+    runtime_header.push('\n');
+    if !literals.is_empty() {
+        let _ = write!(
+            runtime_header,
+            "extern _Atomic(jabs_object *) jabs_literal_cache[{count}];\n\
+             jabs_object *jabs_literal_get(uint32_t id);\n\
+             static inline jabs_object *jabs_literal(uint32_t id) {{\n\
+                 jabs_object *cached = atomic_load_explicit(&jabs_literal_cache[id], memory_order_acquire);\n\
+                 return cached ? cached : jabs_literal_get(id);\n\
+             }}\n",
+            count = literals.len()
+        );
+    }
+    runtime_header.push_str("#endif\n");
+
+    // 2. Unit-specific declarations for jabs_unit.h.
+    let mut unit_decls = String::from("#include \"jabs_runtime.h\"\n");
+    for class in &laid_out {
+        emit_object_layout(&mut unit_decls, class);
+    }
+    for class in classes {
+        for method in &class.methods {
+            let key = (
+                class.name.clone(),
+                method.name.clone(),
+                method.descriptor.clone(),
+            );
+            if let (true, Some(Ok((sig, _)))) = (emission.methods.contains(&key), results.get(&key))
+            {
+                let _ = writeln!(unit_decls, "{};", prototype(&class.name, method, sig));
+            }
+        }
+    }
+    for class in emitted_init_targets(&unit, results, &emission) {
+        let _ = writeln!(unit_decls, "int {}(void);", init_symbol(&class));
+    }
+    for key in reached_stub_targets(results, &emission) {
+        let Some(class) = unit.get(&key.0) else {
+            continue;
+        };
+        let Some(method) = class
+            .methods
+            .iter()
+            .find(|m| m.name == key.1 && m.descriptor == key.2)
+        else {
+            continue;
+        };
+        if let Ok(sig) = unit.signature(&key.2) {
+            let _ = writeln!(unit_decls, "{};", prototype(&key.0, method, &sig));
+        }
+    }
+
+    // 3. Sharded unit_0_* sections.
+    let live = |class: &str, key: &MethodKey| {
+        emission.instantiated.contains(class) && emission.methods.contains(key)
+    };
+    let stub_pairs = collect_stubs(&unit, &recorded, &live);
+    let mut internal_decls = String::new();
+    let mut stub_defs: Vec<String> = Vec::with_capacity(stub_pairs.len());
+    for (decl, def) in stub_pairs {
+        internal_decls.push_str(&decl);
+        stub_defs.push(def);
+    }
+    let mut reached_stubs_text = String::new();
+    emit_reached_stubs(&mut reached_stubs_text, &unit, results, &emission, init_ok);
+    if !reached_stubs_text.trim().is_empty() {
+        stub_defs.push(reached_stubs_text);
+    }
+    let stub_shards = shard_strings(&stub_defs, 16, 200);
+
+    let mut record_items: Vec<String> =
+        Vec::with_capacity(interface_records.len() + recorded.len());
+    for name in &interface_records {
+        let mut buf = String::new();
+        emit_interface_record(&mut buf, &unit, unit.get(name).unwrap(), &interface_records);
+        record_items.push(buf);
+    }
+    for class in &recorded {
+        let mut buf = String::new();
+        emit_class_record(&mut buf, &unit, class, &live);
+        record_items.push(buf);
+    }
+    let record_shards = shard_strings(&record_items, 16, 150);
+
+    let mut init_items: Vec<String> = Vec::with_capacity(emission.inits.len());
+    for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
+        let _ = writeln!(
+            internal_decls,
+            "extern jabs_class_init {}_state;",
+            init_symbol(&class.name)
+        );
+        let mut buf = String::new();
+        emit_statics_and_init(&mut buf, &unit, class, &literal_ids);
+        init_items.push(buf);
+    }
+    let init_shards = shard_strings(&init_items, 16, 150);
+
+    let mut core_body = String::from(RUNTIME_GLOBALS);
+    let array_vtable = if recorded_names.contains(OBJECT) {
+        mangled("jv_", &[OBJECT])
+    } else {
+        "NULL".to_string()
+    };
+    let _ = writeln!(
+        core_body,
+        "const jabs_class jabs_array_class_record = {{ \"[\", 0, {array_vtable}, NULL, NULL, 0, NULL, 0, 0, 0 }};"
+    );
+    emit_vm_throwables(&mut core_body, &recorded_names);
+    emit_literals(&mut core_body, &literals, registry);
+    core_body.push_str(&thread_glue_functions(&unit, registry, &emission.methods));
+    core_body.push_str(&management::glue(
+        &unit,
+        &emission.methods,
+        &emission.records,
+        &emission.inits,
+    ));
+    if !registry {
+        core_body.push_str(&boot_extras::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+            false,
+        ));
+    }
+
+    let reflect_body = if registry {
+        let mut r = String::new();
         emit_class_registry(
-            &mut source,
+            &mut r,
             &unit,
             &recorded,
             &RegistryInputs {
@@ -8585,113 +9325,100 @@ pub fn compile_unit_with(
                 inits: &emission.inits,
                 methods: &emission.methods,
                 interfaces: &interface_records,
-                hidden: &hidden_classes,
+                hidden: &indy
+                    .defined_by
+                    .iter()
+                    .map(|(generated, _)| generated.clone())
+                    .chain(proxies.proxies.iter().map(|p| p.name.clone()))
+                    .collect(),
                 proxies: &proxies.proxies,
             },
         );
+        r.push_str(&boot_extras::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+            true,
+        ));
+        r.push_str(&modules::tables(&extras.jdk_modules, classes, &app_classes));
+        r.push_str(&modules::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        r.push_str(&net::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        r.push_str(&nio_fs::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        r.push_str(&stack::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        r.push_str(&method_handles::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        r.push_str(&unsafe_rt::glue(&emission.inits));
+        r.push_str(&zip::glue(
+            &unit,
+            &emission.methods,
+            &emission.records,
+            &emission.inits,
+        ));
+        Some(r)
+    } else {
+        None
+    };
+
+    struct EmitItem<'a> {
+        class: &'a ClassFile,
+        method: &'a Member,
+        sig: &'a Signature,
+        analyzed: &'a Analyzed,
+        intrinsic: Option<&'a (String, bool)>,
     }
-    for class in classes.iter().filter(|c| emission.inits.contains(&c.name)) {
-        emit_statics_and_init(&mut source, &unit, class);
-    }
-    emit_reached_stubs(&mut source, &unit, &results, &emission, &init_ok);
-    source.push_str(&thread_glue_functions(&unit, registry, &emission.methods));
-    source.push_str(&management::glue(
-        &unit,
-        &emission.methods,
-        &emission.records,
-        &emission.inits,
-    ));
-    source.push_str(&boot_extras::glue(
-        &unit,
-        &emission.methods,
-        &emission.records,
-        &emission.inits,
-        registry,
-    ));
-    if registry {
-        source.push_str(&modules::tables(&extras.jdk_modules, classes, &app_classes));
-        source.push_str(&modules::glue(
-            &unit,
-            &emission.methods,
-            &emission.records,
-            &emission.inits,
-        ));
-        source.push_str(&net::glue(
-            &unit,
-            &emission.methods,
-            &emission.records,
-            &emission.inits,
-        ));
-        source.push_str(&nio_fs::glue(
-            &unit,
-            &emission.methods,
-            &emission.records,
-            &emission.inits,
-        ));
-        source.push_str(&stack::glue(
-            &unit,
-            &emission.methods,
-            &emission.records,
-            &emission.inits,
-        ));
-        source.push_str(&method_handles::glue(
-            &unit,
-            &emission.methods,
-            &emission.records,
-            &emission.inits,
-        ));
-        source.push_str(&unsafe_rt::glue(&emission.inits));
-        source.push_str(&zip::glue(
-            &unit,
-            &emission.methods,
-            &emission.records,
-            &emission.inits,
-        ));
-    }
-    // Everything above the methods: shared declarations, then data and support definitions.
-    let header_end = source
-        .find(&format!("\n{}", "/* @@definitions@@ */"))
-        .unwrap_or(0);
-    let shared = source[..header_end].to_string();
-    let support = source[header_end..].to_string();
-    source.clear();
-    let mut method_texts: Vec<String> = Vec::new();
+
+    // 4. Parallel method emission + scoped MethodReport construction.
+    let executed_set: HashSet<&MethodKey> = extras.executed_methods.iter().collect();
+    let mut to_emit: Vec<EmitItem<'_>> = Vec::new();
     let mut methods = Vec::new();
     for class in classes {
+        let is_root_class = roots.is_some_and(|r| r.contains(&class.name));
         for method in &class.methods {
             let key = (
                 class.name.clone(),
                 method.name.clone(),
                 method.descriptor.clone(),
             );
-            let status = match &results[&key] {
-                _ if method.access & ACC_ABSTRACT != 0 => MethodStatus::Abstract,
-                Ok((sig, analyzed)) => {
-                    if !emission.methods.contains(&key) {
-                    } else if let Some((body, _)) = intrinsics.get(&key) {
-                        let mut unused = String::new();
-                        if method.access & ACC_STATIC == 0 {
-                            unused.push_str(" (void)self;");
-                        }
-                        for i in 0..sig.params.len() {
-                            let _ = write!(unused, " (void)a{i};");
-                        }
-                        let mut text = String::new();
-                        let _ = writeln!(
-                            text,
-                            "/* native {}.{}{} */",
-                            class.name, method.name, method.descriptor
-                        );
-                        let _ = writeln!(
-                            text,
-                            "{} {{{unused} {body} }}\n",
-                            prototype(&class.name, method, sig)
-                        );
-                        method_texts.push(text);
-                    } else {
-                        let mut text = String::new();
-                        emit_method(&mut text, &unit, class, method, sig, analyzed);
-                        method_texts.push(text);
+            let emitted = emission.methods.contains(&key);
+            if roots.is_some() && !is_root_class && !emitted && !executed_set.contains(&key) {
+                continue;
+            }
+            let status = match results.get(&key) {
+                Some(_) if method.access & ACC_ABSTRACT != 0 => MethodStatus::Abstract,
+                Some(Ok((sig, analyzed))) => {
+                    if emitted {
+                        to_emit.push(EmitItem {
+                            class,
+                            method,
+                            sig,
+                            analyzed,
+                            intrinsic: intrinsics.get(&key),
+                        });
                     }
                     MethodStatus::Compiled {
                         symbol: symbol(&key.0, &key.1, &key.2),
@@ -8699,8 +9426,11 @@ pub fn compile_unit_with(
                         blocked_by: poisoned.get(&key).cloned().unwrap_or_default(),
                     }
                 }
-                Err(reason) => MethodStatus::Unsupported {
+                Some(Err(reason)) => MethodStatus::Unsupported {
                     reason: reason.clone(),
+                },
+                None => MethodStatus::Unsupported {
+                    reason: "not analyzed".to_string(),
                 },
             };
             methods.push(MethodReport {
@@ -8711,6 +9441,68 @@ pub fn compile_unit_with(
             });
         }
     }
+
+    let emit_one = |item: &EmitItem<'_>| -> (usize, String) {
+        if let Some((body, _)) = item.intrinsic {
+            let mut unused = String::new();
+            if item.method.access & ACC_STATIC == 0 {
+                unused.push_str(" (void)self;");
+            }
+            for i in 0..item.sig.params.len() {
+                let _ = write!(unused, " (void)a{i};");
+            }
+            let mut text = String::new();
+            let _ = writeln!(
+                text,
+                "/* native {}.{}{} */",
+                item.class.name, item.method.name, item.method.descriptor
+            );
+            let _ = writeln!(
+                text,
+                "{} {{{unused} {body} }}\n",
+                prototype(&item.class.name, item.method, item.sig)
+            );
+            (1, text)
+        } else {
+            let calls = item
+                .analyzed
+                .resolved
+                .values()
+                .filter(|r| matches!(r, Resolved::Call(_)))
+                .count();
+            let cost =
+                (item.analyzed.insns.len() + item.analyzed.dispatch.len() * 8 + calls * 4).max(1);
+            let mut text = String::new();
+            emit_method(
+                &mut text,
+                &unit,
+                item.class,
+                item.method,
+                item.sig,
+                item.analyzed,
+                &literal_ids,
+            );
+            (cost, text)
+        }
+    };
+
+    let method_texts: Vec<(usize, String)> = if to_emit.len() >= 16 {
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(to_emit.len());
+        let chunk_size = to_emit.len().div_ceil(threads).max(1);
+        let chunks: Vec<Vec<(usize, String)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = to_emit
+                .chunks(chunk_size)
+                .map(|chunk| scope.spawn(|| chunk.iter().map(emit_one).collect::<Vec<_>>()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        chunks.into_iter().flatten().collect()
+    } else {
+        to_emit.iter().map(emit_one).collect()
+    };
+
     let compiled = methods
         .iter()
         .filter(|m| matches!(m.status, MethodStatus::Compiled { .. }))
@@ -8731,26 +9523,69 @@ pub fn compile_unit_with(
             )
         })
         .count();
+
+    let mut extern_decls = String::new();
+    for s in &record_shards {
+        extern_decls.push_str(&declarations_for(s));
+    }
+    for s in &init_shards {
+        extern_decls.push_str(&declarations_for(s));
+    }
+    for s in &stub_shards {
+        extern_decls.push_str(&declarations_for(s));
+    }
+    extern_decls.push_str(&declarations_for(&core_body));
+    if let Some(ref reflect) = reflect_body {
+        extern_decls.push_str(&declarations_for(reflect));
+    }
+
+    let unit_header = format!(
+        "#ifndef JABS_UNIT_H\n#define JABS_UNIT_H\n{unit_decls}\n/* Definitions elsewhere in this program. */\n{extern_decls}#endif\n"
+    );
+    let internal_header = format!(
+        "#ifndef JABS_UNIT_INTERNAL_H\n#define JABS_UNIT_INTERNAL_H\n#include \"jabs_unit.h\"\n{internal_decls}#endif\n"
+    );
+    let resources_c = resources_file(
+        &extras.resources,
+        extras.jab.as_ref(),
+        extras.java_home.as_deref(),
+    );
+
     let c_files = {
-        let header = format!(
-            "{shared}\n/* Definitions elsewhere in this program. */\n{}",
-            declarations_for(&support)
-        );
         let mut files = vec![
-            ("jabs_unit.h".to_string(), header),
+            ("jabs_unit.h".to_string(), unit_header),
+            ("jabs_runtime.h".to_string(), runtime_header.clone()),
+            ("jabs_unit_internal.h".to_string(), internal_header),
             (
-                "unit_0.c".to_string(),
-                format!("#include \"jabs_unit.h\"\n{RUNTIME_GLOBALS}{support}"),
+                "unit_0_core.c".to_string(),
+                format!("#include \"jabs_unit_internal.h\"\n{core_body}"),
             ),
         ];
-        files.push((
-            "resources.c".to_string(),
-            resources_file(
-                &extras.resources,
-                extras.jab.as_ref(),
-                extras.java_home.as_deref(),
-            ),
-        ));
+        for (i, s) in stub_shards.iter().enumerate() {
+            files.push((
+                format!("unit_0_stubs_{i}.c"),
+                format!("#include \"jabs_unit_internal.h\"\n{s}"),
+            ));
+        }
+        for (i, s) in record_shards.iter().enumerate() {
+            files.push((
+                format!("unit_0_records_{i}.c"),
+                format!("#include \"jabs_unit_internal.h\"\n{s}"),
+            ));
+        }
+        for (i, s) in init_shards.iter().enumerate() {
+            files.push((
+                format!("unit_0_inits_{i}.c"),
+                format!("#include \"jabs_unit_internal.h\"\n{s}"),
+            ));
+        }
+        if let Some(ref reflect) = reflect_body {
+            files.push((
+                "unit_0_reflect.c".to_string(),
+                format!("#include \"jabs_unit_internal.h\"\n{reflect}"),
+            ));
+        }
+        files.push(("resources.c".to_string(), resources_c.clone()));
         files.push(("jabs_jab.c".to_string(), JAB_C.to_string()));
         files.push(("jabs_platform.c".to_string(), PLATFORM_C.to_string()));
         files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
@@ -8765,7 +9600,7 @@ pub fn compile_unit_with(
             files.push(("jabs_nio_fs.c".to_string(), NIO_FS_C.to_string()));
             files.push(("jabs_zip.c".to_string(), ZIP_C.to_string()));
         }
-        for (i, chunk) in method_chunks(&method_texts, 32).into_iter().enumerate() {
+        for (i, chunk) in method_chunks(&method_texts, 48).into_iter().enumerate() {
             files.push((
                 format!("unit_{}.c", i + 1),
                 format!("#include \"jabs_unit.h\"\n{chunk}"),
@@ -8778,6 +9613,53 @@ pub fn compile_unit_with(
     if let Err(problem) = symbols::check(&c_files) {
         panic!("jabs: {problem}");
     }
+
+    let c_source = if extras.emit_single_source {
+        let mut s = String::new();
+        s.push_str(&runtime_header);
+        s.push_str(&strip_includes(&unit_decls));
+        s.push_str(&extern_decls);
+        s.push_str(&internal_decls);
+        s.push_str(&core_body);
+        for shard in &stub_shards {
+            s.push_str(shard);
+        }
+        for shard in &record_shards {
+            s.push_str(shard);
+        }
+        for shard in &init_shards {
+            s.push_str(shard);
+        }
+        if let Some(ref reflect) = reflect_body {
+            s.push_str(reflect);
+        }
+        for (_, text) in &method_texts {
+            s.push_str(text);
+        }
+        s.push_str(&strip_includes(&resources_c));
+        // First of the handwritten files: on Windows, winsock2.h must come before the
+        // first windows.h.
+        if registry_emitted {
+            s.push_str(&strip_includes(NET_C));
+        }
+        s.push_str(&strip_includes(PLATFORM_C));
+        s.push_str(&strip_includes(FILES_C));
+        s.push_str(&strip_includes(JAB_C));
+        s.push_str(&strip_includes(SYNC_C));
+        s.push_str(&strip_includes(THREAD_C));
+        s.push_str(&strip_includes(REFLECT_C));
+        if registry_emitted {
+            s.push_str(&strip_includes(IO_C));
+            s.push_str(&strip_includes(MANAGEMENT_C));
+            s.push_str(&strip_includes(MODULES_C));
+            s.push_str(&strip_includes(NIO_FS_C));
+            s.push_str(&strip_includes(ZIP_C));
+        }
+        s
+    } else {
+        String::new()
+    };
+
     CompiledUnit {
         schema_version: 1,
         lambda_sites: indy.lambdas,
@@ -8798,38 +9680,7 @@ pub fn compile_unit_with(
         self_contained: self_contained_count,
         methods,
         executed_roots: (!extras.executed_methods.is_empty()).then_some(executed_counts),
-        c_source: format!(
-            "{shared}{RUNTIME_GLOBALS}{support}{}{}",
-            method_texts.concat(),
-            resources_file(
-                &extras.resources,
-                extras.jab.as_ref(),
-                extras.java_home.as_deref(),
-            )
-            .replacen("#include \"jabs_unit.h\"\n", "", 1)
-                // First of the handwritten files: on Windows, winsock2.h must come before the
-                // first windows.h.
-                + &(if registry_emitted {
-                    NET_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                } else {
-                    String::new()
-                })
-                + &PLATFORM_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                + &FILES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                + &JAB_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                + &SYNC_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                + &THREAD_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                + &REFLECT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                + &(if registry_emitted {
-                    IO_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                        + &MANAGEMENT_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                        + &MODULES_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                        + &NIO_FS_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                        + &ZIP_C.replacen("#include \"jabs_unit.h\"\n", "", 1)
-                } else {
-                    String::new()
-                })
-        ),
+        c_source,
         c_files,
     }
 }

@@ -25,7 +25,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #endif
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 /* IOStatus values the dispatchers return. */
 #define JABS_NIO_EOF (-1)

@@ -9,7 +9,8 @@
 //! `void (*const jv_X[])(void) = {`), declarations are `extern` lines or column-0 prototypes
 //! ending in `;`, and everything else that names a symbol refers to it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Prefixes of the symbols JABS generates (cgen.rs `mangled`). `jo_` names struct types, which
 /// the C compiler checks itself.
@@ -84,67 +85,131 @@ fn first_use(after: &str, line: &str) -> FirstUse {
     FirstUse::Refers
 }
 
+struct FileScan<'a> {
+    defined: HashSet<&'a str>,
+    referred: HashMap<&'a str, (&'a str, usize, &'a str)>,
+}
+
+fn scan_file<'a>(file: &'a str, text: &'a str) -> FileScan<'a> {
+    let mut defined: HashSet<&'a str> = HashSet::new();
+    let mut referred: HashMap<&'a str, (&'a str, usize, &'a str)> = HashMap::new();
+    let mut enclosing: &str = "(file scope)";
+    for (number, line) in text.lines().enumerate() {
+        let skip = line.starts_with('#')
+            || line.starts_with("extern ")
+            || line.starts_with("typedef")
+            || line.starts_with("/*")
+            || line.starts_with("//")
+            || line.starts_with(" *")
+            // Pure literal payload / byte-table lines cannot reference JABS C symbols.
+            || line.starts_with('"')
+            || line.starts_with("static const unsigned char jabs_resource_")
+            || line.starts_with("    0x")
+            || (line.starts_with("    \"") && (line.ends_with('"') || line.ends_with("\";")));
+        if skip {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        // Every JABS symbol prefix in `PREFIXES` contains both `'j'` and `'_'`.
+        if !bytes.contains(&b'j') || !bytes.contains(&b'_') {
+            continue;
+        }
+        let column0 = !line.starts_with([' ', '\t', '{', '}']);
+        let mut first = true;
+        let mut i = 0;
+        while i < bytes.len() {
+            if !ident_byte(bytes[i]) || (i > 0 && ident_byte(bytes[i - 1])) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let ident = &line[start..i];
+            if !PREFIXES.iter().any(|p| ident.starts_with(p)) {
+                continue;
+            }
+            let is_first = first;
+            first = false;
+            if column0 && is_first {
+                match first_use(&line[i..], line) {
+                    FirstUse::Defines => {
+                        defined.insert(ident);
+                        enclosing = ident;
+                        continue;
+                    }
+                    FirstUse::Declares => continue,
+                    FirstUse::Refers => {}
+                }
+            }
+            referred
+                .entry(ident)
+                .or_insert((file, number + 1, enclosing));
+        }
+    }
+    FileScan { defined, referred }
+}
+
 /// Check that every JABS symbol referred to in `files` (name, text) is defined in one of them.
 /// Err lists the undefined symbols, each with the definition (and file) that refers to it.
 pub fn check(files: &[(String, String)]) -> Result<(), String> {
     let mut defined: HashSet<&str> = HashSet::new();
     // symbol -> (file, line number, enclosing definition) of its first reference
-    let mut referred: BTreeMap<&str, (&str, usize, &str)> = BTreeMap::new();
-    for (file, text) in files {
-        let mut enclosing: &str = "(file scope)";
-        for (number, line) in text.lines().enumerate() {
-            let skip = line.starts_with('#')
-                || line.starts_with("extern ")
-                || line.starts_with("typedef")
-                || line.starts_with("/*")
-                || line.starts_with("//")
-                || line.starts_with(" *");
-            if skip {
-                continue;
+    let mut referred: HashMap<&str, (&str, usize, &str)> = HashMap::new();
+    if files.len() <= 1 {
+        for (file, text) in files {
+            let scan = scan_file(file.as_str(), text.as_str());
+            defined.extend(scan.defined);
+            for (ident, loc) in scan.referred {
+                referred.entry(ident).or_insert(loc);
             }
-            let column0 = !line.starts_with([' ', '\t', '{', '}']);
-            let bytes = line.as_bytes();
-            let mut first = true;
-            let mut i = 0;
-            while i < bytes.len() {
-                if !ident_byte(bytes[i]) || (i > 0 && ident_byte(bytes[i - 1])) {
-                    i += 1;
-                    continue;
-                }
-                let start = i;
-                while i < bytes.len() && ident_byte(bytes[i]) {
-                    i += 1;
-                }
-                let ident = &line[start..i];
-                if !PREFIXES.iter().any(|p| ident.starts_with(p)) {
-                    continue;
-                }
-                let is_first = first;
-                first = false;
-                if column0 && is_first {
-                    match first_use(&line[i..], line) {
-                        FirstUse::Defines => {
-                            defined.insert(ident);
-                            enclosing = ident;
-                            continue;
+        }
+    } else {
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(files.len());
+        let next = AtomicUsize::new(0);
+        let mut ordered: Vec<Option<FileScan<'_>>> = (0..files.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut local = Vec::new();
+                        loop {
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            if idx >= files.len() {
+                                break;
+                            }
+                            let (file, text) = &files[idx];
+                            local.push((idx, scan_file(file.as_str(), text.as_str())));
                         }
-                        FirstUse::Declares => continue,
-                        FirstUse::Refers => {}
-                    }
+                        local
+                    })
+                })
+                .collect();
+            for handle in handles {
+                for (idx, scan) in handle.join().expect("symbol scanner thread panicked") {
+                    ordered[idx] = Some(scan);
                 }
-                referred
-                    .entry(ident)
-                    .or_insert((file.as_str(), number + 1, enclosing));
+            }
+        });
+        // Merge in deterministic file order so `referred` keeps the earliest reference.
+        for scan in ordered.into_iter().flatten() {
+            defined.extend(scan.defined);
+            for (ident, loc) in scan.referred {
+                referred.entry(ident).or_insert(loc);
             }
         }
     }
-    let missing: Vec<(&&str, &(&str, usize, &str))> = referred
-        .iter()
-        .filter(|(symbol, _)| !defined.contains(**symbol))
+    let mut missing: Vec<(&str, (&str, usize, &str))> = referred
+        .into_iter()
+        .filter(|(symbol, _)| !defined.contains(symbol))
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
+    missing.sort_unstable_by_key(|(symbol, _)| *symbol);
     let mut message = format!(
         "generated C refers to {} JABS symbol(s) that nothing defines (an emitter names a record, \
          method, stub or initializer that emission left out):\n",

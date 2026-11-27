@@ -1,7 +1,7 @@
 /* RFC 1950 (zlib framing) + RFC 1951 (DEFLATE/INFLATE) + Adler-32 engine for
  * java.util.zip.Inflater and java.util.zip.Deflater. Self-contained C11 with
  * streaming byte-by-byte / 1-byte boundaries and no external dependencies. */
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 /* ---- Shared RFC 1951 constants ---- */
 

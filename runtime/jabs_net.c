@@ -29,7 +29,7 @@
 #include <unistd.h>
 #endif
 #include <limits.h>
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 /* Longest host name the resolver hands back (NI_MAXHOST, which strict POSIX headers hide). */
 #define JABS_NET_HOST_CAP 1025

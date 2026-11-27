@@ -114,7 +114,12 @@ pub fn parse_class(data: &[u8]) -> Result<ClassInfo> {
 
 /// Read an archive entry fully, failing if it exceeds `limit` bytes (zip-bomb guard).
 fn read_bounded(reader: impl Read, limit: u64, name: &str) -> Result<Vec<u8>> {
-    let mut buffer = Vec::new();
+    read_bounded_hint(reader, limit, 0, name)
+}
+
+fn read_bounded_hint(reader: impl Read, limit: u64, size_hint: u64, name: &str) -> Result<Vec<u8>> {
+    let cap = usize::try_from(size_hint.min(limit).min(1 << 20)).unwrap_or(0);
+    let mut buffer = Vec::with_capacity(cap);
     reader
         .take(limit + 1)
         .read_to_end(&mut buffer)
@@ -528,8 +533,104 @@ pub fn read_class_list(path: &Path) -> Result<std::collections::BTreeSet<String>
     Ok(names)
 }
 
+/// Maximum jar size read into memory for parallel entry decompression (512 MiB).
+const MAX_PARALLEL_JAR_BYTES: u64 = 512 * 1024 * 1024;
+/// Minimum class count before spawning worker threads for zip decompression/parsing.
+const PARALLEL_CLASS_THRESHOLD: usize = 64;
+
+fn is_target_class(name: &str, prefix: &str) -> bool {
+    let Some(rel) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    rel.ends_with(".class")
+        && !rel.starts_with("META-INF/versions/")
+        && !rel.ends_with("module-info.class")
+}
+
+fn parse_zip_indices<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    indices: &[usize],
+) -> Result<(Vec<ClassFile>, usize)> {
+    let mut classes = Vec::with_capacity(indices.len());
+    let mut unparsable = 0usize;
+    for &index in indices {
+        let entry = archive.by_index(index)?;
+        let size = entry.size();
+        let name = entry.name().to_owned();
+        match read_bounded_hint(entry, MAX_CLASS_BYTES, size, &name)
+            .and_then(|b| ClassFile::parse(&b))
+        {
+            Ok(class) => classes.push(class),
+            Err(_) => unparsable += 1,
+        }
+    }
+    Ok((classes, unparsable))
+}
+
+/// Parse the classes under `prefix` from an in-memory zip buffer, parallelizing decompression
+/// and parsing across threads while preserving deterministic entry order.
+pub(crate) fn classes_from_zip_bytes(
+    zip_bytes: &[u8],
+    prefix: &str,
+    label: &str,
+) -> Result<(Vec<ClassFile>, usize, usize)> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        .with_context(|| format!("read zip {label}"))?;
+    if archive.len() > MAX_ENTRIES {
+        bail!(
+            "{label} has {} entries; limit is {MAX_ENTRIES}",
+            archive.len()
+        );
+    }
+    let indices: Vec<usize> = (0..archive.len())
+        .filter(|&i| {
+            archive
+                .name_for_index(i)
+                .is_some_and(|name| is_target_class(name, prefix))
+        })
+        .collect();
+    let tried = indices.len();
+    if tried < PARALLEL_CLASS_THRESHOLD {
+        let (classes, unparsable) = parse_zip_indices(&mut archive, &indices)?;
+        return Ok((classes, tried, unparsable));
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(tried);
+    let chunk_size = tried.div_ceil(workers);
+    let results: Vec<Result<(Vec<ClassFile>, usize)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = indices
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let worker_archive = archive.clone();
+                scope.spawn(move || {
+                    let mut local_archive = worker_archive;
+                    parse_zip_indices(&mut local_archive, chunk)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("zip class parser thread panicked"))
+            .collect()
+    });
+    let mut classes = Vec::with_capacity(tried);
+    let mut unparsable = 0usize;
+    for res in results {
+        let (chunk_classes, chunk_unparsable) = res?;
+        classes.extend(chunk_classes);
+        unparsable += chunk_unparsable;
+    }
+    Ok((classes, tried, unparsable))
+}
+
 /// Parse every class in a JAR (multi-release overlays skipped); returns (classes, entries tried, unparsable).
 pub fn read_jar_classes(path: &Path) -> Result<(Vec<ClassFile>, usize, usize)> {
+    let meta = std::fs::metadata(path).with_context(|| format!("open jar {}", path.display()))?;
+    if meta.len() <= MAX_PARALLEL_JAR_BYTES {
+        let bytes = std::fs::read(path).with_context(|| format!("open jar {}", path.display()))?;
+        return classes_from_zip_bytes(&bytes, "", &path.display().to_string());
+    }
     let file = File::open(path).with_context(|| format!("open jar {}", path.display()))?;
     let mut archive =
         zip::ZipArchive::new(file).with_context(|| format!("read zip {}", path.display()))?;
@@ -548,24 +649,60 @@ pub fn classes_from_zip<R: Read + std::io::Seek>(
             archive.len()
         );
     }
-    let (mut classes, mut tried, mut unparsable) = (Vec::new(), 0, 0);
+    let mut payloads: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut tried = 0usize;
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
+        let size = entry.size();
         let name = entry.name().to_owned();
-        let Some(rel) = name.strip_prefix(prefix) else {
-            continue;
-        };
-        if !rel.ends_with(".class")
-            || rel.starts_with("META-INF/versions/")
-            || rel.ends_with("module-info.class")
-        {
+        if !is_target_class(&name, prefix) {
             continue;
         }
         tried += 1;
-        match read_bounded(entry, MAX_CLASS_BYTES, &name).and_then(|b| ClassFile::parse(&b)) {
-            Ok(class) => classes.push(class),
-            Err(_) => unparsable += 1,
+        payloads.push(read_bounded_hint(entry, MAX_CLASS_BYTES, size, &name).ok());
+    }
+    if payloads.len() < PARALLEL_CLASS_THRESHOLD {
+        let mut classes = Vec::with_capacity(payloads.len());
+        let mut unparsable = 0usize;
+        for payload in payloads {
+            match payload.and_then(|b| ClassFile::parse(&b).ok()) {
+                Some(class) => classes.push(class),
+                None => unparsable += 1,
+            }
         }
+        return Ok((classes, tried, unparsable));
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(payloads.len());
+    let chunk_size = payloads.len().div_ceil(workers);
+    let results: Vec<(Vec<ClassFile>, usize)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = payloads
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut classes = Vec::with_capacity(chunk.len());
+                    let mut unparsable = 0usize;
+                    for payload in chunk {
+                        match payload.as_deref().and_then(|b| ClassFile::parse(b).ok()) {
+                            Some(class) => classes.push(class),
+                            None => unparsable += 1,
+                        }
+                    }
+                    (classes, unparsable)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("class parser thread panicked"))
+            .collect()
+    });
+    let mut classes = Vec::with_capacity(tried);
+    let mut unparsable = 0usize;
+    for (chunk_classes, chunk_unparsable) in results {
+        classes.extend(chunk_classes);
+        unparsable += chunk_unparsable;
     }
     Ok((classes, tried, unparsable))
 }
@@ -681,7 +818,11 @@ fn part_coverage(
                 compiled += 1;
                 self_contained += usize::from(*whole);
                 for category in blocked_by {
-                    let entry = tally.entry(category.clone()).or_default();
+                    let entry = if let Some(entry) = tally.get_mut(category.as_str()) {
+                        entry
+                    } else {
+                        tally.entry(category.clone()).or_default()
+                    };
                     entry.1 += 1;
                     if blocked_by.len() == 1 {
                         entry.2 += 1;
@@ -745,7 +886,8 @@ pub fn coverage_with(
 ) -> Result<Coverage> {
     let (mut classes, tried, unparsable) = read_jar_classes(path)?;
     let jar_names: Vec<String> = classes.iter().map(|c| c.name.clone()).collect();
-    let mut jdk_names = Vec::new();
+    let jar_set: std::collections::HashSet<&str> = jar_names.iter().map(String::as_str).collect();
+    let mut jdk_names = std::collections::HashSet::new();
     let mut jdk_modules = Vec::new();
     if let Some(java) = jdk {
         let home = crate::jdk::java_home(java)?;
@@ -759,33 +901,31 @@ pub fn coverage_with(
             used.extend(trace.methods.iter().map(|(class, _, _)| class.clone()));
         }
         jdk_modules.push("java.base".to_owned());
-        for module in crate::jdk::modules_containing(&home, &used)? {
-            if !jdk_modules.contains(&module) {
-                jdk_modules.push(module);
+        if !used.is_empty() {
+            for module in crate::jdk::modules_containing(&home, &used)? {
+                if !jdk_modules.contains(&module) {
+                    jdk_modules.push(module);
+                }
             }
         }
         // A jar class with the same name as a JDK class would be shadowed by the boot loader.
-        let mine: std::collections::HashSet<String> = jar_names.iter().cloned().collect();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for module in &jdk_modules {
             let (library, _, library_unparsable) = crate::jdk::read_module(&home, module)?;
             if library_unparsable > 0 {
                 bail!("{library_unparsable} {module} classes could not be parsed");
             }
             for class in library {
-                if mine.contains(&class.name) {
+                if jar_set.contains(class.name.as_str()) {
                     continue;
                 }
-                if !seen.insert(class.name.clone()) {
+                if !jdk_names.insert(class.name.clone()) {
                     bail!("JDK class {} appears in two modules", class.name);
                 }
-                jdk_names.push(class.name.clone());
                 classes.push(class);
             }
         }
     }
     let unit = crate::cgen::compile_unit(&classes);
-    let jar_set: std::collections::HashSet<&str> = jar_names.iter().map(String::as_str).collect();
     let jar = part_coverage(&unit, &jar_set);
     let jdk_set: std::collections::HashSet<&str> = jdk_names.iter().map(String::as_str).collect();
     let jdk_part = (!jdk_names.is_empty()).then(|| part_coverage(&unit, &jdk_set));

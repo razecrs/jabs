@@ -9,7 +9,7 @@
  * says done, the table of Module objects is never written again; readers see it through the
  * gate's release/acquire pair. A failure while building is a JABS bug or a JDK this runtime does
  * not understand, so it stops the program with the module and step named. */
-#include "jabs_unit.h"
+#include "jabs_runtime.h"
 
 /* Most modules one program may have (MAX_MODULES in src/cgen/modules.rs). */
 #define JABS_MAX_MODULES 1024

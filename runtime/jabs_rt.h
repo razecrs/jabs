@@ -41,6 +41,14 @@
 #error "JABS requires FLT_EVAL_METHOD == 0 for Java floating-point semantics"
 #endif
 
+#ifndef JABS_ALWAYS_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define JABS_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define JABS_ALWAYS_INLINE static inline
+#endif
+#endif
+
 /* One interface-table entry: a method signature's selector and the implementation chosen for it. */
 typedef struct jabs_itable_entry {
     uint64_t selector;
@@ -144,7 +152,7 @@ extern _Thread_local const char *jabs_caller;
  * running the initialization), happens in jabs_thread.c under the class-initialization lock. */
 enum { JABS_CLASS_UNINITIALIZED, JABS_CLASS_INITIALIZING, JABS_CLASS_INITIALIZED, JABS_CLASS_ERRONEOUS };
 typedef struct { _Atomic int32_t state; const void *owner; } jabs_class_init;
-static inline bool jabs_class_initialized(jabs_class_init *c) {
+JABS_ALWAYS_INLINE bool jabs_class_initialized(jabs_class_init *c) {
     return atomic_load_explicit(&c->state, memory_order_acquire) == JABS_CLASS_INITIALIZED;
 }
 /* What the caller of jabs_class_init_begin does next: run the initialization (and then call
@@ -280,72 +288,72 @@ static inline jabs_object *jabs_initializer_failure(jabs_object *thrown) {
 }
 
 /* Reinterpret raw IEEE bits as float/double (exact, including NaN payloads). */
-static inline float jabs_fbits(uint32_t bits) { float f; memcpy(&f, &bits, 4); return f; }
-static inline double jabs_dbits(uint64_t bits) { double d; memcpy(&d, &bits, 8); return d; }
+JABS_ALWAYS_INLINE float jabs_fbits(uint32_t bits) { float f; memcpy(&f, &bits, 4); return f; }
+JABS_ALWAYS_INLINE double jabs_dbits(uint64_t bits) { double d; memcpy(&d, &bits, 8); return d; }
 /* And back: the raw bits of a float/double (floatToRawIntBits: NaN payloads kept). */
-static inline uint32_t jabs_float_raw_bits(float f) { uint32_t bits; memcpy(&bits, &f, 4); return bits; }
-static inline uint64_t jabs_double_raw_bits(double d) { uint64_t bits; memcpy(&bits, &d, 8); return bits; }
+JABS_ALWAYS_INLINE uint32_t jabs_float_raw_bits(float f) { uint32_t bits; memcpy(&bits, &f, 4); return bits; }
+JABS_ALWAYS_INLINE uint64_t jabs_double_raw_bits(double d) { uint64_t bits; memcpy(&bits, &d, 8); return bits; }
 
 /* int */
-static inline int32_t jabs_iadd(int32_t a, int32_t b) { return (int32_t)((uint32_t)a + (uint32_t)b); }
-static inline int32_t jabs_isub(int32_t a, int32_t b) { return (int32_t)((uint32_t)a - (uint32_t)b); }
-static inline int32_t jabs_imul(int32_t a, int32_t b) { return (int32_t)((uint32_t)a * (uint32_t)b); }
-static inline int32_t jabs_ineg(int32_t a) { return (int32_t)(0u - (uint32_t)a); }
+JABS_ALWAYS_INLINE int32_t jabs_iadd(int32_t a, int32_t b) { return (int32_t)((uint32_t)a + (uint32_t)b); }
+JABS_ALWAYS_INLINE int32_t jabs_isub(int32_t a, int32_t b) { return (int32_t)((uint32_t)a - (uint32_t)b); }
+JABS_ALWAYS_INLINE int32_t jabs_imul(int32_t a, int32_t b) { return (int32_t)((uint32_t)a * (uint32_t)b); }
+JABS_ALWAYS_INLINE int32_t jabs_ineg(int32_t a) { return (int32_t)(0u - (uint32_t)a); }
 /* Java division: INT_MIN / -1 wraps to INT_MIN (UB in C). Callers check b == 0 first (ArithmeticException). */
-static inline int32_t jabs_idiv(int32_t a, int32_t b) { return (a == INT32_MIN && b == -1) ? INT32_MIN : a / b; }
-static inline int32_t jabs_irem(int32_t a, int32_t b) { return b == -1 ? 0 : a % b; }
+JABS_ALWAYS_INLINE int32_t jabs_idiv(int32_t a, int32_t b) { return (a == INT32_MIN && b == -1) ? INT32_MIN : a / b; }
+JABS_ALWAYS_INLINE int32_t jabs_irem(int32_t a, int32_t b) { return b == -1 ? 0 : a % b; }
 /* Shift counts are masked to 0..31 as Java does; shifting by >= 32 is UB in C. */
-static inline int32_t jabs_ishl(int32_t a, int32_t n) { return (int32_t)((uint32_t)a << (n & 31)); }
+JABS_ALWAYS_INLINE int32_t jabs_ishl(int32_t a, int32_t n) { return (int32_t)((uint32_t)a << (n & 31)); }
 /* Arithmetic right shift built from unsigned ops, so it does not rely on implementation-defined signed >>. */
-static inline int32_t jabs_ishr(int32_t a, int32_t n) {
+JABS_ALWAYS_INLINE int32_t jabs_ishr(int32_t a, int32_t n) {
     uint32_t u = (uint32_t)a >> (n & 31);
     if (a < 0 && (n & 31)) u |= ~(UINT32_MAX >> (n & 31));
     return (int32_t)u;
 }
-static inline int32_t jabs_iushr(int32_t a, int32_t n) { return (int32_t)((uint32_t)a >> (n & 31)); }
+JABS_ALWAYS_INLINE int32_t jabs_iushr(int32_t a, int32_t n) { return (int32_t)((uint32_t)a >> (n & 31)); }
 
 /* long */
-static inline int64_t jabs_ladd(int64_t a, int64_t b) { return (int64_t)((uint64_t)a + (uint64_t)b); }
-static inline int64_t jabs_lsub(int64_t a, int64_t b) { return (int64_t)((uint64_t)a - (uint64_t)b); }
-static inline int64_t jabs_lmul(int64_t a, int64_t b) { return (int64_t)((uint64_t)a * (uint64_t)b); }
-static inline int64_t jabs_lneg(int64_t a) { return (int64_t)(0u - (uint64_t)a); }
-static inline int64_t jabs_ldiv(int64_t a, int64_t b) { return (a == INT64_MIN && b == -1) ? INT64_MIN : a / b; }
-static inline int64_t jabs_lrem(int64_t a, int64_t b) { return b == -1 ? 0 : a % b; }
-static inline int64_t jabs_lshl(int64_t a, int32_t n) { return (int64_t)((uint64_t)a << (n & 63)); }
-static inline int64_t jabs_lshr(int64_t a, int32_t n) {
+JABS_ALWAYS_INLINE int64_t jabs_ladd(int64_t a, int64_t b) { return (int64_t)((uint64_t)a + (uint64_t)b); }
+JABS_ALWAYS_INLINE int64_t jabs_lsub(int64_t a, int64_t b) { return (int64_t)((uint64_t)a - (uint64_t)b); }
+JABS_ALWAYS_INLINE int64_t jabs_lmul(int64_t a, int64_t b) { return (int64_t)((uint64_t)a * (uint64_t)b); }
+JABS_ALWAYS_INLINE int64_t jabs_lneg(int64_t a) { return (int64_t)(UINT64_C(0) - (uint64_t)a); }
+JABS_ALWAYS_INLINE int64_t jabs_ldiv(int64_t a, int64_t b) { return (a == INT64_MIN && b == -1) ? INT64_MIN : a / b; }
+JABS_ALWAYS_INLINE int64_t jabs_lrem(int64_t a, int64_t b) { return b == -1 ? 0 : a % b; }
+JABS_ALWAYS_INLINE int64_t jabs_lshl(int64_t a, int32_t n) { return (int64_t)((uint64_t)a << (n & 63)); }
+JABS_ALWAYS_INLINE int64_t jabs_lshr(int64_t a, int32_t n) {
     uint64_t u = (uint64_t)a >> (n & 63);
     if (a < 0 && (n & 63)) u |= ~(UINT64_MAX >> (n & 63));
     return (int64_t)u;
 }
-static inline int64_t jabs_lushr(int64_t a, int32_t n) { return (int64_t)((uint64_t)a >> (n & 63)); }
+JABS_ALWAYS_INLINE int64_t jabs_lushr(int64_t a, int32_t n) { return (int64_t)((uint64_t)a >> (n & 63)); }
 
 /* Conversions: Java saturates out-of-range floating values and maps NaN to 0. */
-static inline int32_t jabs_d2i(double v) {
+JABS_ALWAYS_INLINE int32_t jabs_d2i(double v) {
     if (v != v) return 0;
     if (v >= 2147483647.0) return INT32_MAX;
     if (v <= -2147483648.0) return INT32_MIN;
     return (int32_t)v;
 }
-static inline int64_t jabs_d2l(double v) {
+JABS_ALWAYS_INLINE int64_t jabs_d2l(double v) {
     if (v != v) return 0;
     if (v >= 9223372036854775807.0) return INT64_MAX; /* 2^63 */
     if (v <= -9223372036854775808.0) return INT64_MIN;
     return (int64_t)v;
 }
-static inline int32_t jabs_f2i(float v) { return jabs_d2i((double)v); }
-static inline int64_t jabs_f2l(float v) { return jabs_d2l((double)v); }
+JABS_ALWAYS_INLINE int32_t jabs_f2i(float v) { return jabs_d2i((double)v); }
+JABS_ALWAYS_INLINE int64_t jabs_f2l(float v) { return jabs_d2l((double)v); }
 /* Keep the low 32 bits, as Java's l2i does. */
-static inline int32_t jabs_l2i(int64_t v) { return (int32_t)(uint32_t)(uint64_t)v; }
-static inline int32_t jabs_i2b(int32_t v) { return (int8_t)(uint8_t)(uint32_t)v; }
-static inline int32_t jabs_i2c(int32_t v) { return (uint16_t)(uint32_t)v; }
-static inline int32_t jabs_i2s(int32_t v) { return (int16_t)(uint16_t)(uint32_t)v; }
+JABS_ALWAYS_INLINE int32_t jabs_l2i(int64_t v) { return (int32_t)(uint32_t)(uint64_t)v; }
+JABS_ALWAYS_INLINE int32_t jabs_i2b(int32_t v) { return (int8_t)(uint8_t)(uint32_t)v; }
+JABS_ALWAYS_INLINE int32_t jabs_i2c(int32_t v) { return (uint16_t)(uint32_t)v; }
+JABS_ALWAYS_INLINE int32_t jabs_i2s(int32_t v) { return (int16_t)(uint16_t)(uint32_t)v; }
 
 /* Comparisons: fcmpl/dcmpl yield -1 on NaN, fcmpg/dcmpg yield 1. */
-static inline int32_t jabs_lcmp(int64_t a, int64_t b) { return (a > b) - (a < b); }
-static inline int32_t jabs_fcmpl(float a, float b) { return a > b ? 1 : a == b ? 0 : -1; }
-static inline int32_t jabs_fcmpg(float a, float b) { return a < b ? -1 : a == b ? 0 : 1; }
-static inline int32_t jabs_dcmpl(double a, double b) { return a > b ? 1 : a == b ? 0 : -1; }
-static inline int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == b ? 0 : 1; }
+JABS_ALWAYS_INLINE int32_t jabs_lcmp(int64_t a, int64_t b) { return (a > b) - (a < b); }
+JABS_ALWAYS_INLINE int32_t jabs_fcmpl(float a, float b) { return a > b ? 1 : a == b ? 0 : -1; }
+JABS_ALWAYS_INLINE int32_t jabs_fcmpg(float a, float b) { return a < b ? -1 : a == b ? 0 : 1; }
+JABS_ALWAYS_INLINE int32_t jabs_dcmpl(double a, double b) { return a > b ? 1 : a == b ? 0 : -1; }
+JABS_ALWAYS_INLINE int32_t jabs_dcmpg(double a, double b) { return a < b ? -1 : a == b ? 0 : 1; }
 
 /* System properties from the command line, as `java -Dkey=value` gives them: each entry is
  * "key=value" ("key" alone means an empty value). Call before jabs_vm_startup; the strings must
@@ -841,13 +849,13 @@ void jabs_sleep_nanos(int64_t nanos);
 int64_t jabs_nano_time_adjustment(int64_t offset_seconds);
 
 /* Elements start right after the header, aligned for any element type. */
-static inline void *jabs_array_data(jabs_array *a) {
+JABS_ALWAYS_INLINE void *jabs_array_data(jabs_array *a) {
     return (char *)a + ((sizeof(jabs_array) + 7) & ~(size_t)7);
 }
 
 /* Shared record for every array object: arrays are instances of no compiled class. */
 extern const jabs_class jabs_array_class_record;
-static inline const jabs_class *jabs_array_class(void) { return &jabs_array_class_record; }
+JABS_ALWAYS_INLINE const jabs_class *jabs_array_class(void) { return &jabs_array_class_record; }
 
 static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *target);
 static inline int32_t jabs_is_array_instance(const jabs_object *o, const char *target, const jabs_class *component);
@@ -856,7 +864,7 @@ static inline int32_t jabs_is_array_instance(const jabs_object *o, const char *t
 static inline int jabs_array_store_ok(jabs_array *a, jabs_object *value) {
     switch (a->component_kind) {
     case JABS_COMPONENT_ANY: return 1;
-    case JABS_COMPONENT_CLASS: return jabs_is_instance(value, a->component);
+    case JABS_COMPONENT_CLASS: return a->component && jabs_is_instance(value, a->component);
     case JABS_COMPONENT_ARRAY: {
         if (value->cls != jabs_array_class()) return 0;
         const char *row = a->component_descriptor;
@@ -1110,6 +1118,7 @@ static inline void jabs_arraycopy(jabs_object *src, int32_t src_pos, jabs_object
         jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX);
         return;
     }
+    if (length == 0) return;
     size_t size = jabs_element_size(s);
     char *from = (char *)jabs_array_data(s) + (size_t)src_pos * size;
     char *to = (char *)jabs_array_data(d) + (size_t)dst_pos * size;
@@ -1155,7 +1164,7 @@ static inline jabs_object *jabs_clone(jabs_object *o) {
 /* Wall time for currentTimeMillis; nanoTime uses the host's monotonic clock. */
 static inline int64_t jabs_current_millis(void) {
     struct timespec t;
-    timespec_get(&t, TIME_UTC);
+    if (timespec_get(&t, TIME_UTC) != TIME_UTC) return 0;
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 int64_t jabs_nano_time(void);
