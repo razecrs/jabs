@@ -1184,6 +1184,28 @@ static inline void (*jabs_itable_find(const jabs_object *o, uint64_t selector))(
     return (lo < o->cls->itable_len && t[lo].selector == selector) ? t[lo].fn : NULL;
 }
 
+/* invokeinterface through a call site's inline cache: the itable entry the site found last.
+ * When it lies in the receiver's own itable and names this method, that is the answer (one
+ * compare, as a monomorphic site mostly sees); otherwise the binary search, remembering what
+ * it found. The cache is one pointer, so threads racing on it see a whole entry, and an entry
+ * of another class fails the range check. NULL when the class does not implement the method. */
+static inline void (*jabs_itable_cached(const jabs_object *o, uint64_t selector,
+                                        _Atomic(const jabs_itable_entry *) *cache))(void) {
+    const jabs_itable_entry *t = o->cls->itable;
+    uint32_t len = o->cls->itable_len;
+    const jabs_itable_entry *e = atomic_load_explicit(cache, memory_order_relaxed);
+    if ((uintptr_t)e >= (uintptr_t)t && (uintptr_t)e < (uintptr_t)(t + len) && e->selector == selector) return e->fn;
+    uint32_t lo = 0, hi = len;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (t[mid].selector < selector) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo >= len || t[lo].selector != selector) return NULL;
+    atomic_store_explicit(cache, &t[lo], memory_order_relaxed);
+    return t[lo].fn;
+}
+
 static inline jabs_object *jabs_new(const jabs_class *cls) {
     jabs_object *o = jabs_gc_tlab_alloc(cls->size);
     if (o) {

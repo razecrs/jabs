@@ -4311,18 +4311,22 @@ fn emit_method(
                 c_params(false, &callee, false),
                 base - 1
             ),
-            CallKind::Interface { selector, .. } => format!(
-                "(({} (*)({}))jabs_itable_find(s[{}].a, UINT64_C(0x{selector:016x})))",
+            // The guard below looked the method up through the site's inline cache.
+            CallKind::Interface { .. } => format!(
+                "(({} (*)({}))jabs_ic_fn)",
                 c_type(callee.ret.code),
                 c_params(false, &callee, false),
-                base - 1
             ),
             _ => symbol(&key.0, &key.1, &key.2),
         };
         let guard = if let CallKind::Interface { selector, .. } = kind {
-            // The receiver's class must implement the interface (JVMS invokeinterface).
+            // The receiver's class must implement the interface (JVMS invokeinterface). One
+            // lookup, through this call site's own inline cache (a static in its own block),
+            // finds the method or proves it missing.
             format!(
-                "if (!s[{r}].a) {npe} if (!jabs_itable_find(s[{r}].a, UINT64_C(0x{selector:016x}))) {} ",
+                "if (!s[{r}].a) {npe} {{ static _Atomic(const jabs_itable_entry *) jabs_ic; \
+                 void (*jabs_ic_fn)(void) = jabs_itable_cached(s[{r}].a, UINT64_C(0x{selector:016x}), &jabs_ic); \
+                 if (!jabs_ic_fn) {} ",
                 throw("java/lang/IncompatibleClassChangeError", exit),
                 r = base - 1
             )
@@ -4336,7 +4340,12 @@ fn emit_method(
             Some(k) => format!("s[{result_at}].{} = {invoke};", field(k)),
             None => format!("{invoke};"),
         };
-        format!("{guard}{assign} if (jabs_pending) {exit}")
+        let close = if matches!(kind, CallKind::Interface { .. }) {
+            "}"
+        } else {
+            ""
+        };
+        format!("{guard}{assign}{close} if (jabs_pending) {exit}")
     };
     for (insn, stack) in a.insns.iter().zip(&a.stacks) {
         if a.targets.contains(&insn.pc) {
