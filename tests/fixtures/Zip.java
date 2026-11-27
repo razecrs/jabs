@@ -430,6 +430,27 @@ class ZipCases {
                         + ((long) i1.getAdler() & 0xffffffffL));
         d1.end();
         i1.end();
+
+        // Regression test: lazy match active when lookahead drops below 3 during final drain.
+        byte[] tailLazy = makeMixed(8192, 0x5441494CL);
+        System.arraycopy(tailLazy, tailLazy.length - 10, tailLazy, tailLazy.length - 3, 3);
+        Deflater dTail = new Deflater(Deflater.DEFAULT_COMPRESSION, false);
+        dTail.setInput(tailLazy);
+        dTail.finish();
+        byte[] cTailAll = new byte[16384];
+        int cTailLen = 0;
+        while (!dTail.finished()) {
+            cTailLen += dTail.deflate(cTailAll, cTailLen, cTailAll.length - cTailLen);
+        }
+        dTail.end();
+        Inflater iTail = new Inflater(false);
+        byte[] rTail = inflateSliced(iTail, Arrays.copyOf(cTailAll, cTailLen), 64, 64);
+        iTail.end();
+        System.out.println(
+                "zlib_tail_lazy ok="
+                        + Arrays.equals(tailLazy, rTail)
+                        + " adler="
+                        + (adler32Of(tailLazy) == adler32Of(rTail)));
     }
 
     // ---- 3. Deflater / Inflater (raw) ----

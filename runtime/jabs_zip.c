@@ -1312,7 +1312,9 @@ static void zip_compress_step(zip_deflater *s, int final_drain) {
         return;
     }
 
-    int32_t min_look = final_drain ? 1 : ZIP_DEF_MAX_LOOK;
+    int32_t min_look = final_drain
+        ? ((s->strategy == ZIP_STRAT_HUFFMAN) ? 1 : 3)
+        : ZIP_DEF_MAX_LOOK;
     int use_lazy = (s->level >= 4 && s->strategy != ZIP_STRAT_HUFFMAN);
 
     while (s->lookahead >= min_look) {
