@@ -530,13 +530,22 @@ static void raise_io_last_error(DWORD code, const char *fallback) {
 #include <limits.h>
 
 /* The system's text for an errno value (thread-safe; handles GNU vs XSI strerror_r). */
-static const char *errno_text(int code, char *buf, size_t size) {
-#if defined(__GLIBC__) && defined(_GNU_SOURCE)
-    return strerror_r(code, buf, size);
-#else
-    if (strerror_r(code, buf, size) != 0) snprintf(buf, size, "error %d", code);
+static const char *errno_text_gnu(char *text, char *buf, size_t size, int code) {
+    (void)buf; (void)size; (void)code;
+    return text;
+}
+
+static const char *errno_text_xsi(int rc, char *buf, size_t size, int code) {
+    if (rc != 0) snprintf(buf, size, "error %d", code);
     return buf;
-#endif
+}
+
+/* Which strerror_r <string.h> declared depends on feature macros set before the first include
+   anywhere, so pick by its return type rather than by _GNU_SOURCE here. */
+static const char *errno_text(int code, char *buf, size_t size) {
+    return _Generic(strerror_r(code, buf, size),
+                    char *: errno_text_gnu,
+                    default: errno_text_xsi)(strerror_r(code, buf, size), buf, size, code);
 }
 
 /* JNU_ThrowByNameWithLastError: the errno text, or the default when errno is 0. */

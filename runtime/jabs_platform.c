@@ -9,6 +9,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+/* GetSystemMetrics (hasDisplays0): MinGW links user32 by default, the MSVC target does not. */
+#ifdef _MSC_VER
+#pragma comment(lib, "user32.lib")
+#endif
 #include <io.h>
 #include <fcntl.h>
 
