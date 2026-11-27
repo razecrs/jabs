@@ -843,6 +843,8 @@ int32_t jabs_vfs_close(int64_t d);
 
 /* SetErrorMode on Windows (returns the previous mode); 0 elsewhere. */
 int64_t jabs_platform_set_error_mode(int64_t mode);
+/* sun.awt.PlatformGraphicsInfo.hasDisplays0 on Windows: 1 when the desktop has a display. */
+int32_t jabs_platform_has_displays(void);
 /* Sleep for at least this many nanoseconds. */
 void jabs_sleep_nanos(int64_t nanos);
 /* VM.getNanoTimeAdjustment: wall-clock nanoseconds since `offset_seconds`, or -1 if too far. */

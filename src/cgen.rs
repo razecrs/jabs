@@ -353,6 +353,13 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "return jabs_platform_set_error_mode(a0);",
         needs_classes: false,
     },
+    // GraphicsEnvironment.isHeadless without java.awt.headless (the 1.7.10 server's snooper asks
+    // after Done): Windows' PlatformGraphicsInfo reads it once in its static initializer.
+    Intrinsic {
+        key: ("sun/awt/PlatformGraphicsInfo", "hasDisplays0", "()Z"),
+        body: "return jabs_platform_has_displays();",
+        needs_classes: false,
+    },
     Intrinsic {
         key: ("java/lang/Shutdown", "beforeHalt", "()V"),
         body: "/* nothing to flush beyond the streams Java code already flushed */",

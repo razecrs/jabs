@@ -113,6 +113,12 @@ int64_t jabs_platform_set_error_mode(int64_t mode) {
     return (int64_t)SetErrorMode((UINT)mode);
 }
 
+/* sun.awt.PlatformGraphicsInfo.hasDisplays0 (Windows): whether the desktop has a display, which
+ * GraphicsEnvironment.isHeadless reports the opposite of when java.awt.headless is unset. */
+int32_t jabs_platform_has_displays(void) {
+    return GetSystemMetrics(SM_CMONITORS) > 0;
+}
+
 int64_t jabs_platform_process_id(void) {
     return (int64_t)GetCurrentProcessId(); /* cannot fail */
 }
@@ -305,6 +311,11 @@ const char *jabs_platform_value(int which) {
 
 int64_t jabs_platform_set_error_mode(int64_t mode) {
     (void)mode;
+    return 0;
+}
+
+/* Only Windows' PlatformGraphicsInfo declares hasDisplays0; nothing calls this elsewhere. */
+int32_t jabs_platform_has_displays(void) {
     return 0;
 }
 
