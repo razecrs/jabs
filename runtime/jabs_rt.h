@@ -185,6 +185,9 @@ static inline jabs_object *jabs_gc_tlab_alloc(size_t size) {
 jabs_object *jabs_gc_alloc_obj(size_t size, const jabs_class *cls);
 jabs_object *jabs_gc_oom_object(const jabs_class *cls);
 int64_t jabs_gc_total_memory(void);
+/* The maximum heap, as -Xmx takes it ("512m", "4G"); call before the first allocation.
+ * Returns -1 if the size is malformed. Without it: JABS_MAX_HEAP, else 1/4 of physical RAM. */
+int jabs_gc_set_max_heap(const char *size);
 int64_t jabs_gc_free_memory(void);
 int64_t jabs_gc_max_memory(void);
 int64_t jabs_gc_used_memory(void);

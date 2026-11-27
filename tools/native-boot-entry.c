@@ -13,15 +13,20 @@ static void report(const char *what, jabs_object *e) {
     for (jabs_object *c = jabs_cause_of(e); c; c = jabs_cause_of(c)) printf("  caused by %s: %s\n", c->cls->name, message_of(c));
 }
 /* Native entry point: what the JVM's launcher does. Leading -Dkey=value arguments are system
- * properties and "--" ends them, as before the class name on a java command line; the rest are
+ * properties, -Xmx<size> sets the maximum heap (as java takes it), and "--" ends them, as before the class name on a java command line; the rest are
  * main's arguments. Then JVM startup (System.initPhase1), then main. */
 #define MAX_DEFINES 256
 int main(int argc, char **argv) {
     static const char *defines[MAX_DEFINES];
     int first = 1, count = 0;
-    while (first < argc && strncmp(argv[first], "-D", 2) == 0) {
+    for (; first < argc; first++) {
+        if (strncmp(argv[first], "-Xmx", 4) == 0) {
+            if (jabs_gc_set_max_heap(argv[first] + 4) != 0) { printf("invalid maximum heap size: %s\n", argv[first]); return 2; }
+            continue;
+        }
+        if (strncmp(argv[first], "-D", 2) != 0) break;
         if (count == MAX_DEFINES) { printf("more than %d -D properties\n", MAX_DEFINES); return 2; }
-        defines[count++] = argv[first++] + 2;
+        defines[count++] = argv[first] + 2;
     }
     if (first < argc && strcmp(argv[first], "--") == 0) first++;
     if (jabs_set_command_line_properties(count, defines) != 0) { printf("a -D property has no key\n"); return 2; }

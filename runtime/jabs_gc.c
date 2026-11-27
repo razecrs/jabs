@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 
 enum {
@@ -33,12 +34,18 @@ enum {
     JABS_GC_GRANULE_SIZE      = 16u,
     JABS_GC_GRANULES_PER_BLK  = 4096u,
     JABS_GC_MAX_SMALL_SIZE    = 8192u,
-    JABS_GC_ARENA_BLOCKS      = 8192u,
     JABS_GC_FREE_RESERVE_BLKS = 48u,
     JABS_GC_RECYCLE_MAX_LINES = 224u
 };
 
-#define JABS_GC_ARENA_BYTES ((size_t)JABS_GC_ARENA_BLOCKS * (size_t)JABS_GC_BLOCK_SIZE)
+/* The arena's size is the maximum heap, like the JVM's -Xmx: set before the first allocation
+ * (jabs_gc_set_max_heap, from the launcher's -Xmx), else the JABS_MAX_HEAP environment variable,
+ * else a quarter of physical memory as HotSpot picks by default. Only the address space is
+ * reserved; blocks are committed as they are used. */
+#define JABS_GC_MIN_HEAP ((size_t)64u << 20)
+#define JABS_GC_DEFAULT_HEAP_FALLBACK ((size_t)1u << 30)
+#define JABS_GC_ARENA_BYTES ((size_t)gc_arena_blocks * (size_t)JABS_GC_BLOCK_SIZE)
+#define JABS_GC_ARENA_BLOCKS gc_arena_blocks
 #define JABS_GC_INIT_THRESHOLD ((size_t)(16u << 20))
 #define JABS_GC_MIN_HEADROOM   ((size_t)(8u << 20))
 #define JABS_GC_MAX_HEADROOM   ((size_t)(32u << 20))
@@ -100,7 +107,9 @@ static _Thread_local jabs_gc_thread *gc_tls_thread = NULL;
 
 static uintptr_t gc_arena_base = 0u;
 static uintptr_t gc_arena_end = 0u;
-static jabs_gc_block_meta gc_blocks[JABS_GC_ARENA_BLOCKS];
+static uint32_t gc_arena_blocks = 0u;
+static size_t gc_requested_max_heap = 0u;
+static jabs_gc_block_meta *gc_blocks = NULL;
 static uint32_t gc_committed_blocks = 0u;
 static uint32_t gc_free_blocks = 0u;
 static uint32_t gc_free_head = UINT32_MAX;
@@ -225,6 +234,65 @@ static void gc_stw_broadcast(void) {
 #endif
 }
 
+/* "512m", "4G", "65536k" or plain bytes, as -Xmx takes them; 0 if malformed or too large. */
+static size_t gc_parse_size(const char *text) {
+    if (!text || !*text) return 0u;
+    size_t value = 0u;
+    const char *p = text;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        if (value > (SIZE_MAX - 9u) / 10u) return 0u;
+        value = value * 10u + (size_t)(*p - '0');
+    }
+    if (p == text) return 0u;
+    unsigned shift = 0u;
+    if (*p == 'k' || *p == 'K') shift = 10u;
+    else if (*p == 'm' || *p == 'M') shift = 20u;
+    else if (*p == 'g' || *p == 'G') shift = 30u;
+    else if (*p == 't' || *p == 'T') shift = 40u;
+    if (shift) p++;
+    if (*p != '\0') return 0u;
+    if (shift && value > (SIZE_MAX >> shift)) return 0u;
+    return value << shift;
+}
+
+int jabs_gc_set_max_heap(const char *size) {
+    size_t bytes = gc_parse_size(size);
+    if (bytes == 0u) return -1;
+    gc_requested_max_heap = bytes;
+    return 0;
+}
+
+static size_t gc_physical_memory(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof status;
+    return GlobalMemoryStatusEx(&status) ? (size_t)status.ullTotalPhys : 0u;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page = sysconf(_SC_PAGE_SIZE);
+    return pages > 0 && page > 0 ? (size_t)pages * (size_t)page : 0u;
+#endif
+}
+
+static size_t gc_choose_max_heap(void) {
+    size_t bytes = gc_requested_max_heap;
+    if (bytes == 0u) {
+        const char *env = getenv("JABS_MAX_HEAP");
+        if (env && *env) {
+            bytes = gc_parse_size(env);
+            if (bytes == 0u) fprintf(stderr, "jabs: ignoring malformed JABS_MAX_HEAP=%s\n", env);
+        }
+    }
+    if (bytes == 0u) {
+        size_t phys = gc_physical_memory();
+        bytes = phys ? phys / 4u : JABS_GC_DEFAULT_HEAP_FALLBACK;
+    }
+    if (bytes < JABS_GC_MIN_HEAP) bytes = JABS_GC_MIN_HEAP;
+    size_t blocks = (bytes + JABS_GC_BLOCK_SIZE - 1u) >> JABS_GC_BLOCK_SHIFT;
+    if (blocks > (size_t)(UINT32_MAX - 1u)) blocks = (size_t)(UINT32_MAX - 1u);
+    return blocks;
+}
+
 static void gc_init_impl(void) {
 #ifdef _WIN32
     InitializeCriticalSection(&gc_heap_cs);
@@ -233,10 +301,32 @@ static void gc_init_impl(void) {
     InitializeConditionVariable(&gc_stw_cv);
     InitializeCriticalSection(&gc_ref_cs);
     InitializeConditionVariable(&gc_ref_cv);
+#endif
+    gc_arena_blocks = (uint32_t)gc_choose_max_heap();
+    /* Zeroed and committed lazily by the OS: only the metadata of used blocks costs memory. */
+    gc_blocks = (jabs_gc_block_meta *)calloc(gc_arena_blocks, sizeof *gc_blocks);
+    if (!gc_blocks) {
+        fprintf(stderr, "jabs: failed to allocate GC metadata for a %zu MB heap\n", JABS_GC_ARENA_BYTES >> 20);
+        abort();
+    }
+#ifdef _WIN32
     void *base = VirtualAlloc(NULL, JABS_GC_ARENA_BYTES, MEM_RESERVE, PAGE_NOACCESS);
 #else
-    void *base = mmap(NULL, JABS_GC_ARENA_BYTES, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) base = NULL;
+    /* Blocks are found by masking addresses (addr & (BLOCK_SIZE - 1)), so the arena must start on
+       a block boundary. VirtualAlloc reserves on 64 KB boundaries; mmap only on pages, so reserve
+       one block more, round the base up, and give back the ends. */
+    void *base = NULL;
+    size_t span = JABS_GC_ARENA_BYTES + JABS_GC_BLOCK_SIZE;
+    void *raw = mmap(NULL, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw != MAP_FAILED) {
+        uintptr_t start = (uintptr_t)raw;
+        uintptr_t aligned = (start + JABS_GC_BLOCK_SIZE - 1u) & ~(uintptr_t)(JABS_GC_BLOCK_SIZE - 1u);
+        size_t head = (size_t)(aligned - start);
+        size_t tail = span - head - JABS_GC_ARENA_BYTES;
+        if (head) munmap(raw, head);
+        if (tail) munmap((void *)(aligned + JABS_GC_ARENA_BYTES), tail);
+        base = (void *)aligned;
+    }
 #endif
     if (!base) {
         fprintf(stderr, "jabs: failed to reserve %zu MB GC arena\n", JABS_GC_ARENA_BYTES >> 20);
@@ -653,7 +743,15 @@ static void gc_decommit_block(uint32_t bidx) {
     gc_committed_blocks--;
 }
 
+/* Whether `bytes` more fit under the maximum heap: committed small-object blocks and large objects
+   share it, as -Xmx bounds the JVM's whole heap. */
+static int gc_heap_has_room(size_t bytes) {
+    size_t committed = ((size_t)gc_committed_blocks << JABS_GC_BLOCK_SHIFT) + gc_los_bytes;
+    return committed <= JABS_GC_ARENA_BYTES && bytes <= JABS_GC_ARENA_BYTES - committed;
+}
+
 static int gc_commit_block(uint32_t bidx) {
+    if (!gc_heap_has_room(JABS_GC_BLOCK_SIZE)) return 0;
     uintptr_t addr = gc_arena_base + ((uintptr_t)bidx << JABS_GC_BLOCK_SHIFT);
 #ifdef _WIN32
     if (!VirtualAlloc((void *)addr, JABS_GC_BLOCK_SIZE, MEM_COMMIT, PAGE_READWRITE)) return 0;
@@ -981,6 +1079,7 @@ static jabs_object *gc_alloc_small_in_block(size_t asize, int fill_tlab) {
 static jabs_object *gc_alloc_los(size_t asize) {
     size_t total = sizeof(jabs_gc_los_node) + asize;
     if (total < sizeof(jabs_gc_los_node)) return NULL;
+    if (!gc_heap_has_room(asize)) return NULL;
 #ifdef _WIN32
     jabs_gc_los_node *node = (jabs_gc_los_node *)VirtualAlloc(NULL, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
@@ -1080,6 +1179,7 @@ int64_t jabs_gc_free_memory(void) {
 }
 
 int64_t jabs_gc_max_memory(void) {
+    gc_init_once_run(); /* the arena's size is chosen at init */
     return (int64_t)JABS_GC_ARENA_BYTES;
 }
 

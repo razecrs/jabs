@@ -28,9 +28,35 @@ class GcStressCases {
             cleaner();
         } else if (mechanism.equals("multithreadedStw")) {
             multithreadedStw();
+        } else if (mechanism.equals("heapLimit")) {
+            heapLimit();
         } else {
             throw new IllegalArgumentException("unknown mechanism: " + mechanism);
         }
+    }
+
+    /** The maximum heap as the launcher set it (java -Xmx, JABS_MAX_HEAP natively), and whether
+     *  200 MB fit under it, once as small arrays and once as large ones: natively those live in
+     *  the Immix arena and the large-object space, which share the one limit. */
+    static void heapLimit() {
+        System.out.println("maxMemoryMB=" + (Runtime.getRuntime().maxMemory() >> 20));
+        System.out.println("held200MB small=" + holds(200 * 256, 4000));
+        System.out.println("held200MB large=" + holds(200 * 16, 64 * 1024));
+    }
+
+    static boolean holds(int count, int size) {
+        java.util.List<byte[]> held = new java.util.ArrayList<>();
+        boolean fit;
+        try {
+            for (int i = 0; i < count; i++) {
+                held.add(new byte[size]);
+            }
+            fit = true;
+        } catch (OutOfMemoryError e) {
+            fit = false;
+        }
+        held.clear();
+        return fit;
     }
 
     static long runChurnWorkload() {

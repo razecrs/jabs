@@ -234,6 +234,77 @@ fn cleaner_runs_when_referent_collected() {
     );
 }
 
+/// The JVM with `-Xmx<size>` against the native program with `JABS_MAX_HEAP=<size>`: the same
+/// maxMemory, and the same answer to whether 200 MB of small arrays fit.
+fn heap_limit_matches_jvm(size: &str) {
+    let Some(built) = built() else {
+        return;
+    };
+    let (jvm, _) = common::outcome(
+        Command::new("java")
+            .arg(format!("-Xmx{size}"))
+            .arg("-cp")
+            .arg(&built.classes)
+            .args([built.main_class, "heapLimit"]),
+        "Exception in thread \"main\" ",
+    );
+    assert_eq!(
+        jvm.status,
+        Some(0),
+        "the reference JVM run itself failed: {jvm:?}"
+    );
+    let (native, stop) = common::outcome(
+        Command::new(&built.native)
+            .env("JABS_MAX_HEAP", size)
+            .arg("heapLimit"),
+        "uncaught ",
+    );
+    assert_eq!(
+        native, jvm,
+        "heapLimit with {size}: native differs from the JVM\nlook at: gc_choose_max_heap and \
+         jabs_gc_max_memory in runtime/jabs_gc.c\njabs stop: {stop:?}"
+    );
+}
+
+#[test]
+fn small_heap_limit_throws_out_of_memory_like_the_jvm() {
+    heap_limit_matches_jvm("96m");
+}
+
+#[test]
+fn large_heap_limit_holds_what_the_jvm_holds() {
+    heap_limit_matches_jvm("512m");
+}
+
+/// A heap that is not a power of two: mmap then reserves on a page, not a 64 KB block boundary,
+/// and the arena must still start on one (blocks are found by masking addresses). Before the
+/// rounding in gc_init_impl, sizes like 3999m segfaulted on Linux while 4000m ran.
+#[test]
+fn odd_heap_size_keeps_blocks_aligned() {
+    let Some(built) = built() else {
+        return;
+    };
+    for size in ["3999m", "777m"] {
+        let (native, stop) = common::outcome(
+            Command::new(&built.native)
+                .env("JABS_MAX_HEAP", size)
+                .arg("churnBounded"),
+            "uncaught ",
+        );
+        assert_eq!(
+            native.status,
+            Some(0),
+            "{size}: stop={stop:?}, run={native:#?}\nlook at: the arena reservation in gc_init_impl \
+             (runtime/jabs_gc.c)"
+        );
+        assert!(
+            native.stdout.contains("ok=true "),
+            "{size}: {}",
+            native.stdout
+        );
+    }
+}
+
 #[test]
 fn multithreaded_stw_safepoints_across_waiters() {
     same_as_jvm(
