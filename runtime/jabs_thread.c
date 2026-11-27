@@ -251,6 +251,7 @@ int64_t jabs_class_initialized_count(void) {
 
 int jabs_class_init_begin(jabs_class_init *c) {
     const void *me = jabs_thread_identity();
+    jabs_gc_enter_native();
     jabs_os_mutex_lock(&jabs_init_mutex);
     /* Step 2: wait while another thread initializes. No cap: a <clinit> may legitimately take as
      * long as it takes, and the JVM waits too. */
@@ -262,10 +263,12 @@ int jabs_class_init_begin(jabs_class_init *c) {
     case JABS_CLASS_INITIALIZED:
     case JABS_CLASS_INITIALIZING: /* step 3: this thread's own initialization in progress (recursive request) */
         jabs_os_mutex_unlock(&jabs_init_mutex);
+        jabs_gc_exit_native();
         return JABS_INIT_DONE;
     case JABS_CLASS_ERRONEOUS:
         /* Step 5. Raised outside the lock: creating the exception may initialize its class. */
         jabs_os_mutex_unlock(&jabs_init_mutex);
+        jabs_gc_exit_native();
         jabs_pending = jabs_vm_throwable(JABS_VM_NO_CLASS_DEF_FOUND);
         return JABS_INIT_FAILED;
     case JABS_CLASS_UNINITIALIZED:
@@ -273,9 +276,11 @@ int jabs_class_init_begin(jabs_class_init *c) {
         c->owner = me;
         atomic_store_explicit(&c->state, JABS_CLASS_INITIALIZING, memory_order_relaxed);
         jabs_os_mutex_unlock(&jabs_init_mutex);
+        jabs_gc_exit_native();
         return JABS_INIT_RUN;
     default:
         jabs_os_mutex_unlock(&jabs_init_mutex);
+        jabs_gc_exit_native();
         fprintf(stderr, "jabs: class initialization state %d is not a state (memory corruption?)\n", (int)state);
         abort();
     }
@@ -332,6 +337,7 @@ typedef struct jabs_thread_record {
     jabs_os_mutex sleep_lock;
     jabs_os_cond sleep_wake;
     bool park_permit;
+    struct jabs_thread_record *next;
 } jabs_thread_record;
 
 /* Guards the main record's attachment, every thread's start and end (threadStatus, eetop) and
@@ -343,6 +349,13 @@ static uint32_t jabs_threads_started;
 /* The main thread is live (for java.lang.management) from the start: it runs before any count is
  * read, as HotSpot's main JavaThread does. */
 static jabs_thread_record jabs_main_record = { .live = true };
+static jabs_thread_record *jabs_thread_list_head = &jabs_main_record;
+
+void jabs_thread_visit_gc_roots(jabs_gc_root_fn visit, void *ctx) {
+    for (jabs_thread_record *r = jabs_thread_list_head; r; r = r->next) {
+        if (r->live && r->thread) visit(r->thread, ctx);
+    }
+}
 /* java.lang.management's thread counts, as HotSpot's ThreadService keeps them: a thread counts
  * from Thread.start0 (before it returns) and stops counting at its end before join() waiters
  * wake, so a joined thread is never live. Started counts every thread ever started plus main.
@@ -451,6 +464,7 @@ static void jabs_thread_terminate(jabs_thread_record *record) {
 static void jabs_thread_main(void *arg) {
     jabs_thread_record *record = (jabs_thread_record *)arg;
     jabs_self = record;
+    jabs_gc_thread_attach();
     /* An interrupt that came before the monitors knew this thread only set the Java field
      * (interrupt0 found no sync record): carry it over, under the lock interrupt0 reads with. */
     jabs_sync_thread *sync = jabs_sync_current();
@@ -478,6 +492,7 @@ static void jabs_thread_main(void *arg) {
      * over a program's life would exhaust them. The sync record itself stays allocated, so a late
      * interrupt through record->sync still finds valid memory. */
     jabs_sync_thread_end();
+    jabs_gc_thread_detach();
 }
 
 void jabs_thread_start(jabs_object *thread) {
@@ -517,6 +532,8 @@ void jabs_thread_start(jabs_object *thread) {
     int64_t peak_before = jabs_mgmt_peak;
     record->live = true;
     record->daemon = daemon;
+    record->next = jabs_thread_list_head;
+    jabs_thread_list_head = record;
     jabs_mgmt_live++;
     if (daemon) jabs_mgmt_daemon++;
     jabs_mgmt_started++;
@@ -539,6 +556,13 @@ void jabs_thread_start(jabs_object *thread) {
     jabs_mgmt_started--;
     record->live = false;
     if (jabs_mgmt_peak == peak_set && peak_set > peak_before) jabs_mgmt_peak = peak_before > jabs_mgmt_live ? peak_before : jabs_mgmt_live;
+    if (jabs_thread_list_head == record) {
+        jabs_thread_list_head = record->next;
+    } else {
+        for (jabs_thread_record *it = jabs_thread_list_head; it; it = it->next) {
+            if (it->next == record) { it->next = record->next; break; }
+        }
+    }
     jabs_os_mutex_unlock(&jabs_threads_mutex);
     jabs_os_sync_destroy(&record->sleep_lock, &record->sleep_wake);
     free(record);
@@ -555,10 +579,12 @@ void jabs_destroy_java_vm(void) {
             jabs_thread_terminate(&jabs_main_record);
         }
     }
+    jabs_gc_enter_native();
     jabs_os_mutex_lock(&jabs_threads_mutex);
     /* No cap: the JVM waits for its non-daemon threads however long they run. */
     while (jabs_live_non_daemon > 0) jabs_os_cond_wait(&jabs_no_live, &jabs_threads_mutex);
     jabs_os_mutex_unlock(&jabs_threads_mutex);
+    jabs_gc_exit_native();
 }
 
 void jabs_thread_sleep(int64_t nanos) {
@@ -568,6 +594,7 @@ void jabs_thread_sleep(int64_t nanos) {
     if (!self || self->thread != thread) { fprintf(stderr, "jabs: sleeping thread has no record\n"); abort(); }
     int64_t start = jabs_nano_time();
     bool woken_by_interrupt = false;
+    jabs_gc_enter_native();
     jabs_os_mutex_lock(&self->sleep_lock);
     /* Not capped by a count: each pass either ends (deadline or interrupt) or waits for the
      * remaining time, and the clock only moves forward. interrupt0 signals under sleep_lock after
@@ -584,6 +611,7 @@ void jabs_thread_sleep(int64_t nanos) {
         jabs_os_cond_wait_nanos(&self->sleep_wake, &self->sleep_lock, nanos - elapsed);
     }
     jabs_os_mutex_unlock(&self->sleep_lock);
+    jabs_gc_exit_native();
     if (woken_by_interrupt) {
         /* The same interrupt also marked the monitors' record; it is consumed here. */
         if (self->sync) (void)jabs_sync_clear_interrupt(self->sync);
@@ -649,6 +677,7 @@ void jabs_thread_park(int32_t is_absolute, int64_t time) {
     int64_t start = is_absolute ? 0 : jabs_nano_time();
     int32_t *status = jabs_thread_status_slot(thread);
     int32_t parked_state = (!is_absolute && time == 0) ? JABS_THREAD_WAITING : JABS_THREAD_TIMED_WAITING;
+    jabs_gc_enter_native();
     jabs_os_mutex_lock(&self->sleep_lock);
     for (;;) {
         if (self->park_permit) {
@@ -677,6 +706,7 @@ void jabs_thread_park(int32_t is_absolute, int64_t time) {
     }
     if (status) jabs_set_status(status, JABS_THREAD_RUNNABLE);
     jabs_os_mutex_unlock(&self->sleep_lock);
+    jabs_gc_exit_native();
 }
 
 void jabs_thread_unpark(jabs_object *thread) {

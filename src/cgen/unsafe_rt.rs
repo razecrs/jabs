@@ -27,12 +27,11 @@ pub(super) fn intrinsic(key: &MethodKey, classes_available: bool) -> Option<(Str
         (UNSAFE, "shouldBeInitialized0", "(Ljava/lang/Class;)Z") => classes_available
             .then(|| ("return jabs_unsafe_should_be_initialized(a0);".into(), true)),
         (REFERENCE, "getAndClearReferencePendingList", "()Ljava/lang/ref/Reference;") => {
-            Some(("return NULL;".into(), false))
+            Some(("return jabs_gc_take_pending_refs();".into(), false))
         }
-        (REFERENCE, "waitForReferencePendingList", "()V") => Some((
-            "/* no GC: nothing is ever added to the pending list */".into(),
-            false,
-        )),
+        (REFERENCE, "waitForReferencePendingList", "()V") => {
+            Some(("jabs_gc_wait_pending_refs();".into(), false))
+        }
         (PREVIEW_FEATURES, "isPreviewEnabled", "()Z") => Some(("return 0;".into(), false)),
         (
             LAMBDA_ARCHIVE,

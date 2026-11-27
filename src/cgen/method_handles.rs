@@ -218,7 +218,7 @@ pub(super) fn glue(
     if (box_obj) {{
         if (box_obj->cls != jabs_array_class()) jabs_not_compiled("MethodHandleNatives.getNamedCon box is not an array");
         jabs_array *arr = (jabs_array *)box_obj;
-        if (arr->component_kind == JABS_COMPONENT_PRIMITIVE) jabs_not_compiled("MethodHandleNatives.getNamedCon box is a primitive array");
+        if (!jabs_array_is_ref(arr)) jabs_not_compiled("MethodHandleNatives.getNamedCon box is a primitive array");
         if (arr->length > 0) {{
             jabs_object *s = jabs_string_from_utf8(jabs_mh_named_cons[which].name);
             if (!s) return 0;
@@ -495,6 +495,17 @@ static int jabs_mh_rmn_lookup(jabs_object *rmn, const jabs_rclass **out_rc, cons
     return 0;
 }}
 
+void jabs_gc_sweep_mh_roots(jabs_gc_is_marked_fn is_marked) {{
+    size_t write_idx = 0;
+    for (size_t i = 0; i < jabs_mh_rmn_count; i++) {{
+        if (is_marked(jabs_mh_rmn_entries[i].rmn)) {{
+            if (write_idx != i) jabs_mh_rmn_entries[write_idx] = jabs_mh_rmn_entries[i];
+            write_idx++;
+        }}
+    }}
+    jabs_mh_rmn_count = write_idx;
+}}
+
 static jabs_object *jabs_mh_make_rmn(jabs_object *holder, const jabs_rclass *rc, const jabs_rmethod *rm) {{
     if ({rmn_init}() != 0) return NULL;
     jabs_object *rmn = jabs_new(&{rmn_record});
@@ -560,7 +571,7 @@ static int jabs_mh_append_method_desc(jabs_mh_buf *b, jabs_object *rtype, jabs_o
         return -1;
     }}
     jabs_array *ptypes = (jabs_array *)ptypes_obj;
-    if (ptypes->component_kind == JABS_COMPONENT_PRIMITIVE) {{
+    if (!jabs_array_is_ref(ptypes)) {{
         jabs_mh_raise(JABS_MH_ERR_INTERNAL, "MemberName parameter types is primitive array");
         return -1;
     }}
@@ -590,7 +601,7 @@ static char *jabs_mh_type_to_desc(jabs_object *type_obj) {{
     }}
     if (type_obj->cls == jabs_array_class()) {{
         jabs_array *arr = (jabs_array *)type_obj;
-        if (arr->component_kind != JABS_COMPONENT_PRIMITIVE && arr->length >= 2) {{
+        if (jabs_array_is_ref(arr) && arr->length >= 2) {{
             jabs_object **slots = (jabs_object **)jabs_array_data(arr);
             if (jabs_mh_append_method_desc(&b, slots[0], slots[1]) != 0) {{ free(b.data); return NULL; }}
             return b.data;

@@ -58,6 +58,15 @@ typedef struct jabs_itable_entry {
 /* A class's runtime record: name, instance size, vtable (one slot per overridable method),
  * superclass record (NULL directly below java/lang/Object), interface table sorted by
  * selector, every superinterface, and whether the record is itself an interface. */
+enum {
+    JABS_CLS_HAS_REFS    = 1u << 0,
+    JABS_CLS_REF_SOFT    = 1u << 1,
+    JABS_CLS_REF_WEAK    = 1u << 2,
+    JABS_CLS_REF_PHANTOM = 1u << 3,
+    JABS_CLS_VAR_HANDLE  = 1u << 4,
+    JABS_CLS_REF_MASK    = JABS_CLS_REF_SOFT | JABS_CLS_REF_WEAK | JABS_CLS_REF_PHANTOM
+};
+
 typedef struct jabs_class {
     const char *name;
     size_t size;
@@ -69,6 +78,9 @@ typedef struct jabs_class {
     uint32_t interfaces_len;
     int32_t is_interface;
     uint16_t access; /* class-file access flags (Class.getModifiers approximates from these) */
+    uint16_t gc_flags;
+    const uint32_t *ref_offsets;
+    uint32_t ref_offsets_len;
 } jabs_class;
 
 /* Every object starts with this header; the class's own struct embeds it first. */
@@ -127,14 +139,74 @@ int jabs_is_error(const jabs_object *o);
 void jabs_set_cause(jabs_object *o, jabs_object *cause);
 jabs_object *jabs_cause_of(jabs_object *o);
 
-/* Allocate a zeroed object: all-zero bytes are every field's Java default (0, 0.0, false, null).
- * There is no garbage collector yet, so objects live until the process exits. */
+/* Allocate a zeroed object: all-zero bytes are every field's Java default (0, 0.0, false, null). */
 static inline jabs_object *jabs_new(const jabs_class *cls);
-/* The canonical String with the same contents (String.intern; literals use it too). */
+/* The canonical String with these contents (String.intern; literals use it too). */
 jabs_object *jabs_string_intern(jabs_object *s);
-/* Bytes of Java objects allocated so far, by every thread. With no garbage collector the heap
- * only grows, so this is Runtime.totalMemory (and freeMemory is 0). */
+/* Bytes of live/allocated Java heap tracked by runtime. */
 extern _Atomic int64_t jabs_heap_bytes;
+
+/* ---- Garbage collector & cooperative safepoints (runtime/jabs_gc.c) ---- */
+typedef void (*jabs_gc_root_fn)(jabs_object *obj, void *ctx);
+typedef int (*jabs_gc_is_marked_fn)(const jabs_object *obj);
+
+extern _Atomic uint32_t jabs_gc_safepoint_flag;
+void jabs_gc_safepoint_slow(void);
+JABS_ALWAYS_INLINE void jabs_gc_safepoint(void) {
+    if (__builtin_expect(atomic_load_explicit(&jabs_gc_safepoint_flag, memory_order_relaxed) != 0, 0))
+        jabs_gc_safepoint_slow();
+}
+void jabs_gc_enter_native(void);
+void jabs_gc_exit_native(void);
+void jabs_gc_thread_attach(void);
+void jabs_gc_thread_detach(void);
+void jabs_thread_visit_gc_roots(jabs_gc_root_fn visit, void *ctx);
+typedef struct jabs_gc_tlab {
+    uintptr_t cursor;
+    uintptr_t limit;
+    uintptr_t block_base;
+    uint64_t *alloc_bits;
+} jabs_gc_tlab;
+extern _Thread_local jabs_gc_tlab jabs_tls_tlab;
+
+static inline jabs_object *jabs_gc_tlab_alloc(size_t size) {
+    size_t asize = (size + 15u) & ~(size_t)15u;
+    if (asize < 16u) asize = 16u;
+    uintptr_t p = jabs_tls_tlab.cursor;
+    if (__builtin_expect(asize <= 4096u && p + asize <= jabs_tls_tlab.limit, 1)) {
+        jabs_tls_tlab.cursor = p + asize;
+        size_t granule = (p - jabs_tls_tlab.block_base) >> 4;
+        jabs_tls_tlab.alloc_bits[granule >> 6] |= (UINT64_C(1) << (granule & 63u));
+        return (jabs_object *)p;
+    }
+    return NULL;
+}
+
+jabs_object *jabs_gc_alloc_obj(size_t size, const jabs_class *cls);
+jabs_object *jabs_gc_oom_object(const jabs_class *cls);
+int64_t jabs_gc_total_memory(void);
+int64_t jabs_gc_free_memory(void);
+int64_t jabs_gc_max_memory(void);
+int64_t jabs_gc_used_memory(void);
+void jabs_gc_collect(void);
+int32_t jabs_gc_has_pending_refs(void);
+jabs_object *jabs_gc_take_pending_refs(void);
+void jabs_gc_wait_pending_refs(void);
+
+/* Generated root / metadata hooks called by runtime/jabs_gc.c during STW. */
+extern jabs_object **const jabs_gc_static_refs[];
+extern const uint32_t jabs_gc_literal_count;
+extern _Atomic(jabs_object *) *const jabs_gc_literals;
+extern const size_t jabs_gc_var_handle_size;
+extern const uint32_t jabs_gc_ref_referent_offset;
+extern const uint32_t jabs_gc_ref_discovered_offset;
+void jabs_gc_visit_runtime_roots(jabs_gc_root_fn visit, void *ctx);
+void jabs_gc_sweep_weak_roots(jabs_gc_is_marked_fn is_marked);
+void jabs_gc_visit_reflect_roots(jabs_gc_root_fn visit, void *ctx);
+void jabs_gc_visit_module_roots(jabs_gc_root_fn visit, void *ctx);
+void jabs_gc_visit_rproxy_roots(jabs_gc_root_fn visit, void *ctx);
+void jabs_gc_sweep_mh_roots(jabs_gc_is_marked_fn is_marked);
+void jabs_gc_sweep_sync_monitors(jabs_gc_is_marked_fn is_marked);
 
 /* Runtime locks (jabs_thread.c) for the tables every thread shares: the Class registry, the
  * String intern table, the sorting of the frame table and the .jab's descriptors. A holder never runs Java code, never
@@ -409,8 +481,8 @@ static inline _Noreturn void jabs_not_compiled_class(const char *what, const cha
     abort();
 }
 
-/* Arrays: header, length, then elements at their JVM width. The element class of a reference
- * array is recorded so covariant stores can be checked at runtime (ArrayStoreException). */
+/* Arrays: 24-byte header (object header + length + packed type_tag) followed by elements.
+ * Type metadata lives in a lock-free chunked table keyed by type_tag & JABS_ARRAY_TAG_ID_MASK. */
 enum {
     JABS_COMPONENT_PRIMITIVE,
     JABS_COMPONENT_ANY,       /* Object[]: anything fits */
@@ -418,14 +490,42 @@ enum {
     JABS_COMPONENT_ARRAY,     /* elements must be arrays whose descriptor equals `component_descriptor` */
     JABS_COMPONENT_UNCHECKED  /* element type outside the unit or an interface: stores cannot be checked yet */
 };
+typedef struct jabs_array_type {
+    const char *descriptor;           /* this array's type, e.g. "[I" */
+    const char *component_descriptor; /* element array type for JABS_COMPONENT_ARRAY */
+    const jabs_class *component;
+    int32_t component_kind;
+    uint8_t elem_size;
+    uint8_t elem_shift;
+    uint8_t is_ref;
+} jabs_array_type;
+
+#define JABS_ARRAY_TAG_REF       UINT32_C(0x80000000)
+#define JABS_ARRAY_TAG_SHIFT_POS 29u
+#define JABS_ARRAY_TAG_ID_MASK   UINT32_C(0x1fffffff)
+
 typedef struct jabs_array {
     jabs_object header;
     int32_t length;
-    int32_t component_kind;
-    const jabs_class *component;
-    const char *descriptor;           /* this array's type, e.g. "[I" */
-    const char *component_descriptor; /* element array type for JABS_COMPONENT_ARRAY */
+    uint32_t type_tag; /* bit31=is_ref, bits29..30=elem_shift, bits0..28=type_id */
 } jabs_array;
+
+extern jabs_array_type jabs_array_chunk0[64];
+extern jabs_array_type *jabs_array_chunks[1024];
+uint32_t jabs_array_intern_tag(int32_t kind, const jabs_class *component,
+                               const char *descriptor, const char *component_descriptor);
+
+JABS_ALWAYS_INLINE const jabs_array_type *jabs_array_info(const jabs_array *a) {
+    uint32_t id = a->type_tag & JABS_ARRAY_TAG_ID_MASK;
+    if (__builtin_expect(id < 64u, 1)) return &jabs_array_chunk0[id];
+    const jabs_array_type *chunk = __atomic_load_n(&jabs_array_chunks[id >> 6], __ATOMIC_ACQUIRE);
+    return &chunk[id & 63u];
+}
+JABS_ALWAYS_INLINE const char *jabs_array_descriptor(const jabs_array *a) { return jabs_array_info(a)->descriptor; }
+JABS_ALWAYS_INLINE int32_t jabs_array_kind(const jabs_array *a) { return jabs_array_info(a)->component_kind; }
+JABS_ALWAYS_INLINE const jabs_class *jabs_array_component(const jabs_array *a) { return jabs_array_info(a)->component; }
+JABS_ALWAYS_INLINE const char *jabs_array_component_descriptor(const jabs_array *a) { return jabs_array_info(a)->component_descriptor; }
+JABS_ALWAYS_INLINE int jabs_array_is_ref(const jabs_array *a) { return (a->type_tag & JABS_ARRAY_TAG_REF) != 0; }
 
 /* A file from the input jars embedded in the program (resources.c), for the app class loader. */
 typedef struct { const char *name; const unsigned char *data; size_t length; } jabs_resource;
@@ -862,22 +962,24 @@ static inline int32_t jabs_is_array_instance(const jabs_object *o, const char *t
 
 /* aastore check: may `value` (non-null) be stored in this array? */
 static inline int jabs_array_store_ok(jabs_array *a, jabs_object *value) {
-    switch (a->component_kind) {
+    const jabs_array_type *info = jabs_array_info(a);
+    switch (info->component_kind) {
     case JABS_COMPONENT_ANY: return 1;
-    case JABS_COMPONENT_CLASS: return a->component && jabs_is_instance(value, a->component);
+    case JABS_COMPONENT_CLASS: return info->component && jabs_is_instance(value, info->component);
     case JABS_COMPONENT_ARRAY: {
         if (value->cls != jabs_array_class()) return 0;
-        const char *row = a->component_descriptor;
+        const char *row = info->component_descriptor;
         if (!row || row[0] != '[') jabs_not_compiled("aastore into an array of arrays with no row type recorded");
         /* Rows of a primitive type fit only exactly; rows of references are covariant, so a row
          * fits exactly when it is an instance of the row type (a String[] in a CharSequence[][]). */
-        if (row[1] != 'L' && row[1] != '[') return strcmp(((jabs_array *)value)->descriptor, row) == 0;
-        if (strcmp(((jabs_array *)value)->descriptor, row) == 0) return 1;
+        const char *vdesc = jabs_array_descriptor((const jabs_array *)value);
+        if (row[1] != 'L' && row[1] != '[') return strcmp(vdesc, row) == 0;
+        if (strcmp(vdesc, row) == 0) return 1;
         /* A covariant row needs the row element's record; without it the answer would be a
          * wrong ArrayStoreException, so stop instead. */
-        if (row[1] == 'L' && !a->component && strcmp(row, "[Ljava/lang/Object;") != 0)
+        if (row[1] == 'L' && !info->component && strcmp(row, "[Ljava/lang/Object;") != 0)
             jabs_not_compiled("aastore of a row whose element class is outside the unit");
-        return jabs_is_array_instance(value, row, a->component);
+        return jabs_is_array_instance(value, row, info->component);
     }
     default: jabs_not_compiled("aastore into an array whose element type is outside the unit");
     }
@@ -926,6 +1028,27 @@ static inline jabs_object *jabs_multi_new_array(const char *descriptor, int dime
 }
 
 /* Allocate a zeroed array (zero bytes are every element's default); length is already >= 0. */
+static inline uint32_t jabs_resolve_array_tag(int32_t kind, const jabs_class *component,
+                                              const char *descriptor, const char *component_descriptor) {
+    if (kind == JABS_COMPONENT_PRIMITIVE) {
+        switch (descriptor[1]) {
+        case 'Z': return 0u;
+        case 'B': return 1u;
+        case 'C': return (1u << JABS_ARRAY_TAG_SHIFT_POS) | 2u;
+        case 'S': return (1u << JABS_ARRAY_TAG_SHIFT_POS) | 3u;
+        case 'I': return (2u << JABS_ARRAY_TAG_SHIFT_POS) | 4u;
+        case 'J': return (3u << JABS_ARRAY_TAG_SHIFT_POS) | 5u;
+        case 'F': return (2u << JABS_ARRAY_TAG_SHIFT_POS) | 6u;
+        case 'D': return (3u << JABS_ARRAY_TAG_SHIFT_POS) | 7u;
+        default: break;
+        }
+    } else if (kind == JABS_COMPONENT_ANY) {
+        uint32_t pshift = (sizeof(jabs_object *) == 8u) ? 3u : 2u;
+        return JABS_ARRAY_TAG_REF | (pshift << JABS_ARRAY_TAG_SHIFT_POS) | 8u;
+    }
+    return jabs_array_intern_tag(kind, component, descriptor, component_descriptor);
+}
+
 static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, int32_t kind, const jabs_class *component,
                                           const char *descriptor, const char *component_descriptor) {
     size_t header = (sizeof(jabs_array) + 7) & ~(size_t)7;
@@ -933,18 +1056,17 @@ static inline jabs_object *jabs_new_array(int32_t length, size_t element_size, i
         jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
         return NULL;
     }
-    jabs_array *a = (jabs_array *)calloc(1, header + (size_t)length * element_size);
-    if (a) atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)(header + (size_t)length * element_size), memory_order_relaxed);
-    if (!a) {
-        jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
-        return NULL;
+    uint32_t tag = jabs_resolve_array_tag(kind, component, descriptor, component_descriptor);
+    size_t total = header + (size_t)length * element_size;
+    jabs_array *a = (jabs_array *)jabs_gc_tlab_alloc(total);
+    if (a) {
+        a->header.cls = jabs_array_class();
+    } else {
+        a = (jabs_array *)jabs_gc_alloc_obj(total, jabs_array_class());
+        if (!a) return NULL;
     }
-    a->header.cls = jabs_array_class();
     a->length = length;
-    a->component_kind = kind;
-    a->component = component;
-    a->descriptor = descriptor;
-    a->component_descriptor = component_descriptor;
+    a->type_tag = tag;
     return &a->header;
 }
 
@@ -976,22 +1098,24 @@ static inline int32_t jabs_is_instance(const jabs_object *o, const jabs_class *t
 static inline int32_t jabs_is_array_instance(const jabs_object *o, const char *target, const jabs_class *component) {
     if (o->cls != jabs_array_class()) return 0;
     const jabs_array *a = (const jabs_array *)o;
-    if (strcmp(a->descriptor, target) == 0) return 1;
-    int reference = a->descriptor[1] == 'L' || a->descriptor[1] == '[';
+    const jabs_array_type *info = jabs_array_info(a);
+    const char *desc = info->descriptor;
+    if (strcmp(desc, target) == 0) return 1;
+    int reference = desc[1] == 'L' || desc[1] == '[';
     /* Primitive arrays are instances only of their exact type (checked above). */
     if (!reference) return 0;
     if (strcmp(target, "[Ljava/lang/Object;") == 0) return 1;
     if (target[1] == 'L') {
         /* Elements that are arrays are Object, Cloneable and Serializable, nothing else. */
-        if (a->descriptor[1] == '[') {
+        if (desc[1] == '[') {
             return strcmp(target, "[Ljava/lang/Cloneable;") == 0 || strcmp(target, "[Ljava/io/Serializable;") == 0;
         }
-        switch (a->component_kind) {
-        case JABS_COMPONENT_CLASS: return component && jabs_class_assignable(a->component, component);
+        switch (info->component_kind) {
+        case JABS_COMPONENT_CLASS: return component && info->component && jabs_class_assignable(info->component, component);
         case JABS_COMPONENT_ANY: return 0; /* an Object[] is only an Object[] */
         default: break;
         }
-    } else if (target[1] != '[' || a->descriptor[1] != '[') {
+    } else if (target[1] != '[' || desc[1] != '[') {
         return 0; /* never a primitive array; a one-dimensional reference array is never an array of arrays */
     }
     jabs_not_compiled("array type test whose element type is outside the unit or multi-dimensional");
@@ -1058,14 +1182,12 @@ static inline void (*jabs_itable_find(const jabs_object *o, uint64_t selector))(
 }
 
 static inline jabs_object *jabs_new(const jabs_class *cls) {
-    jabs_object *o = (jabs_object *)calloc(1, cls->size);
-    if (o) atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)cls->size, memory_order_relaxed);
-    if (!o) {
-        jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY);
-        return NULL;
+    jabs_object *o = jabs_gc_tlab_alloc(cls->size);
+    if (o) {
+        o->cls = cls;
+        return o;
     }
-    o->cls = cls;
-    return o;
+    return jabs_gc_alloc_obj(cls->size, cls);
 }
 
 /* ---- Native methods implemented by the runtime (JVM intrinsics) ---- */
@@ -1086,15 +1208,9 @@ static inline int32_t jabs_identity_hash(jabs_object *o) {
     return (int32_t)expected;
 }
 
-/* Size in bytes of one element of an array, from its descriptor. */
-static inline size_t jabs_element_size(const jabs_array *a) {
-    switch (a->descriptor[1]) {
-    case 'Z': case 'B': return 1;
-    case 'C': case 'S': return 2;
-    case 'I': case 'F': return 4;
-    case 'J': case 'D': return 8;
-    default: return sizeof(jabs_object *);
-    }
+/* Size in bytes of one element of an array, decoded directly from type_tag. */
+JABS_ALWAYS_INLINE size_t jabs_element_size(const jabs_array *a) {
+    return (size_t)1u << ((a->type_tag >> JABS_ARRAY_TAG_SHIFT_POS) & 3u);
 }
 
 /* System.arraycopy with HotSpot's checks in its order: null (NullPointerException), array types
@@ -1107,9 +1223,10 @@ static inline void jabs_arraycopy(jabs_object *src, int32_t src_pos, jabs_object
         return;
     }
     jabs_array *s = (jabs_array *)src, *d = (jabs_array *)dst;
-    int s_ref = s->descriptor[1] == 'L' || s->descriptor[1] == '[';
-    int d_ref = d->descriptor[1] == 'L' || d->descriptor[1] == '[';
-    if (s_ref != d_ref || (!s_ref && s->descriptor[1] != d->descriptor[1])) {
+    const jabs_array_type *si = jabs_array_info(s), *di = jabs_array_info(d);
+    int s_ref = si->is_ref != 0;
+    int d_ref = di->is_ref != 0;
+    if (s_ref != d_ref || (!s_ref && si->descriptor[1] != di->descriptor[1])) {
         jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_STORE);
         return;
     }
@@ -1122,7 +1239,7 @@ static inline void jabs_arraycopy(jabs_object *src, int32_t src_pos, jabs_object
     size_t size = jabs_element_size(s);
     char *from = (char *)jabs_array_data(s) + (size_t)src_pos * size;
     char *to = (char *)jabs_array_data(d) + (size_t)dst_pos * size;
-    if (!s_ref || strcmp(s->descriptor, d->descriptor) == 0 || d->component_kind == JABS_COMPONENT_ANY) {
+    if (!s_ref || s->type_tag == d->type_tag || strcmp(si->descriptor, di->descriptor) == 0 || di->component_kind == JABS_COMPONENT_ANY) {
         memmove(to, from, (size_t)length * size);
         return;
     }
@@ -1152,9 +1269,9 @@ static inline jabs_object *jabs_clone(jabs_object *o) {
         if (!cloneable) { jabs_pending = jabs_vm_throwable(JABS_VM_CLONE_NOT_SUPPORTED); return NULL; }
         size = o->cls->size;
     }
-    jabs_object *copy = (jabs_object *)malloc(size);
-    if (copy) atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)size, memory_order_relaxed);
-    if (!copy) { jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }
+    jabs_object *copy = jabs_gc_tlab_alloc(size);
+    if (!copy) copy = jabs_gc_alloc_obj(size, o->cls);
+    if (!copy) return NULL;
     memcpy(copy, o, size);
     copy->monitor = 0;
     atomic_store_explicit(&copy->hash, 0, memory_order_relaxed);

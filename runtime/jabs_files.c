@@ -349,8 +349,11 @@ static int64_t os_fd_read(int32_t fd, void *buffer, size_t length) {
         snprintf(error_text, sizeof error_text, "%s", strerror(errno));
         return -1;
     }
+    jabs_gc_enter_native();
     int n = _read(fd, buffer, length > 0x7fffffff ? 0x7fffffffu : (unsigned)length);
-    if (n < 0) { snprintf(error_text, sizeof error_text, "%s", strerror(errno)); return -1; }
+    int err = n < 0 ? errno : 0;
+    jabs_gc_exit_native();
+    if (n < 0) { snprintf(error_text, sizeof error_text, "%s", strerror(err)); return -1; }
     return n;
 }
 
@@ -393,7 +396,12 @@ static int32_t os_fd_close(int32_t fd) {
     return 1;
 }
 
-static int32_t os_fd_sync(int32_t fd) { return _commit(fd) == 0; }
+static int32_t os_fd_sync(int32_t fd) {
+    jabs_gc_enter_native();
+    int ok = _commit(fd) == 0;
+    jabs_gc_exit_native();
+    return ok;
+}
 
 /* Errors for the .jab's virtual tree, as this OS words them (see the wrappers at the end). */
 enum { FILES_VFS_MISSING_FILE, FILES_VFS_MISSING_PATH, FILES_VFS_READ_ONLY };
@@ -563,8 +571,11 @@ static int32_t os_fd_open(const char *path, int32_t flags) {
 
 static int64_t os_fd_read(int32_t fd, void *buffer, size_t length) {
     ssize_t n;
+    jabs_gc_enter_native();
     do n = read(fd, buffer, length); while (n < 0 && errno == EINTR);
-    if (n < 0) posix_error();
+    int err = n < 0 ? errno : 0;
+    jabs_gc_exit_native();
+    if (n < 0) { errno = err; posix_error(); }
     return n;
 }
 
@@ -606,7 +617,12 @@ static int32_t os_fd_close(int32_t fd) {
     return 1;
 }
 
-static int32_t os_fd_sync(int32_t fd) { return fsync(fd) == 0; }
+static int32_t os_fd_sync(int32_t fd) {
+    jabs_gc_enter_native();
+    int ok = fsync(fd) == 0;
+    jabs_gc_exit_native();
+    return ok;
+}
 
 enum { FILES_VFS_MISSING_FILE, FILES_VFS_MISSING_PATH, FILES_VFS_READ_ONLY };
 static void files_vfs_error(int which) {

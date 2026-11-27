@@ -26,7 +26,7 @@ static void claim_failure(void) {
         }                                                                              \
     } while (0)
 
-static const jabs_class probe_class = { "SyncProbe", sizeof(jabs_object), NULL, NULL, NULL, 0, NULL, 0, 0, 0 };
+static const jabs_class probe_class = { "SyncProbe", sizeof(jabs_object), NULL, NULL, NULL, 0, NULL, 0, 0, 0, 0, NULL, 0 };
 
 static jabs_object *fresh_object(void) {
     jabs_object *o = (jabs_object *)calloc(1, sizeof *o);

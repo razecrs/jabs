@@ -302,8 +302,11 @@ int32_t jabs_nio_file_read(jabs_object *fdo, int64_t address, int32_t length) {
         return n > 0 ? (int32_t)n : JABS_NIO_EOF;
     }
     DWORD got = 0;
-    if (!ReadFile(h, (LPVOID)(intptr_t)address, (DWORD)length, &got, NULL)) {
-        DWORD error = GetLastError();
+    jabs_gc_enter_native();
+    BOOL ok = ReadFile(h, (LPVOID)(intptr_t)address, (DWORD)length, &got, NULL);
+    DWORD error = ok ? 0 : GetLastError();
+    jabs_gc_exit_native();
+    if (!ok) {
         if (error == ERROR_BROKEN_PIPE) return JABS_NIO_EOF;
         if (error == ERROR_NO_DATA) return JABS_NIO_UNAVAILABLE;
         raise_last_error(error, "Read failed");
@@ -598,12 +601,15 @@ int32_t jabs_nio_unix_read(jabs_object *fdo, int64_t address, int32_t length) {
         if (got < 0) { nio_raise_errno(EIO, "Read failed"); return JABS_NIO_THROWN; }
         return got > 0 ? (int32_t)got : JABS_NIO_EOF;
     }
+    jabs_gc_enter_native();
     ssize_t n = read(fd, (void *)(intptr_t)address, (size_t)length);
+    int err = n < 0 ? errno : 0;
+    jabs_gc_exit_native();
     if (n > 0) return (int32_t)n;
     if (n == 0) return JABS_NIO_EOF;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return JABS_NIO_UNAVAILABLE;
-    if (errno == EINTR) return JABS_NIO_INTERRUPTED;
-    nio_raise_errno(errno, "Read failed");
+    if (err == EAGAIN || err == EWOULDBLOCK) return JABS_NIO_UNAVAILABLE;
+    if (err == EINTR) return JABS_NIO_INTERRUPTED;
+    nio_raise_errno(err, "Read failed");
     return JABS_NIO_THROWN;
 }
 

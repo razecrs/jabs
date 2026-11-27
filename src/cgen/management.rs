@@ -146,7 +146,7 @@ pub(super) fn intrinsic(
     // (code and class data) is the executable itself, which JABS does not measure: it stops.
     if key.0 == MEMORY_IMPL && key.1 == "getMemoryUsage0" && key.2 == MEMORY_USAGE_DESCRIPTOR {
         return Some((
-            "if (!a0) jabs_not_compiled(\"MemoryImpl.getMemoryUsage0(false): non-heap memory usage is not measured\"); int64_t used = atomic_load_explicit(&jabs_heap_bytes, memory_order_relaxed); return jabs_management_memory_usage(-1, used, used, -1);".into(),
+            "if (!a0) jabs_not_compiled(\"MemoryImpl.getMemoryUsage0(false): non-heap memory usage is not measured\"); return jabs_management_memory_usage(-1, jabs_gc_used_memory(), jabs_gc_total_memory(), jabs_gc_max_memory());".into(),
             false,
         ));
     }

@@ -295,7 +295,9 @@ jabs_object *jabs_net_lookup(jabs_object *host, int32_t characteristics) {
     memset(&hints, 0, sizeof hints);
     hints.ai_flags = AI_CANONNAME;
     hints.ai_family = lookup_family(characteristics);
+    jabs_gc_enter_native();
     int error = GetAddrInfoW(wide, NULL, &hints, &res);
+    jabs_gc_exit_native();
     free(wide);
     if (error != 0) {
         /* NET_ThrowByNameWithLastError: the system's text for the error, then the host. */
@@ -317,7 +319,9 @@ jabs_object *jabs_net_lookup(jabs_object *host, int32_t characteristics) {
     memset(&hints, 0, sizeof hints);
     hints.ai_flags = AI_CANONNAME;
     hints.ai_family = lookup_family(characteristics);
+    jabs_gc_enter_native();
     int error = getaddrinfo(name, NULL, &hints, &res);
+    jabs_gc_exit_native();
     if (error != 0) {
         /* NET_ThrowUnknownHostExceptionWithGaiError: "<host>: <gai text>", or " <gai text>". */
         int32_t enhanced = jabs_net_enhanced_host_info();
@@ -376,7 +380,10 @@ jabs_object *jabs_net_host_by_addr(jabs_object *address) {
 #ifdef _WIN32
     net_ready();
     wchar_t wide[JABS_NET_HOST_CAP];
-    if (GetNameInfoW((const struct sockaddr *)&storage, length, wide, JABS_NET_HOST_CAP, NULL, 0, NI_NAMEREQD) != 0) {
+    jabs_gc_enter_native();
+    int gni_rc = GetNameInfoW((const struct sockaddr *)&storage, length, wide, JABS_NET_HOST_CAP, NULL, 0, NI_NAMEREQD);
+    jabs_gc_exit_native();
+    if (gni_rc != 0) {
         jabs_net_raise(JABS_NET_UNKNOWN_HOST, NULL);
         return NULL;
     }
@@ -388,7 +395,10 @@ jabs_object *jabs_net_host_by_addr(jabs_object *address) {
     return s;
 #else
     char name[JABS_NET_HOST_CAP + 1];
-    if (getnameinfo((const struct sockaddr *)&storage, (socklen_t)length, name, sizeof name, NULL, 0, NI_NAMEREQD) != 0) {
+    jabs_gc_enter_native();
+    int gni_rc = getnameinfo((const struct sockaddr *)&storage, (socklen_t)length, name, sizeof name, NULL, 0, NI_NAMEREQD);
+    jabs_gc_exit_native();
+    if (gni_rc != 0) {
         jabs_net_raise(JABS_NET_UNKNOWN_HOST, NULL);
         return NULL;
     }
@@ -762,18 +772,25 @@ int32_t jabs_net_connect(int32_t prefer_ipv6, jabs_object *fdo, jabs_object *add
     int type = 0, type_length = sizeof type;
     int type_ok = getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&type, &type_length) == 0;
     if (type_ok && type == SOCK_STREAM && is_loopback(&sa)) fast_loopback_connect(s);
-    if (connect(s, &sa.sa, length) != 0) {
-        int e = WSAGetLastError();
+    jabs_gc_enter_native();
+    int rc = connect(s, &sa.sa, length);
+    int e = rc != 0 ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
+    if (rc != 0) {
         if (e == WSAEINPROGRESS || e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
         net_throw_new(e, "connect");
         return JABS_IOS_THROWN;
     }
     return 1;
 #else
-    if (connect(fd, &sa.sa, (socklen_t)length) != 0) {
-        if (errno == EINPROGRESS) return JABS_IOS_UNAVAILABLE;
-        if (errno == EINTR) return JABS_IOS_INTERRUPTED;
-        return socket_error(errno);
+    jabs_gc_enter_native();
+    int rc = connect(fd, &sa.sa, (socklen_t)length);
+    int e = rc != 0 ? errno : 0;
+    jabs_gc_exit_native();
+    if (rc != 0) {
+        if (e == EINPROGRESS) return JABS_IOS_UNAVAILABLE;
+        if (e == EINTR) return JABS_IOS_INTERRUPTED;
+        return socket_error(e);
     }
     return 1;
 #endif
@@ -792,9 +809,11 @@ int32_t jabs_net_accept(jabs_object *fdo, jabs_object *newfdo, jabs_object *addr
 #ifdef _WIN32
     net_ready();
     int length = (int)sizeof sa;
+    jabs_gc_enter_native();
     SOCKET s = accept(as_socket(fd), &sa.sa, &length);
+    int e = s == INVALID_SOCKET ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
     if (s == INVALID_SOCKET) {
-        int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
         raise_io_last_error((DWORD)e, "Accept failed");
         return JABS_IOS_THROWN;
@@ -804,16 +823,21 @@ int32_t jabs_net_accept(jabs_object *fdo, jabs_object *newfdo, jabs_object *addr
 #else
     socklen_t length = sizeof sa;
     int got = -1;
+    int e = 0;
     /* ECONNABORTED: the peer gave up before accept; take the next one, as the JDK does. */
+    jabs_gc_enter_native();
     for (;;) {
         got = accept(fd, &sa.sa, &length);
-        if (got >= 0 || errno != ECONNABORTED) break;
+        if (got >= 0) break;
+        e = errno;
+        if (e != ECONNABORTED) break;
         length = sizeof sa;
     }
+    jabs_gc_exit_native();
     if (got < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
-        if (errno == EINTR) return JABS_IOS_INTERRUPTED;
-        raise_errno(-1, errno, "Accept failed");
+        if (e == EAGAIN || e == EWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
+        if (e == EINTR) return JABS_IOS_INTERRUPTED;
+        raise_errno(-1, e, "Accept failed");
         return JABS_IOS_THROWN;
     }
     newfd = got;
@@ -988,8 +1012,11 @@ int32_t jabs_net_poll(jabs_object *fdo, int32_t events, int64_t timeout) {
     struct timeval t;
     t.tv_sec = (long)(timeout / 1000);
     t.tv_usec = (long)((timeout % 1000) * 1000);
+    jabs_gc_enter_native();
     int rv = select(0, &rd, &wr, &ex, timeout >= 0 ? &t : NULL);
-    if (rv == SOCKET_ERROR) return socket_error(WSAGetLastError());
+    int e = rv == SOCKET_ERROR ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
+    if (rv == SOCKET_ERROR) return socket_error(e);
     int32_t ready = 0;
     if (FD_ISSET(s, &rd)) ready |= POLLIN;
     if (FD_ISSET(s, &wr)) ready |= POLLOUT;
@@ -1001,10 +1028,13 @@ int32_t jabs_net_poll(jabs_object *fdo, int32_t events, int64_t timeout) {
     p.events = (short)events;
     p.revents = 0;
     int wait = timeout < -1 ? -1 : timeout > INT_MAX ? INT_MAX : (int)timeout;
+    jabs_gc_enter_native();
     int rv = poll(&p, 1, wait);
+    int e = rv < 0 ? errno : 0;
+    jabs_gc_exit_native();
     if (rv >= 0) return p.revents;
-    if (errno == EINTR) return 0;
-    return socket_error(errno);
+    if (e == EINTR) return 0;
+    return socket_error(e);
 #endif
 }
 
@@ -1023,8 +1053,11 @@ int32_t jabs_net_poll_connect(jabs_object *fdo, int64_t timeout) {
     struct timeval t;
     t.tv_sec = (long)(timeout / 1000);
     t.tv_usec = (long)((timeout % 1000) * 1000);
+    jabs_gc_enter_native();
     int rv = select(0, NULL, &wr, &ex, timeout >= 0 ? &t : NULL);
-    if (rv == SOCKET_ERROR) { socket_error(WSAGetLastError()); return 0; }
+    int e = rv == SOCKET_ERROR ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
+    if (rv == SOCKET_ERROR) { socket_error(e); return 0; }
     if (rv == 0) return 0;
     if (FD_ISSET(s, &wr) && !FD_ISSET(s, &ex)) return 1;
     int error = 0, length = sizeof error;
@@ -1043,7 +1076,10 @@ int32_t jabs_net_poll_connect(jabs_object *fdo, int64_t timeout) {
     p.events = POLLOUT;
     p.revents = 0;
     int wait = timeout < -1 ? -1 : timeout > INT_MAX ? INT_MAX : (int)timeout;
+    jabs_gc_enter_native();
     int rv = poll(&p, 1, wait);
+    int e = rv < 0 ? errno : 0;
+    jabs_gc_exit_native();
     if (rv > 0) {
         int error = 0;
         socklen_t length = sizeof error;
@@ -1052,8 +1088,8 @@ int32_t jabs_net_poll_connect(jabs_object *fdo, int64_t timeout) {
         if (p.revents & POLLHUP) { socket_error(ENOTCONN); return 0; }
         return 1;
     }
-    if (rv == 0 || errno == EINTR) return 0;
-    raise_errno(-1, errno, "poll failed");
+    if (rv == 0 || e == EINTR) return 0;
+    raise_errno(-1, e, "poll failed");
     return 0;
 #endif
 }
@@ -1102,8 +1138,11 @@ int32_t jabs_net_read(jabs_object *fdo, int64_t address, int32_t length) {
     b.len = (ULONG)length;
     b.buf = (char *)buffer;
     DWORD got = 0, flags = 0;
-    if (WSARecv(as_socket(fd), &b, 1, &got, &flags, NULL, NULL) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
+    jabs_gc_enter_native();
+    int rc = WSARecv(as_socket(fd), &b, 1, &got, &flags, NULL, NULL);
+    int e = rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
+    if (rc == SOCKET_ERROR) {
         if (e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
         if (e == WSAECONNRESET) jabs_net_raise(JABS_NET_CONNECTION_RESET, "Connection reset");
         else raise_io_last_error((DWORD)e, "WSARecv failed");
@@ -1113,16 +1152,19 @@ int32_t jabs_net_read(jabs_object *fdo, int64_t address, int32_t length) {
     if (got > INT32_MAX) jabs_not_compiled("WSARecv returned more than asked (jabs_net_read, jabs_net.c)");
     return got > 0 ? (int32_t)got : JABS_IOS_EOF;
 #else
+    jabs_gc_enter_native();
     ssize_t n = read(fd, buffer, (size_t)length);
-    if (n < 0 && (errno == ECONNRESET || errno == EPIPE)) {
+    int e = n < 0 ? errno : 0;
+    jabs_gc_exit_native();
+    if (n < 0 && (e == ECONNRESET || e == EPIPE)) {
         jabs_net_raise(JABS_NET_CONNECTION_RESET, "Connection reset");
         return JABS_IOS_THROWN;
     }
     if (n > 0) return (int32_t)n;
     if (n == 0) return JABS_IOS_EOF;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
-    if (errno == EINTR) return JABS_IOS_INTERRUPTED;
-    raise_errno(-1, errno, "Read failed");
+    if (e == EAGAIN || e == EWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
+    if (e == EINTR) return JABS_IOS_INTERRUPTED;
+    raise_errno(-1, e, "Read failed");
     return JABS_IOS_THROWN;
 #endif
 }
@@ -1140,8 +1182,11 @@ int32_t jabs_net_write(jabs_object *fdo, int64_t address, int32_t length) {
     b.len = (ULONG)length;
     b.buf = (char *)buffer;
     DWORD sent = 0;
-    if (WSASend(as_socket(fd), &b, 1, &sent, 0, NULL, NULL) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
+    jabs_gc_enter_native();
+    int rc = WSASend(as_socket(fd), &b, 1, &sent, 0, NULL, NULL);
+    int e = rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
+    if (rc == SOCKET_ERROR) {
         if (e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
         if (e == WSAECONNRESET) net_raise_io("Connection reset by peer");
         else raise_io_last_error((DWORD)e, "WSASend failed");
@@ -1150,15 +1195,18 @@ int32_t jabs_net_write(jabs_object *fdo, int64_t address, int32_t length) {
     if (sent > INT32_MAX) jabs_not_compiled("WSASend sent more than asked (jabs_net_write, jabs_net.c)");
     return (int32_t)sent;
 #else
+    jabs_gc_enter_native();
     ssize_t n = write(fd, buffer, (size_t)length);
-    if (n < 0 && (errno == ECONNRESET || errno == EPIPE)) {
+    int e = n < 0 ? errno : 0;
+    jabs_gc_exit_native();
+    if (n < 0 && (e == ECONNRESET || e == EPIPE)) {
         net_raise_io("Connection reset by peer");
         return JABS_IOS_THROWN;
     }
     if (n >= 0) return (int32_t)n;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
-    if (errno == EINTR) return JABS_IOS_INTERRUPTED;
-    raise_errno(-1, errno, "Write failed");
+    if (e == EAGAIN || e == EWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
+    if (e == EINTR) return JABS_IOS_INTERRUPTED;
+    raise_errno(-1, e, "Write failed");
     return JABS_IOS_THROWN;
 #endif
 }
@@ -1175,27 +1223,35 @@ int32_t jabs_net_drain(int32_t fd) {
     net_ready();
     char buffer[16];
     int32_t any = 0;
+    int err = 0;
+    jabs_gc_enter_native();
     for (;;) {
         int n = recv(as_socket(fd), buffer, (int)sizeof buffer, 0);
         if (n == SOCKET_ERROR) {
-            int e = WSAGetLastError();
-            if (e == WSAEWOULDBLOCK) return any;
-            raise_io_last_error((DWORD)e, "recv failed");
-            return 0;
+            err = WSAGetLastError();
+            break;
         }
-        if (n == 0) return any;
+        if (n == 0) break;
         any = 1;
-        if ((size_t)n < sizeof buffer) return any;
+        if ((size_t)n < sizeof buffer) break;
     }
+    jabs_gc_exit_native();
+    if (err != 0 && err != WSAEWOULDBLOCK) {
+        raise_io_last_error((DWORD)err, "recv failed");
+        return 0;
+    }
+    return any;
 }
 
 /* IOUtil.write1 (Windows, a socket): one byte; 1, or IOS_UNAVAILABLE when the socket is full. */
 int32_t jabs_net_write1(int32_t fd, int8_t byte) {
     net_ready();
     char b = (char)byte;
+    jabs_gc_enter_native();
     int n = send(as_socket(fd), &b, 1, 0);
+    int e = n == SOCKET_ERROR ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
     if (n == SOCKET_ERROR) {
-        int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
         raise_io_last_error((DWORD)e, "send failed");
         return JABS_IOS_THROWN;
@@ -1278,27 +1334,38 @@ int64_t jabs_net_make_pipe(int32_t blocking) {
 int32_t jabs_net_drain(int32_t fd) {
     char buffer[16];
     int32_t any = 0;
+    int err = 0;
+    jabs_gc_enter_native();
     for (;;) {
         ssize_t n = read(fd, buffer, sizeof buffer);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return any;
-            if (errno == EINTR) continue;
-            raise_errno(-1, errno, "Drain");
-            return 0;
+            int e = errno;
+            if (e == EINTR) continue;
+            if (e != EAGAIN && e != EWOULDBLOCK) err = e;
+            break;
         }
-        if (n == 0) return any;
+        if (n == 0) break;
         any = 1;
-        if ((size_t)n < sizeof buffer) return any;
+        if ((size_t)n < sizeof buffer) break;
     }
+    jabs_gc_exit_native();
+    if (err != 0) {
+        raise_errno(-1, err, "Drain");
+        return 0;
+    }
+    return any;
 }
 
 int32_t jabs_net_write1(int32_t fd, int8_t byte) {
     char b = (char)byte;
+    jabs_gc_enter_native();
     ssize_t n = write(fd, &b, 1);
+    int e = n < 0 ? errno : 0;
+    jabs_gc_exit_native();
     if (n == 1) return 1;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return JABS_IOS_UNAVAILABLE;
-    if (n < 0 && errno == EINTR) return JABS_IOS_INTERRUPTED;
-    raise_errno(-1, errno, "Write failed");
+    if (n < 0 && (e == EAGAIN || e == EWOULDBLOCK)) return JABS_IOS_UNAVAILABLE;
+    if (n < 0 && e == EINTR) return JABS_IOS_INTERRUPTED;
+    raise_errno(-1, e, "Write failed");
     return JABS_IOS_THROWN;
 }
 
@@ -1551,13 +1618,19 @@ int32_t jabs_net_epoll_wait(int64_t handle, int64_t address, int32_t maxevents, 
     if (polled == 0) {
         /* Nothing to wait on: wepoll would sleep out the timeout. */
         free(fds); free(wanted); free(data);
-        if (timeout != 0) Sleep(timeout < 0 ? INFINITE : (DWORD)timeout);
+        if (timeout != 0) {
+            jabs_gc_enter_native();
+            Sleep(timeout < 0 ? INFINITE : (DWORD)timeout);
+            jabs_gc_exit_native();
+        }
         return 0;
     }
     if (polled > ULONG_MAX) jabs_not_compiled("more sockets than WSAPoll takes (jabs_net_epoll_wait, jabs_net.c)");
+    jabs_gc_enter_native();
     int r = WSAPoll(fds, (ULONG)polled, timeout < 0 ? -1 : timeout);
+    int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
     if (r == SOCKET_ERROR) {
-        int e = WSAGetLastError();
         free(fds); free(wanted); free(data);
         if (e == WSAEINTR) return JABS_IOS_INTERRUPTED;
         raise_io_last_error((DWORD)e, "epoll_wait failed");
@@ -1621,10 +1694,13 @@ int32_t jabs_net_linux_epoll_ctl(int32_t epfd, int32_t op, int32_t fd, int32_t e
 
 /* EPoll.wait: ready descriptors, IOS_INTERRUPTED on EINTR. */
 int32_t jabs_net_linux_epoll_wait(int32_t epfd, int64_t address, int32_t maxevents, int32_t timeout) {
+    jabs_gc_enter_native();
     int n = epoll_wait(epfd, (struct epoll_event *)(intptr_t)address, maxevents, timeout);
+    int e = n < 0 ? errno : 0;
+    jabs_gc_exit_native();
     if (n >= 0) return n;
-    if (errno == EINTR) return JABS_IOS_INTERRUPTED;
-    raise_errno(-1, errno, "epoll_wait failed");
+    if (e == EINTR) return JABS_IOS_INTERRUPTED;
+    raise_errno(-1, e, "epoll_wait failed");
     return JABS_IOS_THROWN;
 }
 
@@ -1722,8 +1798,11 @@ int32_t jabs_net_uds_connect(jabs_object *fdo, jabs_object *path) {
     struct sockaddr_un sa;
     int length = 0;
     if (uds_address(path, &sa, &length) != 0) return JABS_IOS_THROWN;
-    if (connect(as_socket(fd), (struct sockaddr *)&sa, length) == SOCKET_ERROR) {
-        int e = WSAGetLastError();
+    jabs_gc_enter_native();
+    int rc = connect(as_socket(fd), (struct sockaddr *)&sa, length);
+    int e = rc == SOCKET_ERROR ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
+    if (rc == SOCKET_ERROR) {
         if (e == WSAEINPROGRESS || e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
         return socket_error(e);
     }
@@ -1738,9 +1817,11 @@ int32_t jabs_net_uds_accept(jabs_object *fdo, jabs_object *newfdo, jabs_object *
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     int length = (int)sizeof sa;
+    jabs_gc_enter_native();
     SOCKET s = accept(as_socket(fd), (struct sockaddr *)&sa, &length);
+    int e = s == INVALID_SOCKET ? WSAGetLastError() : 0;
+    jabs_gc_exit_native();
     if (s == INVALID_SOCKET) {
-        int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) return JABS_IOS_UNAVAILABLE;
         return socket_error(e);
     }

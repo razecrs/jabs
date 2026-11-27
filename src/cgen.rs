@@ -373,22 +373,22 @@ const INTRINSICS: &[Intrinsic] = &[
     // No heap limit: the specification's answer is Long.MAX_VALUE.
     Intrinsic {
         key: ("java/lang/Runtime", "maxMemory", "()J"),
-        body: "return INT64_MAX;",
+        body: "return jabs_gc_max_memory();",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/Runtime", "totalMemory", "()J"),
-        body: "return atomic_load_explicit(&jabs_heap_bytes, memory_order_relaxed);",
+        body: "return jabs_gc_total_memory();",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/Runtime", "freeMemory", "()J"),
-        body: "return 0; /* nothing is ever freed without a GC */",
+        body: "return jabs_gc_free_memory();",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/Runtime", "gc", "()V"),
-        body: "/* no garbage collector yet */",
+        body: "jabs_gc_collect();",
         needs_classes: false,
     },
     // Thread.start0: jabs_thread.c runs run() on a new OS thread and ends the thread as HotSpot
@@ -462,15 +462,15 @@ const INTRINSICS: &[Intrinsic] = &[
         body: "static int64_t next_thread_id = 2; return (int64_t)(intptr_t)&next_thread_id;",
         needs_classes: false,
     },
-    // The JVM's default (--finalization=enabled); with no GC no finalizer ever becomes due.
+    // Finalization is disabled (--finalization=disabled); ReferenceHandler and Cleaner handle Reference queues.
     Intrinsic {
         key: ("java/lang/ref/Finalizer", "isFinalizationEnabled", "()Z"),
-        body: "return 1;",
+        body: "return 0;",
         needs_classes: false,
     },
     Intrinsic {
         key: ("java/lang/ref/Reference", "hasReferencePendingList", "()Z"),
-        body: "return 0; /* no GC: nothing is ever pending */",
+        body: "return jabs_gc_has_pending_refs();",
         needs_classes: false,
     },
     // Native libraries: JABS links every native statically, so each library is "built in" (the
@@ -718,25 +718,12 @@ const REPLACEMENTS: &[(&str, &str, &str, &str)] = &[
         "()Ljava/lang/Object;",
         "return jabs_class_new_instance(self);",
     ),
-    // No garbage collector yet: nothing is ever cleared, enqueued or finalized, so these threads
-    // would only wait forever. Revisit with the threads and GC milestones.
-    (
-        "java/lang/ref/Reference",
-        "startReferenceHandlerThread",
-        "(Ljava/lang/ThreadGroup;)V",
-        "(void)a0; /* JABS: no GC yet, so no Reference Handler thread */",
-    ),
-    (
-        "jdk/internal/ref/CleanerImpl",
-        "start",
-        "(Ljava/lang/ref/Cleaner;Ljava/util/concurrent/ThreadFactory;)V",
-        "(void)self; (void)a0; (void)a1; /* JABS: no GC yet, so no Cleaner thread (nothing becomes phantom-reachable) */",
-    ),
+    // Finalization is disabled (isFinalizationEnabled=0), so Finalizer thread is not started.
     (
         "java/lang/ref/Finalizer",
         "startFinalizerThread",
         "(Ljava/lang/ThreadGroup;)V",
-        "(void)a0; /* JABS: no GC yet, so no Finalizer thread */",
+        "(void)a0; /* JABS: finalization disabled */",
     ),
 ];
 
@@ -1494,21 +1481,84 @@ pub struct CompiledUnit {
 }
 
 /// Definitions of the runtime's globals; exactly one file of a program contains them.
-const RUNTIME_GLOBALS: &str = "_Thread_local jabs_object *jabs_pending;\n\
-_Thread_local uint32_t jabs_hash_next = 0x9e3779b9u;\n\
-_Thread_local const char *jabs_where = \"\";\n\
-_Atomic int64_t jabs_heap_bytes;\n\
-_Thread_local const char *jabs_caller;\n\
-void (*jabs_on_not_compiled)(void);\n\
-int jabs_define_count;\n\
-const char *const *jabs_defines;\n\
-int jabs_set_command_line_properties(int count, const char *const *defines) {\n\
-    if (count < 0 || (count > 0 && !defines)) return -1;\n\
-    for (int i = 0; i < count; i++) if (!defines[i] || defines[i][0] == '=' || defines[i][0] == 0) return -1;\n\
-    jabs_define_count = count;\n\
-    jabs_defines = defines;\n\
-    return 0;\n\
-}\n\n";
+const RUNTIME_GLOBALS: &str = r#"_Thread_local jabs_object *jabs_pending;
+_Thread_local uint32_t jabs_hash_next = 0x9e3779b9u;
+_Thread_local const char *jabs_where = "";
+_Atomic int64_t jabs_heap_bytes;
+_Thread_local const char *jabs_caller;
+void (*jabs_on_not_compiled)(void);
+int jabs_define_count;
+const char *const *jabs_defines;
+int jabs_set_command_line_properties(int count, const char *const *defines) {
+    if (count < 0 || (count > 0 && !defines)) return -1;
+    for (int i = 0; i < count; i++) if (!defines[i] || defines[i][0] == '=' || defines[i][0] == 0) return -1;
+    jabs_define_count = count;
+    jabs_defines = defines;
+    return 0;
+}
+jabs_array_type jabs_array_chunk0[64] = {
+    { "[Z", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 1, 0, 0 },
+    { "[B", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 1, 0, 0 },
+    { "[C", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 2, 1, 0 },
+    { "[S", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 2, 1, 0 },
+    { "[I", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 4, 2, 0 },
+    { "[J", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 8, 3, 0 },
+    { "[F", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 4, 2, 0 },
+    { "[D", NULL, NULL, JABS_COMPONENT_PRIMITIVE, 8, 3, 0 },
+    { "[Ljava/lang/Object;", NULL, NULL, JABS_COMPONENT_ANY, (uint8_t)sizeof(jabs_object *), (uint8_t)(sizeof(jabs_object *) == 8 ? 3 : 2), 1 },
+};
+jabs_array_type *jabs_array_chunks[1024] = { jabs_array_chunk0 };
+static atomic_flag jabs_array_type_lock = ATOMIC_FLAG_INIT;
+static uint32_t jabs_array_type_count = 9u;
+typedef struct { const char *desc, *comp_desc; const jabs_class *comp; int32_t kind; uint32_t tag; } jabs_array_tls_entry;
+static _Thread_local jabs_array_tls_entry jabs_array_tls_cache[8];
+static _Thread_local uint32_t jabs_array_tls_next;
+uint32_t jabs_array_intern_tag(int32_t kind, const jabs_class *component, const char *descriptor, const char *component_descriptor) {
+    for (int i = 0; i < 8; i++) {
+        jabs_array_tls_entry *e = &jabs_array_tls_cache[i];
+        if (e->desc == descriptor && e->comp == component && e->kind == kind && e->comp_desc == component_descriptor) return e->tag;
+    }
+    while (atomic_flag_test_and_set_explicit(&jabs_array_type_lock, memory_order_acquire)) {}
+    uint32_t found = UINT32_MAX;
+    for (uint32_t i = 0; i < jabs_array_type_count; i++) {
+        const jabs_array_type *t = &jabs_array_chunks[i >> 6][i & 63u];
+        if (t->component_kind == kind && t->component == component && strcmp(t->descriptor, descriptor) == 0
+            && ((t->component_descriptor == component_descriptor) || (t->component_descriptor && component_descriptor && strcmp(t->component_descriptor, component_descriptor) == 0))) {
+            found = i;
+            break;
+        }
+    }
+    if (found == UINT32_MAX) {
+        if (jabs_array_type_count >= 65536u) { atomic_flag_clear_explicit(&jabs_array_type_lock, memory_order_release); jabs_not_compiled("too many distinct array types"); }
+        uint32_t chunk_idx = jabs_array_type_count >> 6;
+        if (!jabs_array_chunks[chunk_idx]) {
+            jabs_array_type *chunk = (jabs_array_type *)calloc(64, sizeof(jabs_array_type));
+            if (!chunk) { atomic_flag_clear_explicit(&jabs_array_type_lock, memory_order_release); jabs_not_compiled("out of memory registering array type"); }
+            __atomic_store_n(&jabs_array_chunks[chunk_idx], chunk, __ATOMIC_RELEASE);
+        }
+        uint8_t is_ref = (kind != JABS_COMPONENT_PRIMITIVE) ? 1u : 0u;
+        uint8_t shift = (sizeof(jabs_object *) == 8u) ? 3u : 2u;
+        uint8_t esz = (uint8_t)sizeof(jabs_object *);
+        if (!is_ref) {
+            switch (descriptor[1]) {
+            case 'Z': case 'B': esz = 1; shift = 0; break;
+            case 'C': case 'S': esz = 2; shift = 1; break;
+            case 'I': case 'F': esz = 4; shift = 2; break;
+            default: esz = 8; shift = 3; break;
+            }
+        }
+        found = jabs_array_type_count++;
+        jabs_array_chunks[found >> 6][found & 63u] = (jabs_array_type){ descriptor, component_descriptor, component, kind, esz, shift, is_ref };
+    }
+    const jabs_array_type *res = &jabs_array_chunks[found >> 6][found & 63u];
+    uint32_t tag = (res->is_ref ? JABS_ARRAY_TAG_REF : 0u) | ((uint32_t)res->elem_shift << JABS_ARRAY_TAG_SHIFT_POS) | found;
+    atomic_flag_clear_explicit(&jabs_array_type_lock, memory_order_release);
+    uint32_t slot = jabs_array_tls_next++ & 7u;
+    jabs_array_tls_cache[slot] = (jabs_array_tls_entry){ descriptor, component_descriptor, component, kind, tag };
+    return tag;
+}
+
+"#;
 
 /// Extern declarations for the external definitions in `code` (records, vtables, static fields
 /// and non-static functions), so other files can reference them.
@@ -4215,6 +4265,7 @@ fn emit_method(
         let _ = writeln!(out, "    l[{slot}].{} = a{i};", field(k));
         slot += if matches!(k, Kind::J | Kind::D) { 2 } else { 1 };
     }
+    let _ = writeln!(out, "    jabs_gc_safepoint();");
     // Raise a VM exception and leave through `exit` (a handler dispatch block or a return).
     // Raises record the method that raised them (stack traces are not captured yet).
     let site = c_escape(&format!(
@@ -4459,29 +4510,62 @@ fn emit_method(
                     b = d - 1
                 )
             }
-            Op::If(c, t) => format!("if (s[{}].i {} 0) goto L{t};", d - 1, cond_op(*c)),
-            Op::IfICmp(c, t) => format!(
-                "if (s[{}].i {} s[{}].i) goto L{t};",
-                d - 2,
-                cond_op(*c),
-                d - 1
-            ),
+            Op::If(c, t) => {
+                if *t <= insn.pc {
+                    format!(
+                        "if (s[{}].i {} 0) {{ jabs_gc_safepoint(); goto L{t}; }}",
+                        d - 1,
+                        cond_op(*c)
+                    )
+                } else {
+                    format!("if (s[{}].i {} 0) goto L{t};", d - 1, cond_op(*c))
+                }
+            }
+            Op::IfICmp(c, t) => {
+                if *t <= insn.pc {
+                    format!(
+                        "if (s[{}].i {} s[{}].i) {{ jabs_gc_safepoint(); goto L{t}; }}",
+                        d - 2,
+                        cond_op(*c),
+                        d - 1
+                    )
+                } else {
+                    format!(
+                        "if (s[{}].i {} s[{}].i) goto L{t};",
+                        d - 2,
+                        cond_op(*c),
+                        d - 1
+                    )
+                }
+            }
             Op::IfNull { is_null, target } => {
-                format!(
-                    "if (s[{}].a {} NULL) goto L{target};",
-                    d - 1,
-                    if *is_null { "==" } else { "!=" }
-                )
+                let cond = format!("s[{}].a {} NULL", d - 1, if *is_null { "==" } else { "!=" });
+                if *target <= insn.pc {
+                    format!("if ({cond}) {{ jabs_gc_safepoint(); goto L{target}; }}")
+                } else {
+                    format!("if ({cond}) goto L{target};")
+                }
             }
             Op::IfACmp { equal, target } => {
-                format!(
-                    "if (s[{}].a {} s[{}].a) goto L{target};",
+                let cond = format!(
+                    "s[{}].a {} s[{}].a",
                     d - 2,
                     if *equal { "==" } else { "!=" },
                     d - 1
-                )
+                );
+                if *target <= insn.pc {
+                    format!("if ({cond}) {{ jabs_gc_safepoint(); goto L{target}; }}")
+                } else {
+                    format!("if ({cond}) goto L{target};")
+                }
             }
-            Op::Goto(t) => format!("goto L{t};"),
+            Op::Goto(t) => {
+                if *t <= insn.pc {
+                    format!("{{ jabs_gc_safepoint(); goto L{t}; }}")
+                } else {
+                    format!("goto L{t};")
+                }
+            }
             Op::TableSwitch {
                 default,
                 low,
@@ -4490,17 +4574,47 @@ fn emit_method(
                 let mut s = format!("switch (s[{}].i) {{", d - 1);
                 for (i, t) in targets.iter().enumerate() {
                     let key = *low as i64 + i as i64;
-                    let _ = write!(s, " case {}: goto L{t};", int_case(key as i32));
+                    if *t <= insn.pc {
+                        let _ = write!(
+                            s,
+                            " case {}: {{ jabs_gc_safepoint(); goto L{t}; }}",
+                            int_case(key as i32)
+                        );
+                    } else {
+                        let _ = write!(s, " case {}: goto L{t};", int_case(key as i32));
+                    }
                 }
-                let _ = write!(s, " default: goto L{default}; }}");
+                if *default <= insn.pc {
+                    let _ = write!(
+                        s,
+                        " default: {{ jabs_gc_safepoint(); goto L{default}; }} }}"
+                    );
+                } else {
+                    let _ = write!(s, " default: goto L{default}; }}");
+                }
                 s
             }
             Op::LookupSwitch { default, pairs } => {
                 let mut s = format!("switch (s[{}].i) {{", d - 1);
                 for (key, t) in pairs {
-                    let _ = write!(s, " case {}: goto L{t};", int_case(*key));
+                    if *t <= insn.pc {
+                        let _ = write!(
+                            s,
+                            " case {}: {{ jabs_gc_safepoint(); goto L{t}; }}",
+                            int_case(*key)
+                        );
+                    } else {
+                        let _ = write!(s, " case {}: goto L{t};", int_case(*key));
+                    }
                 }
-                let _ = write!(s, " default: goto L{default}; }}");
+                if *default <= insn.pc {
+                    let _ = write!(
+                        s,
+                        " default: {{ jabs_gc_safepoint(); goto L{default}; }} }}"
+                    );
+                } else {
+                    let _ = write!(s, " default: goto L{default}; }}");
+                }
                 s
             }
             Op::Return(None) => "return;".into(),
@@ -4787,7 +4901,7 @@ fn emit_method(
             };
             let _ = writeln!(
                 out,
-                "    if ({test}) {{ s[0].a = jabs_pending; jabs_pending = NULL; goto L{}; }}",
+                "    if ({test}) {{ s[0].a = jabs_pending; jabs_pending = NULL; jabs_gc_safepoint(); goto L{}; }}",
                 catch.handler
             );
         }
@@ -4857,14 +4971,32 @@ fn int_case(key: i32) -> String {
     }
 }
 
-/// Emit a class's object layout: its superclass's struct (or the header) first, then its own instance fields.
+/// Emit a class's object layout: its superclass's struct (or the header) first, then its own
+/// instance fields ordered references-first and descending by alignment to eliminate padding.
+fn field_layout_rank(descriptor: &str) -> u8 {
+    match storage_type(descriptor) {
+        Some("jabs_object *") => 0,
+        None => 1,
+        Some("int64_t") | Some("double") => 2,
+        Some("int32_t") | Some("float") => 3,
+        Some("uint16_t") | Some("int16_t") => 4,
+        _ => 5,
+    }
+}
+
 fn emit_object_layout(out: &mut String, class: &ClassFile) {
     let base = match class.super_name.as_deref() {
         Some(parent) if parent != OBJECT => format!("{} super;", object_struct(parent)),
         _ => "jabs_object header;".to_string(),
     };
     let _ = writeln!(out, "{} {{\n    {base}", object_struct(&class.name));
-    for f in class.fields.iter().filter(|f| f.access & ACC_STATIC == 0) {
+    let mut instance_fields: Vec<&Member> = class
+        .fields
+        .iter()
+        .filter(|f| f.access & ACC_STATIC == 0)
+        .collect();
+    instance_fields.sort_by_key(|f| field_layout_rank(&f.descriptor));
+    for f in instance_fields {
         match storage_type(&f.descriptor) {
             Some(ty) => {
                 let _ = writeln!(out, "    {ty} {};", instance_field(&f.name));
@@ -4900,6 +5032,7 @@ fn constant_string(class: &ClassFile, field: &Member) -> Option<Vec<u16>> {
 /// and slow-path constructor (`jabs_literal_get`) shared by all compiled methods and static fields.
 fn emit_literals(out: &mut String, literals: &[Vec<u16>], intern_table: bool) {
     if literals.is_empty() {
+        out.push_str("const uint32_t jabs_gc_literal_count = 0u;\n_Atomic(jabs_object *) *const jabs_gc_literals = NULL;\n\n");
         return;
     }
     let string = object_struct(STRING);
@@ -4950,7 +5083,7 @@ fn emit_literals(out: &mut String, literals: &[Vec<u16>], intern_table: bool) {
     }
     let _ = writeln!(
         out,
-        "}};\n_Atomic(jabs_object *) jabs_literal_cache[{count}];",
+        "}};\n_Atomic(jabs_object *) jabs_literal_cache[{count}];\nconst uint32_t jabs_gc_literal_count = {count}u;\n_Atomic(jabs_object *) *const jabs_gc_literals = jabs_literal_cache;",
         count = literals.len()
     );
     let intern_line = if intern_table {
@@ -5164,7 +5297,7 @@ fn emit_interface_record(
     };
     let _ = writeln!(
         out,
-        "const jabs_class {} = {{ \"{}\", 0, NULL, NULL, NULL, 0, {list}, {count}, 1, {} }};",
+        "const jabs_class {} = {{ \"{}\", 0, NULL, NULL, NULL, 0, {list}, {count}, 1, {}, 0, NULL, 0 }};",
         class_record(&iface.name),
         c_escape(&iface.name),
         iface.access
@@ -5266,9 +5399,55 @@ fn emit_class_record(
         Some(p) if p != OBJECT => format!("&{}", class_record(p)),
         _ => "NULL".to_string(),
     };
+    let chain = unit.chain(&class.name).ok();
+    let mut ref_offsets: Vec<String> = Vec::new();
+    let mut ref_mask: u16 = 0;
+    if let Some(ancestors) = &chain {
+        for anc in ancestors.iter() {
+            if anc.name == "java/lang/ref/SoftReference" {
+                ref_mask |= 1 << 1;
+            } else if anc.name == "java/lang/ref/WeakReference" {
+                ref_mask |= 1 << 2;
+            } else if anc.name == "java/lang/ref/PhantomReference" {
+                ref_mask |= 1 << 3;
+            }
+            for f in anc.fields.iter().filter(|f| f.access & ACC_STATIC == 0) {
+                if anc.name == "java/lang/ref/Reference"
+                    && (f.name == "referent" || f.name == "discovered")
+                {
+                    continue;
+                }
+                if storage_type(&f.descriptor) == Some("jabs_object *") {
+                    ref_offsets.push(format!(
+                        "(uint32_t)offsetof({}, {})",
+                        object_struct(&anc.name),
+                        instance_field(&f.name)
+                    ));
+                }
+            }
+        }
+    }
+    let mut gc_flags: u16 = ref_mask;
+    if !ref_offsets.is_empty() {
+        gc_flags |= 1 << 0;
+    }
+    if class.name == VAR_HANDLE {
+        gc_flags |= 1 << 4;
+    }
+    let (refs_ref, refs_len) = if ref_offsets.is_empty() {
+        ("NULL".to_string(), 0usize)
+    } else {
+        let rname = mangled("jro_", &[&class.name]);
+        let _ = writeln!(
+            out,
+            "static const uint32_t {rname}[] = {{ {} }};",
+            ref_offsets.join(", ")
+        );
+        (rname, ref_offsets.len())
+    };
     let _ = writeln!(
         out,
-        "const jabs_class {} = {{ \"{}\", sizeof({}), {vtable_name}, {parent}, {itable_ref}, {itable_len}, {ifaces_ref}, {ifaces_len}, 0, {} }};\n",
+        "const jabs_class {} = {{ \"{}\", sizeof({}), {vtable_name}, {parent}, {itable_ref}, {itable_len}, {ifaces_ref}, {ifaces_len}, 0, {}, {gc_flags}u, {refs_ref}, {refs_len}u }};\n",
         class_record(&class.name),
         c_escape(&class.name),
         object_struct(&class.name),
@@ -5287,7 +5466,7 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
             let synthetic = mangled("jabs_vmx_", &[name]);
             let _ = writeln!(
                 out,
-                "const jabs_class {synthetic} = {{ \"{name}\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0 }};"
+                "const jabs_class {synthetic} = {{ \"{name}\", 0, NULL, NULL, NULL, 0, NULL, 0, 0, 0, 0, NULL, 0 }};"
             );
             records.push(format!("&{synthetic}"));
         }
@@ -5301,13 +5480,17 @@ fn emit_vm_throwables(out: &mut String, recorded: &BTreeSet<&str>) {
     let _ = writeln!(out, "    const jabs_class *c = records[kind];");
     let _ = writeln!(
         out,
-        "    jabs_object *o = (jabs_object *)calloc(1, c->size > sizeof(jabs_object) ? c->size : sizeof(jabs_object));"
+        "    if (kind == JABS_VM_OUT_OF_MEMORY) return jabs_gc_oom_object(c);"
     );
     let _ = writeln!(
         out,
-        "    if (!o) {{ fputs(\"jabs: out of memory while raising an exception\\n\", stderr); abort(); }}"
+        "    size_t sz = c->size > sizeof(jabs_object) ? c->size : sizeof(jabs_object);"
     );
-    let _ = writeln!(out, "    o->cls = c;\n    return o;\n}}");
+    let _ = writeln!(out, "    jabs_object *o = jabs_gc_alloc_obj(sz, c);");
+    let _ = writeln!(
+        out,
+        "    if (!o) return jabs_gc_oom_object(records[JABS_VM_OUT_OF_MEMORY]);\n    return o;\n}}"
+    );
     let error_test = if recorded.contains("java/lang/Error") {
         format!("jabs_is_instance(o, &{})", class_record("java/lang/Error"))
     } else {
@@ -5607,7 +5790,7 @@ static jabs_class_entry *jabs_class_entry_of(jabs_object *c) {{
 
 /* Object.getClass. */
 jabs_object *jabs_class_of(jabs_object *o) {{
-    return jabs_class_object(o->cls == jabs_array_class() ? ((jabs_array *)o)->descriptor : o->cls->name);
+    return jabs_class_object(o->cls == jabs_array_class() ? jabs_array_descriptor((const jabs_array *)o) : o->cls->name);
 }}
 
 /* Class.isInstance(o) for non-null o. */
@@ -5690,9 +5873,11 @@ jabs_object *jabs_class_superclass(jabs_object *c) {{
     out.push_str(&format!(
         r#"
 /* The String intern table (String.intern and every literal): open addressing on contents.
- * Every thread shares it; it is read and changed only under JABS_LOCK_STRINGS. */
+ * Every thread shares it; it is read and changed only under JABS_LOCK_STRINGS.
+ * Runtime-interned strings are weak to GC: unmarked slots become tombstones during STW. */
+#define JABS_INTERN_TOMBSTONE ((jabs_object *)(intptr_t)1)
 static jabs_object **jabs_interned;
-static size_t jabs_interned_count, jabs_interned_capacity;
+static size_t jabs_interned_count, jabs_interned_tombstones, jabs_interned_capacity;
 
 static uint64_t jabs_string_contents_hash(jabs_object *s) {{
     jabs_array *v = (jabs_array *)(({string_struct} *)s)->{value};
@@ -5712,13 +5897,14 @@ static int jabs_string_contents_equal(jabs_object *a, jabs_object *b) {{
 jabs_object *jabs_string_intern(jabs_object *s) {{
     if (!s) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
     jabs_lock(JABS_LOCK_STRINGS);
-    if (2 * (jabs_interned_count + 1) > jabs_interned_capacity) {{
+    if (2 * (jabs_interned_count + jabs_interned_tombstones + 1) > jabs_interned_capacity) {{
         size_t grown = jabs_interned_capacity ? jabs_interned_capacity * 2 : 1024;
+        if (jabs_interned_capacity && 4 * (jabs_interned_count + 1) <= jabs_interned_capacity) grown = jabs_interned_capacity;
         jabs_object **table = (jabs_object **)calloc(grown, sizeof *table);
         if (!table) {{ jabs_unlock(JABS_LOCK_STRINGS); jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
         for (size_t i = 0; i < jabs_interned_capacity; i++) {{
             jabs_object *e = jabs_interned[i];
-            if (!e) continue;
+            if (!e || e == JABS_INTERN_TOMBSTONE) continue;
             size_t j = (size_t)jabs_string_contents_hash(e) & (grown - 1);
             while (table[j]) j = (j + 1) & (grown - 1);
             table[j] = e;
@@ -5726,19 +5912,46 @@ jabs_object *jabs_string_intern(jabs_object *s) {{
         free(jabs_interned);
         jabs_interned = table;
         jabs_interned_capacity = grown;
+        jabs_interned_tombstones = 0;
     }}
     size_t j = (size_t)jabs_string_contents_hash(s) & (jabs_interned_capacity - 1);
+    size_t first_tomb = SIZE_MAX;
     for (; jabs_interned[j]; j = (j + 1) & (jabs_interned_capacity - 1)) {{
-        if (jabs_string_contents_equal(jabs_interned[j], s)) {{
-            jabs_object *canonical = jabs_interned[j];
+        jabs_object *e = jabs_interned[j];
+        if (e == JABS_INTERN_TOMBSTONE) {{ if (first_tomb == SIZE_MAX) first_tomb = j; continue; }}
+        if (jabs_string_contents_equal(e, s)) {{
             jabs_unlock(JABS_LOCK_STRINGS);
-            return canonical;
+            return e;
         }}
     }}
-    jabs_interned[j] = s;
+    if (first_tomb != SIZE_MAX) {{
+        jabs_interned[first_tomb] = s;
+        jabs_interned_tombstones--;
+    }} else {{
+        jabs_interned[j] = s;
+    }}
     jabs_interned_count++;
     jabs_unlock(JABS_LOCK_STRINGS);
     return s;
+}}
+
+void jabs_gc_sweep_interned(jabs_gc_is_marked_fn is_marked) {{
+    for (size_t i = 0; i < jabs_interned_capacity; i++) {{
+        jabs_object *e = jabs_interned[i];
+        if (e && e != JABS_INTERN_TOMBSTONE && !is_marked(e)) {{
+            jabs_interned[i] = JABS_INTERN_TOMBSTONE;
+            jabs_interned_count--;
+            jabs_interned_tombstones++;
+        }}
+    }}
+}}
+
+void jabs_gc_visit_reflect_roots(jabs_gc_root_fn visit, void *ctx) {{
+    for (size_t i = 0; i < jabs_class_count; i++) {{
+        if (jabs_class_entries[i] && jabs_class_entries[i]->object)
+            visit(jabs_class_entries[i]->object, ctx);
+    }}
+    jabs_gc_visit_rproxy_roots(visit, ctx);
 }}
 "#,
         string_struct = object_struct(STRING),
@@ -5846,7 +6059,7 @@ jabs_object *jabs_app_loader(void) {{
 }}
 
 /* The app class loader if it exists yet, without creating it. */
-static jabs_object *jabs_app_loader_created(void) {{ return atomic_load_explicit(&jabs_app_loader_object, memory_order_acquire); }}
+jabs_object *jabs_app_loader_created(void) {{ return atomic_load_explicit(&jabs_app_loader_object, memory_order_acquire); }}
 
 /* Class.getClassLoader: the app loader for classes from the inputs, null (boot) for the rest.
  * The caller holds JABS_LOCK_CLASSES. */
@@ -5863,7 +6076,7 @@ static void jabs_set_defining_loader(jabs_object *c, const char *name) {{
         out.push_str(
             "/* No jabs.rt.AppLoader in the unit: every class belongs to the boot loader. */\n\
 jabs_object *jabs_app_loader(void) { return NULL; }\n\
-static jabs_object *jabs_app_loader_created(void) { return NULL; }\n\
+jabs_object *jabs_app_loader_created(void) { return NULL; }\n\
 static void jabs_set_defining_loader(jabs_object *c, const char *name) { (void)c; (void)name; }\n",
         );
     }
@@ -6563,8 +6776,8 @@ void jabs_init_stack_trace_elements(jabs_object *elements, jabs_object *backtrac
     if (!elements || !backtrace) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return; }}
     jabs_array *a = (jabs_array *)elements, *b = (jabs_array *)backtrace;
     /* The backtrace is only ever the long[] jabs_fill_in_stack_trace made. */
-    if (elements->cls != jabs_array_class() || a->component_kind == JABS_COMPONENT_PRIMITIVE) jabs_not_compiled("StackTraceElement.initStackTraceElements with non-reference elements array");
-    if (backtrace->cls != jabs_array_class() || strcmp(b->descriptor, "[J") != 0) jabs_not_compiled("StackTraceElement.initStackTraceElements with a backtrace JABS did not record");
+    if (elements->cls != jabs_array_class() || !jabs_array_is_ref(a)) jabs_not_compiled("StackTraceElement.initStackTraceElements with non-reference elements array");
+    if (backtrace->cls != jabs_array_class() || strcmp(jabs_array_descriptor(b), "[J") != 0) jabs_not_compiled("StackTraceElement.initStackTraceElements with a backtrace JABS did not record");
     if (depth < 0 || depth > a->length || depth > b->length) {{ jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX); return; }}
     const int64_t *slots = (const int64_t *)jabs_array_data(b);
     for (int32_t i = 0; i < depth; i++) {{
@@ -6613,7 +6826,8 @@ fn var_handle_functions(unit: &Unit, recorded: &[&ClassFile], inits: &BTreeSet<S
     let mut out = String::new();
     if !recorded.iter().any(|c| c.name == VAR_HANDLE) {
         out.push_str(
-            "const jabs_vh *jabs_vh_of(jabs_object *o) { (void)o; return NULL; }\n\
+            "const size_t jabs_gc_var_handle_size = 0u;\n\
+const jabs_vh *jabs_vh_of(jabs_object *o) { (void)o; return NULL; }\n\
 void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index) { (void)h; (void)o; (void)index; return NULL; }\n\
 jabs_object *jabs_var_handle_field(jabs_object *a, jabs_object *b, jabs_object *c, int32_t s) { (void)a; (void)b; (void)c; (void)s; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n\
 jabs_object *jabs_var_handle_array(jabs_object *a) { (void)a; jabs_not_compiled(\"VarHandle (class not in the unit)\"); }\n\
@@ -6647,13 +6861,12 @@ jabs_object *jabs_var_handle_byte_view(jabs_object *a, int32_t b) { (void)a; (vo
         out,
         r#"/* Where a handle's jabs_vh sits: after VarHandle's own (unused) fields. */
 static size_t jabs_vh_offset(void) {{ return ({record}.size + 15) & ~(size_t)15; }}
+const size_t jabs_gc_var_handle_size = ((sizeof({vh_struct}) + 15) & ~(size_t)15) + sizeof(jabs_vh);
 
 static jabs_object *jabs_vh_new(char kind, uint8_t shape, int64_t offset, void *address, int32_t scale, bool big_endian) {{
     size_t at = jabs_vh_offset();
-    jabs_object *o = (jabs_object *)calloc(1, at + sizeof(jabs_vh));
-    if (!o) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
-    atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)(at + sizeof(jabs_vh)), memory_order_relaxed);
-    o->cls = &{record};
+    jabs_object *o = jabs_gc_alloc_obj(at + sizeof(jabs_vh), &{record});
+    if (!o) return NULL;
     jabs_vh *h = (jabs_vh *)((char *)o + at);
     h->kind = kind; h->shape = shape; h->offset = offset; h->address = address; h->scale = scale; h->big_endian = big_endian;
     return o;
@@ -6673,9 +6886,8 @@ jabs_object *jabs_vh_with_exact(jabs_object *o, int32_t exact) {{
     if (!o || !jabs_vh_of(o)) jabs_not_compiled("VarHandle.withInvokeExactBehavior on a handle JABS did not make (jabs_vh_with_exact)");
     if ((({vh_struct} *)o)->{exact} == (uint8_t)(exact != 0)) return o;
     size_t size = jabs_vh_offset() + sizeof(jabs_vh);
-    jabs_object *copy = (jabs_object *)calloc(1, size);
-    if (!copy) {{ jabs_pending = jabs_vm_throwable(JABS_VM_OUT_OF_MEMORY); return NULL; }}
-    atomic_fetch_add_explicit(&jabs_heap_bytes, (int64_t)size, memory_order_relaxed);
+    jabs_object *copy = jabs_gc_alloc_obj(size, &{record});
+    if (!copy) return NULL;
     memcpy(copy, o, size);
     /* A new object: its own lock word and identity hash. */
     copy->monitor = 0;
@@ -6700,7 +6912,7 @@ void *jabs_vh_address(const jabs_vh *h, jabs_object *o, int32_t index) {{
         /* The JDK's ArrayHandle order: cast to byte[] (ClassCastException; null passes), read
          * the length (NullPointerException), then Preconditions.checkIndex(index,
          * length - (size - 1)) (ArrayIndexOutOfBoundsException). */
-        if (o && (o->cls != jabs_array_class() || strcmp(((jabs_array *)o)->descriptor, "[B") != 0)) {{
+        if (o && (o->cls != jabs_array_class() || strcmp(jabs_array_descriptor((const jabs_array *)o), "[B") != 0)) {{
             jabs_pending = jabs_vm_throwable(JABS_VM_CLASS_CAST);
             return NULL;
         }}
@@ -7499,6 +7711,31 @@ fn reached_stub_targets(
     calls
 }
 
+fn reached_stub_statics(
+    results: &BTreeMap<MethodKey, std::result::Result<(Signature, Analyzed), String>>,
+    emission: &Emission,
+) -> BTreeSet<String> {
+    let mut statics: BTreeSet<String> = BTreeSet::new();
+    for key in &emission.methods {
+        let Some(Ok((_, a))) = results.get(key) else {
+            continue;
+        };
+        for (pc, resolved) in &a.resolved {
+            if let Resolved::Field(declaring) = resolved
+                && !emission.inits.contains(declaring)
+            {
+                let is_static = a.insns.iter().any(|i| {
+                    i.pc == *pc && matches!(i.op, Op::GetStatic { .. } | Op::PutStatic { .. })
+                });
+                if is_static {
+                    statics.insert(declaring.clone());
+                }
+            }
+        }
+    }
+    statics
+}
+
 fn emit_reached_stubs(
     out: &mut String,
     unit: &Unit,
@@ -7507,28 +7744,19 @@ fn emit_reached_stubs(
     init_ok: &HashMap<String, std::result::Result<(), String>>,
 ) {
     let mut calls: BTreeSet<MethodKey> = BTreeSet::new();
-    let mut statics: BTreeSet<String> = BTreeSet::new();
     for key in &emission.methods {
         let Some(Ok((_, a))) = results.get(key) else {
             continue;
         };
-        for (pc, resolved) in &a.resolved {
-            match resolved {
-                Resolved::Call(CallKind::Direct(target)) if !emission.methods.contains(target) => {
-                    calls.insert(target.clone());
-                }
-                Resolved::Field(declaring) if !emission.inits.contains(declaring) => {
-                    let is_static = a.insns.iter().any(|i| {
-                        i.pc == *pc && matches!(i.op, Op::GetStatic { .. } | Op::PutStatic { .. })
-                    });
-                    if is_static {
-                        statics.insert(declaring.clone());
-                    }
-                }
-                _ => {}
+        for resolved in a.resolved.values() {
+            if let Resolved::Call(CallKind::Direct(target)) = resolved
+                && !emission.methods.contains(target)
+            {
+                calls.insert(target.clone());
             }
         }
     }
+    let statics = reached_stub_statics(results, emission);
     for target in &calls {
         let Some(class) = unit.get(&target.0) else {
             continue;
@@ -8784,6 +9012,8 @@ const NET_C: &str = include_str!("../runtime/jabs_net.c");
 const NIO_FS_C: &str = include_str!("../runtime/jabs_nio_fs.c");
 /// java.util.zip natives: Inflater and Deflater (handwritten, OS-neutral; needs the class registry).
 const ZIP_C: &str = include_str!("../runtime/jabs_zip.c");
+/// Cooperative Stop-The-World Immix + Large Object Space Garbage Collector (handwritten).
+const GC_C: &str = include_str!("../runtime/jabs_gc.c");
 /// Reflection: member listings and reflective calls (handwritten).
 const REFLECT_C: &str = include_str!("../runtime/jabs_reflect.c");
 /// Reflection's metadata layout and entry points (handwritten; part of every program's header).
@@ -9298,7 +9528,7 @@ pub fn compile_unit_owned(
     };
     let _ = writeln!(
         core_body,
-        "const jabs_class jabs_array_class_record = {{ \"[\", 0, {array_vtable}, NULL, NULL, 0, NULL, 0, 0, 0 }};"
+        "const jabs_class jabs_array_class_record = {{ \"[\", 0, {array_vtable}, NULL, NULL, 0, NULL, 0, 0, 0, 0, NULL, 0 }};"
     );
     emit_vm_throwables(&mut core_body, &recorded_names);
     emit_literals(&mut core_body, &literals, registry);
@@ -9309,6 +9539,84 @@ pub fn compile_unit_owned(
         &emission.records,
         &emission.inits,
     ));
+    let ref_class = unit.get("java/lang/ref/Reference").filter(|c| {
+        recorded_names.contains("java/lang/ref/Reference")
+            && c.fields.iter().any(|f| f.name == "referent")
+            && c.fields.iter().any(|f| f.name == "discovered")
+    });
+    if ref_class.is_some() {
+        let rs = object_struct("java/lang/ref/Reference");
+        let _ = writeln!(
+            core_body,
+            "const uint32_t jabs_gc_ref_referent_offset = (uint32_t)offsetof({rs}, {});\nconst uint32_t jabs_gc_ref_discovered_offset = (uint32_t)offsetof({rs}, {});",
+            instance_field("referent"),
+            instance_field("discovered"),
+        );
+    } else {
+        core_body.push_str(
+            "const uint32_t jabs_gc_ref_referent_offset = 0u;\nconst uint32_t jabs_gc_ref_discovered_offset = 0u;\n",
+        );
+    }
+    let stub_statics = reached_stub_statics(results, &emission);
+    let mut static_ref_syms = Vec::new();
+    for cls_name in emission.inits.iter().chain(stub_statics.iter()) {
+        let Some(c) = unit.get(cls_name) else {
+            continue;
+        };
+        for f in c.fields.iter().filter(|f| f.access & ACC_STATIC != 0) {
+            if storage_type(&f.descriptor) == Some("jabs_object *") {
+                let sym = field_symbol(cls_name, &f.name);
+                let _ = writeln!(core_body, "extern jabs_object *{sym};");
+                static_ref_syms.push(format!("&{sym}"));
+            }
+        }
+    }
+    let _ = writeln!(
+        core_body,
+        "jabs_object **const jabs_gc_static_refs[] = {{ {}NULL }};",
+        if static_ref_syms.is_empty() {
+            String::new()
+        } else {
+            format!("{}, ", static_ref_syms.join(", "))
+        }
+    );
+    if !registry {
+        core_body.push_str(
+            r#"const size_t jabs_gc_var_handle_size = 0u;
+void jabs_gc_visit_reflect_roots(jabs_gc_root_fn visit, void *ctx) { (void)visit; (void)ctx; }
+void jabs_gc_visit_module_roots(jabs_gc_root_fn visit, void *ctx) { (void)visit; (void)ctx; }
+void jabs_gc_visit_rproxy_roots(jabs_gc_root_fn visit, void *ctx) { (void)visit; (void)ctx; }
+void jabs_gc_sweep_mh_roots(jabs_gc_is_marked_fn is_marked) { (void)is_marked; }
+void jabs_gc_visit_runtime_roots(jabs_gc_root_fn visit, void *ctx) {
+    for (uint32_t i = 0; i < jabs_gc_literal_count; i++) {
+        jabs_object *lit = atomic_load_explicit(&jabs_gc_literals[i], memory_order_acquire);
+        if (lit) visit(lit, ctx);
+    }
+}
+void jabs_gc_sweep_weak_roots(jabs_gc_is_marked_fn is_marked) { (void)is_marked; }
+"#,
+        );
+    } else {
+        core_body.push_str(
+            r#"void jabs_gc_sweep_interned(jabs_gc_is_marked_fn is_marked);
+jabs_object *jabs_app_loader_created(void);
+void jabs_gc_visit_runtime_roots(jabs_gc_root_fn visit, void *ctx) {
+    for (uint32_t i = 0; i < jabs_gc_literal_count; i++) {
+        jabs_object *lit = atomic_load_explicit(&jabs_gc_literals[i], memory_order_acquire);
+        if (lit) visit(lit, ctx);
+    }
+    jabs_object *loader = jabs_app_loader_created();
+    if (loader) visit(loader, ctx);
+    jabs_gc_visit_reflect_roots(visit, ctx);
+    jabs_gc_visit_module_roots(visit, ctx);
+}
+void jabs_gc_sweep_weak_roots(jabs_gc_is_marked_fn is_marked) {
+    jabs_gc_sweep_interned(is_marked);
+    jabs_gc_sweep_mh_roots(is_marked);
+}
+"#,
+        );
+    }
     if !registry {
         core_body.push_str(&boot_extras::glue(
             &unit,
@@ -9598,6 +9906,7 @@ pub fn compile_unit_owned(
         files.push(("jabs_files.c".to_string(), FILES_C.to_string()));
         files.push(("jabs_sync.c".to_string(), SYNC_C.to_string()));
         files.push(("jabs_thread.c".to_string(), THREAD_C.to_string()));
+        files.push(("jabs_gc.c".to_string(), GC_C.to_string()));
         files.push(("jabs_reflect.c".to_string(), REFLECT_C.to_string()));
         if registry_emitted {
             files.push(("jabs_io.c".to_string(), IO_C.to_string()));
@@ -9654,6 +9963,7 @@ pub fn compile_unit_owned(
         s.push_str(&strip_includes(JAB_C));
         s.push_str(&strip_includes(SYNC_C));
         s.push_str(&strip_includes(THREAD_C));
+        s.push_str(&strip_includes(GC_C));
         s.push_str(&strip_includes(REFLECT_C));
         if registry_emitted {
             s.push_str(&strip_includes(IO_C));

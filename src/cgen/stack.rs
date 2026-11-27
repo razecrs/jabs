@@ -287,7 +287,7 @@ static int32_t jabs_stack_fill_frames(jabs_stack_cursor *cursor, jabs_array *arr
     if (!frames_obj) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return NULL; }}
     if (frames_obj->cls != jabs_array_class()) jabs_not_compiled("AbstractStackWalker.callStackWalk frames is not an array");
     jabs_array *arr = (jabs_array *)frames_obj;
-    if (arr->component_kind == JABS_COMPONENT_PRIMITIVE) jabs_not_compiled("AbstractStackWalker.callStackWalk frames is a primitive array");
+    if (!jabs_array_is_ref(arr)) jabs_not_compiled("AbstractStackWalker.callStackWalk frames is a primitive array");
     if (start_index < 0 || batch_size < start_index || batch_size > arr->length) {{
         jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX);
         return NULL;
@@ -354,7 +354,7 @@ static int32_t jabs_stack_fill_frames(jabs_stack_cursor *cursor, jabs_array *arr
     if (!frames_obj) {{ jabs_pending = jabs_vm_throwable(JABS_VM_NULL_POINTER); return 0; }}
     if (frames_obj->cls != jabs_array_class()) jabs_not_compiled("AbstractStackWalker.fetchStackFrames frames is not an array");
     jabs_array *arr = (jabs_array *)frames_obj;
-    if (arr->component_kind == JABS_COMPONENT_PRIMITIVE) jabs_not_compiled("AbstractStackWalker.fetchStackFrames frames is a primitive array");
+    if (!jabs_array_is_ref(arr)) jabs_not_compiled("AbstractStackWalker.fetchStackFrames frames is a primitive array");
     if (start_index < 0 || fetch_size < start_index || fetch_size > arr->length) {{
         jabs_pending = jabs_vm_throwable(JABS_VM_ARRAY_INDEX);
         return 0;

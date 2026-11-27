@@ -1222,5 +1222,14 @@ jabs_object *jabs_rnew(int which) {{\n    switch (which) {{\n{news}    default: 
 const char *jabs_reflect_class_name(jabs_object *c) {{ jabs_class_entry *e = c ? jabs_class_entry_of(c) : NULL; return e ? e->name : NULL; }}\n\
 \x20const jabs_class *jabs_reflect_class_record(jabs_object *c) {{ jabs_class_entry *e = c ? jabs_class_entry_of(c) : NULL; return e ? e->record : NULL; }}\n"
     );
+    out.push_str(
+        r#"void jabs_gc_visit_rproxy_roots(jabs_gc_root_fn visit, void *ctx) {
+    for (uint32_t i = 0; i < jabs_rproxy_count; i++) {
+        jabs_object *ctor = __atomic_load_n(&jabs_rproxy_constructors[i], __ATOMIC_ACQUIRE);
+        if (ctor) visit(ctor, ctx);
+    }
+}
+"#,
+    );
     out
 }

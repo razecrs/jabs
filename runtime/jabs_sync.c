@@ -227,6 +227,8 @@ typedef struct {
     uint32_t contenders;       /* threads asleep on `entry` */
     sync_waiter *first, *last; /* the wait set in arrival order */
     uint32_t waiting;          /* nodes in the wait set */
+    uint32_t next_free;        /* 1-based freelist link when recycled by GC */
+    jabs_object *owner_obj;    /* weak backlink for GC monitor recycling */
 } sync_monitor;
 
 /* A wait set holds at most one node per thread; far above any real program. */
@@ -239,6 +241,7 @@ typedef struct {
 #define SYNC_MAX_CHUNKS 16384u
 static sync_monitor *sync_chunks[SYNC_MAX_CHUNKS];
 static uint32_t sync_monitors_used; /* guarded by sync_table_lock; read atomically for tests */
+static uint32_t sync_free_head;     /* 1-based freelist guarded by sync_table_lock */
 
 uint32_t jabs_sync_inflated_monitors(void) { return __atomic_load_n(&sync_monitors_used, __ATOMIC_ACQUIRE); }
 
@@ -261,6 +264,15 @@ static uint32_t sync_monitor_new(jabs_sync_thread *self) {
         return index;
     }
     sync_mutex_lock(&sync_table_lock);
+    if (sync_free_head != 0) {
+        uint32_t index = sync_free_head;
+        sync_monitor *fm = sync_monitor_at(index);
+        sync_free_head = fm->next_free;
+        fm->next_free = 0;
+        fm->owner_obj = NULL;
+        sync_mutex_unlock(&sync_table_lock);
+        return index;
+    }
     uint32_t slot = sync_monitors_used;
     uint32_t chunk = slot >> SYNC_CHUNK_BITS;
     if (chunk >= SYNC_MAX_CHUNKS) {
@@ -291,10 +303,24 @@ static sync_monitor *sync_inflate(jabs_object *o, jabs_sync_thread *self) {
         /* Not yet published: nobody else can see these fields. */
         m->owner = w == 0 ? 0 : sync_thin_owner(w);
         m->count = w == 0 ? 0 : sync_thin_count(w);
+        m->owner_obj = o;
         if (sync_swap_word(o, &w, (index << 1) | SYNC_INFLATED, __ATOMIC_ACQ_REL)) return m;
+        m->owner_obj = NULL;
         self->spare = index; /* the word changed: keep the monitor for the next inflation */
     }
     sync_fail("lock word kept changing while inflating", (long)w);
+}
+
+void jabs_gc_sweep_sync_monitors(jabs_gc_is_marked_fn is_marked) {
+    uint32_t used = __atomic_load_n(&sync_monitors_used, __ATOMIC_ACQUIRE);
+    for (uint32_t idx = 1; idx <= used; idx++) {
+        sync_monitor *m = sync_monitor_at(idx);
+        if (m->owner_obj && m->owner == 0 && m->contenders == 0 && m->waiting == 0 && !is_marked(m->owner_obj)) {
+            m->owner_obj = NULL;
+            m->next_free = sync_free_head;
+            sync_free_head = idx;
+        }
+    }
 }
 
 /* Relaxed is enough for an owner check: only a thread itself stores its own id as owner (or
@@ -305,6 +331,7 @@ static void sync_set_owner(sync_monitor *m, uint32_t id) { __atomic_store_n(&m->
 
 /* Own an inflated monitor once more (blocking while another thread owns it). */
 static void sync_inflated_enter(sync_monitor *m, jabs_sync_thread *self) {
+    jabs_gc_enter_native();
     sync_mutex_lock(&m->mutex);
     if (m->owner == self->id) {
         if (m->count == UINT32_MAX) sync_fail("monitor recursion count overflow", (long)m->count);
@@ -321,6 +348,7 @@ static void sync_inflated_enter(sync_monitor *m, jabs_sync_thread *self) {
         m->count = 1;
     }
     sync_mutex_unlock(&m->mutex);
+    jabs_gc_exit_native();
 }
 
 /* Give up every level of an owned inflated monitor, waking one contender; returns the depth.
@@ -477,6 +505,7 @@ int jabs_monitor_wait(jabs_object *o, int64_t millis) {
     /* Release every level; the depth comes back when this thread owns the monitor again. */
     uint32_t levels = sync_release_all(m);
     sync_mutex_unlock(&m->mutex);
+    jabs_gc_enter_native();
 
     int64_t deadline = INT64_MAX;
     if (millis > 0) {
@@ -518,5 +547,6 @@ int jabs_monitor_wait(jabs_object *o, int64_t millis) {
     sync_mutex_unlock(&self->lock);
     if (!notified) sync_unlink(m, &node);
     sync_mutex_unlock(&m->mutex);
+    jabs_gc_exit_native();
     return notified ? JABS_WAIT_NOTIFIED : outcome;
 }

@@ -19,7 +19,7 @@
 
 static jabs_class_init jabs_modules_gate;
 /* Set (before the gate's release) once every Module is complete. */
-static bool jabs_modules_ready;
+static _Atomic bool jabs_modules_ready;
 static jabs_object *jabs_module_objects[JABS_MAX_MODULES];
 
 static _Noreturn void jabs_modules_stop(const char *step, const char *module) {
@@ -84,14 +84,14 @@ static void jabs_modules_ensure_ready(const char *what) {
         jabs_pending = NULL;
         jabs_modules_build();
         jabs_pending = pending;
-        jabs_modules_ready = true;
+        atomic_store_explicit(&jabs_modules_ready, true, memory_order_release);
         jabs_runtime_once_end(&jabs_modules_gate, true);
         break;
     }
     case JABS_INIT_DONE:
         /* Done, or this thread is building them and the JDK code it runs asked for a
          * module: there is no answer yet that the JVM would give, so stop. */
-        if (!jabs_modules_ready) jabs_modules_stop("querying modules while they are being built", what);
+        if (!atomic_load_explicit(&jabs_modules_ready, memory_order_acquire)) jabs_modules_stop("querying modules while they are being built", what);
         break;
     default:
         jabs_modules_stop("waiting for another thread to build the modules", what);
@@ -140,4 +140,16 @@ jabs_object *jabs_module_of_class(const char *name) {
     }
     jabs_modules_ensure_ready(name);
     return jabs_module_objects[found->module];
+}
+
+void jabs_gc_visit_module_roots(jabs_gc_root_fn visit, void *ctx) {
+    if (!atomic_load_explicit(&jabs_modules_ready, memory_order_acquire) &&
+        atomic_load_explicit(&jabs_modules_gate.state, memory_order_acquire) != JABS_CLASS_INITIALIZING) {
+        return;
+    }
+    int32_t count = jabs_module_def_count;
+    if (count > JABS_MAX_MODULES) count = JABS_MAX_MODULES;
+    for (int32_t i = 0; i < count; i++) {
+        if (jabs_module_objects[i]) visit(jabs_module_objects[i], ctx);
+    }
 }

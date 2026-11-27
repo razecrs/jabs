@@ -229,7 +229,9 @@ void jabs_sleep_nanos(int64_t nanos) {
     if (nanos > 0) {
         /* Divide before rounding up so nanos near INT64_MAX cannot overflow signed int64_t. */
         int64_t millis = nanos / 1000000 + (nanos % 1000000 != 0);
+        jabs_gc_enter_native();
         Sleep((DWORD)(millis > 0x7fffffff ? 0x7fffffff : millis));
+        jabs_gc_exit_native();
     }
 }
 
@@ -261,12 +263,17 @@ static void jabs_std_binary(int32_t fd) {
 int64_t jabs_platform_write(int32_t fd, const void *data, size_t length) {
     size_t done = 0;
     jabs_std_binary(fd);
+    jabs_gc_enter_native();
     while (done < length) {
         unsigned chunk = length - done > 0x40000000u ? 0x40000000u : (unsigned)(length - done);
         int n = _write(fd, (const char *)data + done, chunk);
-        if (n < 0) return -1;
+        if (n < 0) {
+            jabs_gc_exit_native();
+            return -1;
+        }
         done += (size_t)n;
     }
+    jabs_gc_exit_native();
     return (int64_t)done;
 }
 
@@ -405,7 +412,9 @@ int jabs_platform_stack_functions(const void **starts, int max) {
 void jabs_sleep_nanos(int64_t nanos) {
     if (nanos > 0) {
         struct timespec t = { (time_t)(nanos / 1000000000), (long)(nanos % 1000000000) };
+        jabs_gc_enter_native();
         nanosleep(&t, NULL);
+        jabs_gc_exit_native();
     }
 }
 
@@ -422,11 +431,16 @@ int64_t jabs_platform_std_handle(int32_t fd) {
 
 int64_t jabs_platform_write(int32_t fd, const void *data, size_t length) {
     size_t done = 0;
+    jabs_gc_enter_native();
     while (done < length) {
         ssize_t n = write(fd, (const char *)data + done, length - done);
-        if (n < 0) return -1;
+        if (n < 0) {
+            jabs_gc_exit_native();
+            return -1;
+        }
         done += (size_t)n;
     }
+    jabs_gc_exit_native();
     return (int64_t)done;
 }
 #endif
